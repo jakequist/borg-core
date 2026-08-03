@@ -7,7 +7,7 @@
 //! provider line, so that swapping backends never means reimplementing the engine.
 
 use async_trait::async_trait;
-use borg_core::{BranchId, CellRecord, CellRef, LayerId, ObjectTypeName, Result};
+use borg_core::{BranchId, BufferId, CellRecord, CellRef, LayerId, Result};
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
 ///
@@ -50,7 +50,7 @@ pub trait StorageProvider: Send + Sync {
     async fn scan_buffer(
         &self,
         branch: BranchId,
-        buffer: &ObjectTypeName,
+        buffer: &BufferId,
         layer: LayerId,
     ) -> Result<CellStream>;
 

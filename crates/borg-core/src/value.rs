@@ -18,9 +18,16 @@ pub enum Value {
     /// reached by PID.
     Ref(Pid),
 
-    /// A tombstone (SPEC.md §8.1). Distinct from "absent": absence is a legitimate tracked read,
-    /// and a producer observing either must be able to tell them apart.
-    Deleted,
+    /// Explicitly removed (SPEC.md §8.1).
+    ///
+    /// Distinct from *absent*, which is the `None` of an enclosing `Option<Value>`: absence means
+    /// never written, a tombstone means removed. Both are legitimate tracked reads and a producer
+    /// must be able to tell them apart.
+    ///
+    /// A tombstone is cell-valued, so **the cell it occupies determines what was removed**:
+    /// in a property cell it is an unset field, in an existence cell a deleted object, and in a
+    /// future set-member or map-entry cell one removed element. One concept, every granularity.
+    Tombstone,
 }
 
 impl Value {
@@ -31,8 +38,8 @@ impl Value {
         }
     }
 
-    pub const fn is_deleted(&self) -> bool {
-        matches!(self, Value::Deleted)
+    pub const fn is_tombstone(&self) -> bool {
+        matches!(self, Value::Tombstone)
     }
 }
 

@@ -19,8 +19,8 @@ pub enum Freshness {
     /// The producer threw or cycled. `IllegalState`, scoped to *this cell* rather than the branch,
     /// which is why main never breaks because someone merged a bad pipeline (SPEC.md §14).
     Broken,
-    /// Tombstoned, or reached through a dangling reference (SPEC.md §8.1).
-    Deleted,
+    /// Explicitly removed (SPEC.md §8.1), or reached through a dangling reference (§8.2).
+    Tombstoned,
 }
 
 /// What a client asks for. SPEC.md §10.5.

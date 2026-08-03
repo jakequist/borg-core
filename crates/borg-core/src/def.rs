@@ -7,7 +7,7 @@
 //! The consequence worth internalizing: a struct has no owner. Only its fields do. `Company` exists
 //! because somebody declared a field on it.
 
-use crate::cell::{FieldName, Origin};
+use crate::cell::{BufferId, FieldName, Origin};
 use crate::ids::{LayerId, ProducerId, RepoId};
 use crate::value::{ObjectTypeName, ValueType};
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,14 @@ pub struct ObjectDef {
     pub fields: BTreeMap<FieldName, FieldDef>,
 }
 
-/// A single field. Note that `origin` and `writer` are *discovered*, not declared: v1 infers field
-/// ownership at runtime and throws on violation (SPEC.md §8).
+/// A single field.
+///
+/// **There is deliberately no `writer` here.** Every field has exactly one writer, but that
+/// ownership is *discovered* at runtime, and defs are mutated only by DefEvents in def-layers.
+/// Recording a discovered owner into the def would mean the derivation engine emitting
+/// def-mutations — violating the value-xor-def rule and letting a producer's first run silently
+/// rewrite the schema. Ownership is discovered state and lives in the dependency index with the rest
+/// of it (SPEC.md §8).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FieldDef {
     pub name: FieldName,
@@ -29,9 +35,6 @@ pub struct FieldDef {
     /// The repo that declared this field. Only that repo may mutate or delete it.
     pub declaring_repo: RepoId,
     pub origin: Origin,
-    /// The single producer permitted to write this field, once one has claimed it. Every field has
-    /// exactly one writer.
-    pub writer: Option<ProducerId>,
     /// The def-layer that last mutated this field — i.e. its def-version. There is no separate
     /// versioning scheme (SPEC.md §5.3).
     pub version: LayerId,
@@ -44,9 +47,9 @@ pub struct FieldDef {
 pub struct ProducerDef {
     pub id: ProducerId,
     pub kind: ProducerKind,
-    /// The buffer this producer maps over. v1 producers are per-entity maps: one invocation per
-    /// entity (SPEC.md §9.2).
-    pub source: ObjectTypeName,
+    /// The buffer this producer maps over — i.e. the set of instances of one struct (SPEC.md
+    /// §4.2). v1 producers are per-entity maps: one invocation per entity (SPEC.md §9.2).
+    pub source: BufferId,
     /// The def-view this producer's code was authored against. All of its reads resolve here.
     pub version: LayerId,
     pub declaring_repo: RepoId,

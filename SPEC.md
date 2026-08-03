@@ -36,7 +36,7 @@ correctness.
 | **Repo** | A namespace-less contribution unit. Teams define structs, fields, and producers through repos. |
 | **PID** | Point ID. Universal identifier for every non-primitive value. |
 | **Cell** | The universal addressable unit: `(pid, field)` or `(pid, index)`. |
-| **Buffer** | Logical storage for a class of values. Holds complex values only. |
+| **Buffer** | A physical partition of cells: one per struct for objects, global for interned values. |
 | **Def** | A definition — `ObjectDef`, `ListDef`. |
 | **Event** | A single mutation. Either a `ValueEvent` or a `DefEvent`. |
 | **Layer** | An ordered group of events. Belongs to exactly one branch. |
@@ -93,8 +93,9 @@ They are stored inline in the cell that holds them.
 The universal addressable unit is the **cell**:
 
 ```
-ObjectPropBuffer:  (pid, field)  -> CellRecord
-ListElemBuffer:    (pid, index)  -> CellRecord
+(pid, field)     -> CellRecord     // an object property
+(pid, index)     -> CellRecord     // a list element
+(pid, <exists>)  -> CellRecord     // existence — a cell like any other (§8.1)
 ```
 
 The cell is the right granularity because every mechanism in Borg is already field-granular:
@@ -106,16 +107,25 @@ new field key and touches none of Repo#1's storage.
 
 ### 4.2 Buffers
 
-| Buffer | Holds |
-|---|---|
-| `ObjectBuffer` | object existence + type. Degenerate: an index, not a value store. |
-| `ObjectPropBuffer` | all object property cells |
-| `ListBuffer` | list existence + element type |
-| `ListElemBuffer` | all list element cells |
-| `StringBuffer` | interned strings, keyed by content hash |
-| `BinaryBuffer` | interned binary, keyed by content hash |
-| `BigIntBuffer` | interned bigints |
-| `AnyObjectBuffer` / `AnyArrayBuffer` | untyped structures |
+A **buffer** is a physical partition of cells. The partitioning rule:
+
+> **Buffers partition by def where a def exists, and globally where one does not.**
+
+| Buffer | Granularity | Holds |
+|---|---|---|
+| `ObjectBuffer` | **one per struct** | every cell of that struct — existence cells and property cells alike |
+| `ListBuffer` | one per `ListDef` | list existence and element cells |
+| `StringBuffer` | global | interned strings, keyed by content hash |
+| `BinaryBuffer` | global | interned binary |
+| `BigIntBuffer` | global | interned bigints |
+| `AnyObjectBuffer` / `AnyArrayBuffer` | global | untyped structures, which have no def |
+
+Interning buffers *must* be global — registry-wide deduplication is the entire point.
+
+Partitioning objects per struct is what makes "a producer maps over a source buffer" (§9.2) precise:
+the buffer **is** the set of instances of one struct. It also makes discovering new entities a single
+buffer scan rather than a filtered walk, confines a def-mutation to exactly one buffer, and gives
+distribution a natural shard key (§17.2).
 
 Buffers hold complex values only. Primitives live inline in cells.
 
@@ -142,7 +152,7 @@ producer — attaches to derived cells only, which in a normalized model are the
 
 ### 4.4 Lists
 
-Lists are **append-only in v1**. `ListElemBuffer` is keyed `(pid, index)`; mid-list insertion would
+Lists are **append-only in v1**. Element cells are keyed `(pid, index)`; mid-list insertion would
 shift every downstream key and is deferred.
 
 ---
@@ -153,7 +163,8 @@ shift every downstream key and is deferred.
 
 ```
 ObjectDef  { name, fields: { name -> FieldDef } }
-FieldDef   { name, type, declaringRepo, origin: Source | Derived }
+FieldDef   { name, type, declaringRepo, origin: Source | Derived, version: LayerId }
+           // note: no `writer` — discovered ownership lives in the dependency index (§8)
 ListDef    { elementType }
 ```
 
@@ -350,23 +361,51 @@ lineage, and the system's job is to be honest about both rather than to pretend.
 carry source cells (`name`, `website`) and derived cells (`is_investible`) side by side.
 
 **Every field has exactly one writer.** In v1 this is discovered at runtime and enforced by throwing
-on violation; codegen emits all fields as writable. Static enforcement in codegen is deferred.
+on violation.
 
-### 8.1 Deletion and dangling references
+**Discovered ownership lives in the dependency index, never in the def.** Defs are mutated by
+DefEvents, which live in def-layers; discovery happens during derivation, which emits value layers.
+Recording an owner into the def would therefore mean the derivation engine emitting def-mutations —
+violating the value-xor-def rule (§6.2) and letting a producer's first run silently rewrite the
+schema. Ownership is discovered state, and belongs with the other discovered state.
 
-`DeleteObject` writes a **tombstone**; nothing is physically removed, because time travel requires
-the history to remain intact.
+### 8.1 Tombstones
 
-Deletion needs almost no dedicated machinery. **A tombstone is just a write**, so it flows through
-the dependency index and invalidates dependents like any other change, and because negative reads are
-tracked (§9.4) a producer observing a deleted input is reading a legitimate value — absence. A
-producer whose input vanished produces nothing, so its outputs, including deterministically-PID'd
-output objects (§9.5), are tombstoned by the same path. Deletion cascades through the derivation
-graph for free.
+A **tombstone** is a value a cell can hold, meaning *explicitly removed* — as distinct from *never
+written*, which is absence. Both are legitimate tracked reads and a producer must be able to tell
+them apart.
+
+Because a tombstone is cell-valued, **the cell it occupies determines what was removed**, and the
+concept generalizes with no new machinery:
+
+| Event | Tombstones | Meaning |
+|---|---|---|
+| `UnsetObjectProp` | a property cell | that field is unset |
+| `DeleteObject` | an existence cell | the object is gone |
+| *(deferred)* set-member / map-entry removal | that member's cell | one element removed |
+
+Nothing is ever physically removed, because time travel requires the history to remain intact.
+
+**Existence is itself a cell.** It must be, or it could not appear in a read-set — and then deletion
+could not invalidate anything.
+
+**Every cell read implicitly depends on its object's existence cell.** Otherwise a `DeleteObject`
+writes only the existence cell, and everything depending on `company#100.name` never observes a write
+to that cell and is never invalidated. The alternative — tombstoning every property cell on delete —
+makes deletion `O(fields)` writes; the implicit dependency costs one extra read-set entry per object
+touched and keeps deletion `O(1)`. The resolver must consult existence for type information anyway.
+
+With that in place, deletion needs no dedicated machinery at all: **a tombstone is just a write**, so
+it flows through the dependency index and invalidates dependents like any other change. A producer
+whose input vanished produces nothing, so its outputs — including deterministically-PID'd output
+objects (§9.5) — are tombstoned by the same path. Deletion cascades through the derivation graph for
+free.
+
+### 8.2 Dangling references
 
 **v1 permits dangling references.** Refcounting a graph in which strings are content-addressed and
 shared registry-wide is a global operation on a system that is otherwise strictly local, and it is
-not worth it yet. A cell holding a PID whose object has been deleted resolves to `state: 'deleted'`
+not worth it yet. A cell holding a PID whose object has been deleted resolves to `state: 'tombstoned'`
 in the read envelope (§10.4) rather than throwing. Opt-in referential integrity is deferred.
 
 ---
@@ -560,12 +599,14 @@ down-migration receives a watermark accounting for both hops.
 Every cell read returns provenance, not a bare value:
 
 ```ts
+// Named `Resolved<T>` in the Rust implementation: `Cell` collides with CellRef,
+// CellRecord and std::cell.
 type Cell<T> = {
   value:     T
   origin:    'source' | 'derived'
   writtenAt: LayerId    // when this value was actually produced
   freshAsOf: LayerId    // certain-correct through here
-  state:     'current' | 'unvalidated' | 'stale' | 'broken' | 'deleted'
+  state:     'current' | 'unvalidated' | 'stale' | 'broken' | 'tombstoned'
   by?:       ProducerId
   // deferred: expectedFreshAt — an ETA for when catch-up will complete
 }
@@ -577,7 +618,7 @@ type Cell<T> = {
 | `unvalidated` | Behind, but unchecked. Cheap to resolve. |
 | `stale` | A dependency is known to have moved. Definitely out of date. |
 | `broken` | The producer threw or cycled. `IllegalState`, scoped to this cell. |
-| `deleted` | Tombstoned, or reached through a dangling reference (§8.1). |
+| `tombstoned` | Explicitly removed (§8.1), or reached through a dangling reference (§8.2). |
 
 For source cells `writtenAt` and `freshAsOf` collapse — source data is written once and correct
 thereafter. The distinction only carries information for derived data.
@@ -941,7 +982,7 @@ async through the derivation engine afterwards is a far larger change than payin
 - Registry-scoped branch tree; time travel; O(1) fork
 - Multi-repo defs, flat namespace, implicit extension, collision errors
 - Def-versions, ClientVersion resolution, live-version set
-- Tombstoned deletes with dangling references permitted
+- Tombstones as a general cell-valued concept; dangling references permitted
 - Unified producer engine: pipelines and migrations, in-process Rust under full trust
 - `ExecutionProvider` / `ProducerCtx` with automatic, ctx-mediated dependency capture
 - Dependency index (bidirectional, key-ranged), re-run cycle detection, producer-scoped `IllegalState`

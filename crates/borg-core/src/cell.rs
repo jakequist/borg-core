@@ -22,9 +22,13 @@ pub enum CellRef {
     Prop { pid: Pid, field: FieldName },
     /// A list element. Lists are append-only in v1, so indices are stable (SPEC.md §4.4).
     Elem { pid: Pid, index: u64 },
-    /// An object's existence and type. `ObjectBuffer` is an index, not a value store, so existence
-    /// is itself a cell — which is what lets deletion flow through the dependency graph as an
-    /// ordinary write (SPEC.md §8.1).
+    /// An object's existence. A cell like any other — it has to be, or it could not appear in a
+    /// read-set, and then deletion could not invalidate anything (SPEC.md §8.1).
+    ///
+    /// **Every cell read implicitly depends on its object's existence cell.** Otherwise a
+    /// `DeleteObject` writes only this cell, and everything depending on `company#100.name` never
+    /// observes a write to *that* cell and is never invalidated. Costs one extra read-set entry per
+    /// object touched, and keeps deletion `O(1)` rather than `O(fields)`.
     Existence { pid: Pid },
 }
 
@@ -87,6 +91,23 @@ pub struct Derivation {
     pub read_set: Vec<CellRef>,
 }
 
-/// A tombstone. SPEC.md §8.1: deletion is just a write, so it flows through the dependency index and
-/// invalidates dependents like any other change.
-pub const DELETED: Value = Value::Deleted;
+/// Identifies a buffer — a physical partition of cells. SPEC.md §4.2.
+///
+/// Buffers partition **by def where a def exists, and globally where one does not.** Objects get one
+/// buffer per struct, which is what makes "a producer maps over a source buffer" precise: the buffer
+/// *is* the set of instances of one struct. Interning buffers must be global, since registry-wide
+/// deduplication is their entire purpose.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum BufferId {
+    /// One per struct.
+    Object(crate::value::ObjectTypeName),
+    /// One per `ListDef`.
+    List(crate::value::ObjectTypeName),
+    /// Global — interning is registry-wide by definition.
+    String,
+    Binary,
+    BigInt,
+    /// Global — the `Any*` family has no def to partition by.
+    AnyObject,
+    AnyArray,
+}
