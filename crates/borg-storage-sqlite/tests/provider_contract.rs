@@ -324,3 +324,47 @@ async fn data_survives_reopening_the_file() -> Result<()> {
     std::fs::remove_file(&file).ok();
     Ok(())
 }
+
+#[tokio::test]
+async fn a_layer_larger_than_one_batch_flushes_without_losing_rows() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    let here = path(&[(MAIN, LayerId(100))]);
+
+    // Comfortably past the internal batch size, so several flushes happen mid-layer.
+    const COUNT: u64 = 1500;
+
+    let mut layer = storage.open_layer(MAIN, LayerId(1)).await?;
+    for n in 0..COUNT {
+        layer
+            .put_cell(
+                &prop(n, "name"),
+                record(Value::Int(n as i64), V1, LayerId(1)),
+            )
+            .await?;
+    }
+
+    // Rows have already been flushed to disk, but the layer is still open — so none of them are
+    // visible. Buffering is only safe because of this.
+    assert!(
+        storage
+            .get_cell(&here, &prop(0, "name"), V1)
+            .await?
+            .is_none(),
+        "flushed-but-uncommitted rows stay invisible"
+    );
+
+    let sealed = layer.seal().await?;
+    storage.commit_layer(sealed).await?;
+
+    for n in [0, 511, 512, 1023, 1024, COUNT - 1] {
+        assert_eq!(
+            storage
+                .get_cell(&here, &prop(n, "name"), V1)
+                .await?
+                .map(|r| r.value),
+            Some(Value::Int(n as i64)),
+            "row {n} survived, including on the batch boundaries"
+        );
+    }
+    Ok(())
+}

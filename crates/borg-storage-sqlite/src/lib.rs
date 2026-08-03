@@ -17,11 +17,20 @@
 //! The obvious alternative, flipping a `visible` flag on every row at commit, would make commit
 //! `O(rows)` and undo the streaming property the interface exists to preserve.
 //!
-//! ## v1 limitation
+//! ## Blocking work stays off the async executor
 //!
-//! SQLite is synchronous and these calls block the executor. A real deployment wants
-//! `spawn_blocking` or an async driver; single-node v1 does not, and pretending otherwise would add
-//! machinery without adding information.
+//! SQLite is synchronous, so every statement runs on Tokio's blocking pool via [`with_conn`]. The
+//! `StorageProvider` trait is async and the whole engine above it already awaits, so this crate is
+//! the only place that has to know SQLite blocks.
+//!
+//! Writes are **batched** rather than dispatched one at a time. `put_cell` is called an unbounded
+//! number of times, and a `spawn_blocking` round-trip per cell would make dispatch overhead dominate
+//! everything else. Rows accumulate into a bounded buffer and flush in a single transaction.
+//!
+//! Buffering is safe precisely because an open layer is invisible: nothing can observe the
+//! difference between a row written immediately and one written at the next flush. The buffer is
+//! bounded at [`BATCH`], so "never buffer a layer whole" still holds — a ten-million-cell layer
+//! passes through in fixed memory.
 
 use async_trait::async_trait;
 use borg_core::{
@@ -37,7 +46,15 @@ const OPEN: i64 = 0;
 const SEALED: i64 = 1;
 const COMMITTED: i64 = 2;
 
+/// How many cell writes accumulate before a flush.
+///
+/// Large enough that per-batch dispatch is negligible, small enough that memory stays flat however
+/// large the layer.
+const BATCH: usize = 512;
+
 const SCHEMA: &str = "
+PRAGMA journal_mode = WAL;
+
 CREATE TABLE IF NOT EXISTS layers (
     id     INTEGER PRIMARY KEY,
     branch INTEGER NOT NULL,
@@ -67,6 +84,26 @@ CREATE TABLE IF NOT EXISTS def_events (
 );
 ";
 
+type Conn = Arc<Mutex<Connection>>;
+
+/// Run blocking SQLite work on Tokio's blocking pool.
+///
+/// Every statement in this crate goes through here, so no database call ever occupies an async
+/// worker thread.
+async fn with_conn<T, F>(conn: &Conn, work: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let conn = Arc::clone(conn);
+    tokio::task::spawn_blocking(move || {
+        let guard = conn.lock().unwrap();
+        work(&guard)
+    })
+    .await
+    .map_err(sql)?
+}
+
 fn sql<E: std::fmt::Display>(err: E) -> BorgError {
     BorgError::Storage(err.to_string())
 }
@@ -82,9 +119,29 @@ fn decode<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T> {
 /// The columns every cell read projects.
 type CellRow = (String, i64, i64, i64, Option<String>);
 
+fn to_record(row: CellRow) -> Result<CellRecord> {
+    let (value, version, written_at, origin, derivation) = row;
+    Ok(CellRecord {
+        value: decode::<Value>(&value)?,
+        version: ClientVersion(LayerId(version as u64)),
+        written_at: LayerId(written_at as u64),
+        origin: if origin == 0 {
+            Origin::Source
+        } else {
+            Origin::Derived
+        },
+        derivation: derivation
+            .map(|raw| decode::<Derivation>(&raw))
+            .transpose()?,
+    })
+}
+
+/// One cell write, already encoded, waiting to be flushed.
+type PendingCell = (String, String, i64, String, i64, Option<String>);
+
 #[derive(Clone)]
 pub struct SqliteStorage {
-    conn: Arc<Mutex<Connection>>,
+    conn: Conn,
 }
 
 impl SqliteStorage {
@@ -102,32 +159,47 @@ impl SqliteStorage {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
-
-    fn to_record(row: CellRow) -> Result<CellRecord> {
-        let (value, version, written_at, origin, derivation) = row;
-        Ok(CellRecord {
-            value: decode::<Value>(&value)?,
-            version: ClientVersion(LayerId(version as u64)),
-            written_at: LayerId(written_at as u64),
-            origin: if origin == 0 {
-                Origin::Source
-            } else {
-                Origin::Derived
-            },
-            derivation: derivation
-                .map(|raw| decode::<Derivation>(&raw))
-                .transpose()?,
-        })
-    }
 }
 
-/// One open layer. Rows stream straight into `cells`; they are invisible because this layer's row in
-/// `layers` is not yet `COMMITTED`.
+/// One open layer. Rows accumulate in a bounded buffer, flush in transactions, and stay invisible
+/// because this layer's row in `layers` is not yet `COMMITTED`.
 pub struct SqliteOpenLayer {
     id: LayerId,
     branch: BranchId,
     defs: u32,
-    conn: Arc<Mutex<Connection>>,
+    pending: Vec<PendingCell>,
+    conn: Conn,
+}
+
+impl SqliteOpenLayer {
+    async fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::take(&mut self.pending);
+        let branch = self.branch.0 as i64;
+        let layer = self.id.0 as i64;
+        with_conn(&self.conn, move |conn| {
+            let tx = conn.unchecked_transaction().map_err(sql)?;
+            {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO cells
+                         (branch, buffer, cell_key, version, written_at, value, origin, derivation)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    )
+                    .map_err(sql)?;
+                for (buffer, key, version, value, origin, derivation) in rows {
+                    stmt.execute(params![
+                        branch, buffer, key, version, layer, value, origin, derivation
+                    ])
+                    .map_err(sql)?;
+                }
+            }
+            tx.commit().map_err(sql)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -137,62 +209,68 @@ impl OpenLayer for SqliteOpenLayer {
     }
 
     async fn put_cell(&mut self, cell: &CellRef, record: CellRecord) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO cells
-             (branch, buffer, cell_key, version, written_at, value, origin, derivation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                self.branch.0 as i64,
-                encode(&cell.buffer)?,
-                encode(&cell.key)?,
-                record.version.0.0 as i64,
-                self.id.0 as i64,
-                encode(&record.value)?,
-                i64::from(record.origin == Origin::Derived),
-                record.derivation.as_ref().map(encode).transpose()?,
-            ],
-        )
-        .map_err(sql)?;
+        self.pending.push((
+            encode(&cell.buffer)?,
+            encode(&cell.key)?,
+            record.version.0.0 as i64,
+            encode(&record.value)?,
+            i64::from(record.origin == Origin::Derived),
+            record.derivation.as_ref().map(encode).transpose()?,
+        ));
+        if self.pending.len() >= BATCH {
+            self.flush().await?;
+        }
         Ok(())
     }
 
     async fn put_def(&mut self, event: DefEvent) -> Result<()> {
-        {
-            let conn = self.conn.lock().unwrap();
+        let layer = self.id.0 as i64;
+        let seq = i64::from(self.defs);
+        let encoded = encode(&event)?;
+        with_conn(&self.conn, move |conn| {
             conn.execute(
                 "INSERT INTO def_events (layer, seq, event) VALUES (?1, ?2, ?3)",
-                params![self.id.0 as i64, i64::from(self.defs), encode(&event)?],
+                params![layer, seq, encoded],
             )
             .map_err(sql)?;
-        }
+            Ok(())
+        })
+        .await?;
         self.defs += 1;
         Ok(())
     }
 
-    async fn seal(self: Box<Self>) -> Result<SealedLayer> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE layers SET state = ?1 WHERE id = ?2 AND state = ?3",
-            params![SEALED, self.id.0 as i64, OPEN],
-        )
-        .map_err(sql)?;
-        Ok(SealedLayer { id: self.id })
+    async fn seal(mut self: Box<Self>) -> Result<SealedLayer> {
+        self.flush().await?;
+        let id = self.id;
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "UPDATE layers SET state = ?1 WHERE id = ?2 AND state = ?3",
+                params![SEALED, id.0 as i64, OPEN],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await?;
+        Ok(SealedLayer { id })
     }
 
-    async fn abort(self: Box<Self>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        // Aborted rows are removed rather than left invisible: nothing will ever read them, and a
-        // failed producer run may have written a great many.
-        for statement in [
-            "DELETE FROM cells WHERE written_at = ?1",
-            "DELETE FROM def_events WHERE layer = ?1",
-            "DELETE FROM layers WHERE id = ?1",
-        ] {
-            conn.execute(statement, params![self.id.0 as i64])
-                .map_err(sql)?;
-        }
-        Ok(())
+    async fn abort(mut self: Box<Self>) -> Result<()> {
+        // Anything unflushed simply evaporates; anything already flushed is deleted. Nothing was
+        // ever visible either way.
+        self.pending.clear();
+        let id = self.id.0 as i64;
+        with_conn(&self.conn, move |conn| {
+            for statement in [
+                "DELETE FROM cells WHERE written_at = ?1",
+                "DELETE FROM def_events WHERE layer = ?1",
+                "DELETE FROM layers WHERE id = ?1",
+            ] {
+                conn.execute(statement, params![id]).map_err(sql)?;
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -204,217 +282,249 @@ impl StorageProvider for SqliteStorage {
         cell: &CellRef,
         version: ClientVersion,
     ) -> Result<Option<CellRecord>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT c.value, c.version, c.written_at, c.origin, c.derivation
-                 FROM cells c JOIN layers l ON c.written_at = l.id
-                 WHERE c.branch = ?1 AND c.buffer = ?2 AND c.cell_key = ?3 AND c.version = ?4
-                   AND l.state = ?5 AND c.written_at <= ?6
-                 ORDER BY c.written_at DESC LIMIT 1",
-            )
-            .map_err(sql)?;
-
+        let segments = path.segments.clone();
         let buffer = encode(&cell.buffer)?;
         let key = encode(&cell.key)?;
-        // Walk outward. The first segment holding *any* record wins — including a tombstone, which
-        // must stop the walk rather than fall through to the parent (SPEC.md §7.2).
-        for (branch, bound) in &path.segments {
-            let found = stmt
-                .query_row(
-                    params![
-                        branch.0 as i64,
-                        &buffer,
-                        &key,
-                        version.0.0 as i64,
-                        COMMITTED,
-                        bound.0 as i64
-                    ],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
+        let version = version.0.0 as i64;
+
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT c.value, c.version, c.written_at, c.origin, c.derivation
+                     FROM cells c JOIN layers l ON c.written_at = l.id
+                     WHERE c.branch = ?1 AND c.buffer = ?2 AND c.cell_key = ?3 AND c.version = ?4
+                       AND l.state = ?5 AND c.written_at <= ?6
+                     ORDER BY c.written_at DESC LIMIT 1",
                 )
-                .optional()
                 .map_err(sql)?;
-            if let Some(row) = found {
-                return Ok(Some(Self::to_record(row)?));
+
+            // Walk outward. The first segment holding *any* record wins — including a tombstone,
+            // which must stop the walk rather than fall through to the parent (SPEC.md §7.2).
+            for (branch, bound) in &segments {
+                let found = stmt
+                    .query_row(
+                        params![
+                            branch.0 as i64,
+                            &buffer,
+                            &key,
+                            version,
+                            COMMITTED,
+                            bound.0 as i64
+                        ],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(sql)?;
+                if let Some(row) = found {
+                    return Ok(Some(to_record(row)?));
+                }
             }
-        }
-        Ok(None)
+            Ok(None)
+        })
+        .await
     }
 
     async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<ClientVersion>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT DISTINCT c.version
-                 FROM cells c JOIN layers l ON c.written_at = l.id
-                 WHERE c.branch = ?1 AND c.buffer = ?2 AND c.cell_key = ?3
-                   AND l.state = ?4 AND c.written_at <= ?5",
-            )
-            .map_err(sql)?;
-
+        let segments = path.segments.clone();
         let buffer = encode(&cell.buffer)?;
         let key = encode(&cell.key)?;
-        let mut versions = Vec::new();
-        for (branch, bound) in &path.segments {
-            let rows = stmt
-                .query_map(
-                    params![branch.0 as i64, &buffer, &key, COMMITTED, bound.0 as i64],
-                    |row| row.get::<_, i64>(0),
+
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT DISTINCT c.version
+                     FROM cells c JOIN layers l ON c.written_at = l.id
+                     WHERE c.branch = ?1 AND c.buffer = ?2 AND c.cell_key = ?3
+                       AND l.state = ?4 AND c.written_at <= ?5",
                 )
                 .map_err(sql)?;
-            for row in rows {
-                let version = ClientVersion(LayerId(row.map_err(sql)? as u64));
-                if !versions.contains(&version) {
-                    versions.push(version);
+
+            let mut versions = Vec::new();
+            for (branch, bound) in &segments {
+                let rows = stmt
+                    .query_map(
+                        params![branch.0 as i64, &buffer, &key, COMMITTED, bound.0 as i64],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(sql)?;
+                for row in rows {
+                    let version = ClientVersion(LayerId(row.map_err(sql)? as u64));
+                    if !versions.contains(&version) {
+                        versions.push(version);
+                    }
                 }
             }
-        }
-        Ok(versions)
+            Ok(versions)
+        })
+        .await
     }
 
     async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<CellStream> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT c.cell_key, c.value, c.version, MAX(c.written_at), c.origin, c.derivation
-                 FROM cells c JOIN layers l ON c.written_at = l.id
-                 WHERE c.branch = ?1 AND c.buffer = ?2 AND l.state = ?3 AND c.written_at <= ?4
-                 GROUP BY c.cell_key, c.version",
-            )
-            .map_err(sql)?;
-
+        let segments = path.segments.clone();
+        let target = buffer.clone();
         let encoded = encode(buffer)?;
-        // A child's own record shadows the parent's, so remember what the inner segments covered.
-        let mut seen: Vec<String> = Vec::new();
-        let mut rows = Vec::new();
-        for (branch, bound) in &path.segments {
-            let found = stmt
-                .query_map(
-                    params![branch.0 as i64, &encoded, COMMITTED, bound.0 as i64],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                        ))
-                    },
+
+        let rows = with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT c.cell_key, c.value, c.version, MAX(c.written_at), c.origin,
+                            c.derivation
+                     FROM cells c JOIN layers l ON c.written_at = l.id
+                     WHERE c.branch = ?1 AND c.buffer = ?2 AND l.state = ?3 AND c.written_at <= ?4
+                     GROUP BY c.cell_key, c.version",
                 )
                 .map_err(sql)?;
 
-            let mut segment = Vec::new();
-            for row in found {
-                let (key, value, version, written_at, origin, derivation) = row.map_err(sql)?;
-                if seen.contains(&key) {
-                    continue;
+            // A child's own record shadows the parent's, so remember what the inner segments
+            // covered.
+            let mut seen: Vec<String> = Vec::new();
+            let mut rows = Vec::new();
+            for (branch, bound) in &segments {
+                let found = stmt
+                    .query_map(
+                        params![branch.0 as i64, &encoded, COMMITTED, bound.0 as i64],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .map_err(sql)?;
+
+                let mut segment = Vec::new();
+                for row in found {
+                    let (key, value, version, written_at, origin, derivation) = row.map_err(sql)?;
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    segment.push(key.clone());
+                    rows.push(Ok((
+                        CellRef {
+                            buffer: target.clone(),
+                            key: decode(&key)?,
+                        },
+                        to_record((value, version, written_at, origin, derivation))?,
+                    )));
                 }
-                segment.push(key.clone());
-                rows.push(Ok((
-                    CellRef {
-                        buffer: buffer.clone(),
-                        key: decode(&key)?,
-                    },
-                    Self::to_record((value, version, written_at, origin, derivation))?,
-                )));
+                seen.extend(segment);
             }
-            seen.extend(segment);
-        }
+            Ok(rows)
+        })
+        .await?;
+
         Ok(Box::pin(futures_util::stream::iter(rows)))
     }
 
     async fn read_layer(&self, layer: LayerId) -> Result<CellStream> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT buffer, cell_key, value, version, written_at, origin, derivation
-                 FROM cells WHERE written_at = ?1",
-            )
-            .map_err(sql)?;
-        let found = stmt
-            .query_map(params![layer.0 as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            })
-            .map_err(sql)?;
+        let id = layer.0 as i64;
+        let rows = with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT buffer, cell_key, value, version, written_at, origin, derivation
+                     FROM cells WHERE written_at = ?1",
+                )
+                .map_err(sql)?;
+            let found = stmt
+                .query_map(params![id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                })
+                .map_err(sql)?;
 
-        let mut rows = Vec::new();
-        for row in found {
-            let (buffer, key, value, version, written_at, origin, derivation) = row.map_err(sql)?;
-            rows.push(Ok((
-                CellRef {
-                    buffer: decode(&buffer)?,
-                    key: decode(&key)?,
-                },
-                Self::to_record((value, version, written_at, origin, derivation))?,
-            )));
-        }
+            let mut rows = Vec::new();
+            for row in found {
+                let (buffer, key, value, version, written_at, origin, derivation) =
+                    row.map_err(sql)?;
+                rows.push(Ok((
+                    CellRef {
+                        buffer: decode(&buffer)?,
+                        key: decode(&key)?,
+                    },
+                    to_record((value, version, written_at, origin, derivation))?,
+                )));
+            }
+            Ok(rows)
+        })
+        .await?;
+
         Ok(Box::pin(futures_util::stream::iter(rows)))
     }
 
     async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached("SELECT event FROM def_events WHERE layer = ?1 ORDER BY seq")
-            .map_err(sql)?;
-        let found = stmt
-            .query_map(params![layer.0 as i64], |row| row.get::<_, String>(0))
-            .map_err(sql)?;
-        let mut events = Vec::new();
-        for row in found {
-            events.push(decode::<DefEvent>(&row.map_err(sql)?)?);
-        }
-        Ok(events)
+        let id = layer.0 as i64;
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT event FROM def_events WHERE layer = ?1 ORDER BY seq")
+                .map_err(sql)?;
+            let found = stmt
+                .query_map(params![id], |row| row.get::<_, String>(0))
+                .map_err(sql)?;
+            let mut events = Vec::new();
+            for row in found {
+                events.push(decode::<DefEvent>(&row.map_err(sql)?)?);
+            }
+            Ok(events)
+        })
+        .await
     }
 
     async fn open_layer(&self, branch: BranchId, id: LayerId) -> Result<Box<dyn OpenLayer>> {
-        {
-            let conn = self.conn.lock().unwrap();
+        let layer = id.0 as i64;
+        let owner = branch.0 as i64;
+        with_conn(&self.conn, move |conn| {
             conn.execute(
                 "INSERT INTO layers (id, branch, state) VALUES (?1, ?2, ?3)",
-                params![id.0 as i64, branch.0 as i64, OPEN],
+                params![layer, owner, OPEN],
             )
-            .map_err(|err| BorgError::Storage(format!("layer {id} already exists: {err}")))?;
-        }
+            .map_err(|err| BorgError::Storage(format!("layer {layer} already exists: {err}")))?;
+            Ok(())
+        })
+        .await?;
+
         Ok(Box::new(SqliteOpenLayer {
             id,
             branch,
             defs: 0,
+            pending: Vec::with_capacity(BATCH),
             conn: Arc::clone(&self.conn),
         }))
     }
 
     async fn commit_layer(&self, layer: SealedLayer) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        // A single-row update, whatever the layer's size. Visibility is a join, not a rewrite.
-        let updated = conn
-            .execute(
-                "UPDATE layers SET state = ?1 WHERE id = ?2 AND state = ?3",
-                params![COMMITTED, layer.id.0 as i64, SEALED],
-            )
-            .map_err(sql)?;
-        if updated == 0 {
-            return Err(BorgError::Storage(format!(
-                "layer {} is not sealed",
-                layer.id
-            )));
-        }
-        Ok(())
+        let id = layer.id;
+        with_conn(&self.conn, move |conn| {
+            // A single-row update, whatever the layer's size. Visibility is a join, not a rewrite.
+            let updated = conn
+                .execute(
+                    "UPDATE layers SET state = ?1 WHERE id = ?2 AND state = ?3",
+                    params![COMMITTED, id.0 as i64, SEALED],
+                )
+                .map_err(sql)?;
+            if updated == 0 {
+                return Err(BorgError::Storage(format!("layer {id} is not sealed")));
+            }
+            Ok(())
+        })
+        .await
     }
 }

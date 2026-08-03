@@ -1028,7 +1028,18 @@ committed. Committing is then a single-row update, `O(1)` however large the laye
 interface exists to preserve.
 
 Reading at HEAD is expressed as *no layer*, not as the branch's head: a fork that has not written
-anything yet has no head of its own, and its effective ceiling is the fork point it inherits. Nothing about derivation,
+anything yet has no head of its own, and its effective ceiling is the fork point it inherits.
+
+**Blocking backends belong on a blocking pool.** The trait is async and the whole engine above it
+awaits, so a synchronous store is the provider's problem alone and must not occupy an async worker
+thread.
+
+**Writes batch; reads do not need to.** `put_cell` is called an unbounded number of times, so
+dispatching each one individually makes overhead dominate. A provider is free to accumulate writes
+into a **bounded** buffer and flush in one transaction — safe precisely because an open layer is
+invisible, so nothing can observe the difference between a row written immediately and one written
+at the next flush. Bounded is the operative word: "never buffer a layer whole" still holds, and a
+ten-million-cell layer passes through in fixed memory. Nothing about derivation,
 dependency tracking or watermarks appears in this interface — all of that lives above the provider
 line.
 
