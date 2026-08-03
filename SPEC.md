@@ -93,10 +93,15 @@ They are stored inline in the cell that holds them.
 The universal addressable unit is the **cell**:
 
 ```
-(pid, field)     -> CellRecord     // an object property
-(pid, index)     -> CellRecord     // a list element
-(pid, <exists>)  -> CellRecord     // existence — a cell like any other (§8.1)
+CellRef { buffer: BufferId, key: CellKey }  ->  CellRecord
+
+key = Pid                 // an object property, or an object's existence
+    | (Pid, index)        // a list element
 ```
+
+**The buffer is part of the address, not derived from it.** A sharded store must be able to route a
+request from the cell address alone; if the shard key required a schema lookup first, every read
+would need the defs before it could be sent anywhere (§17.2).
 
 The cell is the right granularity because every mechanism in Borg is already field-granular:
 transaction guards, producer dependencies, field ownership, migration staleness, and merge conflict
@@ -107,25 +112,39 @@ new field key and touches none of Repo#1's storage.
 
 ### 4.2 Buffers
 
-A **buffer** is a physical partition of cells. The partitioning rule:
+A **buffer** is a partition of cells, and the partition key is a def:
 
-> **Buffers partition by def where a def exists, and globally where one does not.**
+> **One buffer per def.** Values that have no def — interned and untyped ones — get exactly one
+> buffer each.
 
-| Buffer | Granularity | Holds |
+| Buffer | One per | Holds |
 |---|---|---|
-| `ObjectBuffer` | **one per struct** | every cell of that struct — existence cells and property cells alike |
-| `ListBuffer` | one per `ListDef` | list existence and element cells |
-| `StringBuffer` | global | interned strings, keyed by content hash |
-| `BinaryBuffer` | global | interned binary |
-| `BigIntBuffer` | global | interned bigints |
-| `AnyObjectBuffer` / `AnyArrayBuffer` | global | untyped structures, which have no def |
+| `ObjectBuffer` | `ObjectDef` | existence cells for that struct |
+| `ObjectPropBuffer` | `FieldDef` | property cells for that one field |
+| `ListBuffer` | `ListDef` | list existence cells |
+| `ListElemBuffer` | `ListDef` | element cells |
+| `StringBuffer` | — | interned strings, keyed by content hash |
+| `BinaryBuffer` | — | interned binary |
+| `BigIntBuffer` | — | interned bigints |
+| `AnyObjectBuffer` | — | untyped object cells |
+| `AnyArrayBuffer` | — | untyped array cells |
 
-Interning buffers *must* be global — registry-wide deduplication is the entire point.
+The interning buffers are singular by necessity: registry-wide deduplication is their entire purpose.
+The `Any*` buffers are singular because untyped values have no def to partition by.
 
-Partitioning objects per struct is what makes "a producer maps over a source buffer" (§9.2) precise:
-the buffer **is** the set of instances of one struct. It also makes discovering new entities a single
-buffer scan rather than a filtered walk, confines a def-mutation to exactly one buffer, and gives
-distribution a natural shard key (§17.2).
+**Why this granularity.** Buffers are expected to do a great deal of work, and partitioning them
+finely is what makes scaling them horizontally possible later (§17.2). Per-field partitioning also
+matches Borg's actual access pattern: producers read *specific fields* and hop — that is the entire
+point of field-level tracking — and almost never materialize a whole object. A def-mutation is then
+confined to exactly one buffer, and a cross-repo extension like Repo#2's `Company.website` is
+physically isolated from Repo#1's storage rather than merely logically distinct.
+
+**A producer maps over an `ObjectBuffer`** (§9.2), which is precisely the set of instances of one
+struct. Discovering new entities is one buffer scan rather than a filtered walk.
+
+**Logical, not physical.** `BufferId` is a partition key, not a placement decision. A placement
+policy is free to co-locate all of a struct's field buffers on one node for clients that do want
+whole objects. Keeping those two concerns separate is what preserves the option.
 
 Buffers hold complex values only. Primitives live inline in cells.
 
@@ -389,11 +408,15 @@ Nothing is ever physically removed, because time travel requires the history to 
 **Existence is itself a cell.** It must be, or it could not appear in a read-set — and then deletion
 could not invalidate anything.
 
-**Every cell read implicitly depends on its object's existence cell.** Otherwise a `DeleteObject`
-writes only the existence cell, and everything depending on `company#100.name` never observes a write
-to that cell and is never invalidated. The alternative — tombstoning every property cell on delete —
-makes deletion `O(fields)` writes; the implicit dependency costs one extra read-set entry per object
-touched and keeps deletion `O(1)`. The resolver must consult existence for type information anyway.
+**`DeleteObject` tombstones the existence cell and every property cell defined on the struct** —
+`O(fields)` writes, bounded by the def rather than by what was actually set. The alternative was to
+tombstone existence alone and make every cell read implicitly depend on its object's existence cell,
+which keeps deletion `O(1)`. That trade is the wrong way round: it taxes *every read forever* with an
+extra read-set entry in order to make a rare operation cheap. Reads vastly outnumber deletes.
+
+Tombstoning every defined field also keeps invalidation exact with no special-casing — a dependent on
+`company#100.name` observes a real write to that exact cell — and it distinguishes a field that was
+*removed* from one that was merely never set.
 
 With that in place, deletion needs no dedicated machinery at all: **a tombstone is just a write**, so
 it flows through the dependency index and invalidates dependents like any other change. A producer

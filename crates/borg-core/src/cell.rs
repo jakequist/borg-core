@@ -6,7 +6,7 @@
 
 use crate::ids::{ClientVersion, LayerId, ProducerId};
 use crate::pid::Pid;
-use crate::value::Value;
+use crate::value::{ObjectTypeName, Value};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -15,39 +15,115 @@ use std::sync::Arc;
 /// compared constantly during dependency-index lookups.
 pub type FieldName = Arc<str>;
 
-/// Addresses one cell.
+/// Identifies a buffer — a partition of cells. SPEC.md §4.2.
+///
+/// **One buffer per def.** Values with no def — interned and untyped ones — get exactly one buffer
+/// each. Partitioning this finely is what makes horizontal scaling possible later, and it matches
+/// the real access pattern: producers read specific fields and hop, rather than materializing whole
+/// objects.
+///
+/// This is a *logical* partition key, not a placement decision. A placement policy is free to
+/// co-locate all of a struct's field buffers on one node; keeping the two separate preserves that
+/// option.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum CellRef {
-    /// An object property. SPEC.md §4.1.
-    Prop { pid: Pid, field: FieldName },
+pub enum BufferId {
+    /// One per `ObjectDef`. Holds existence cells — and so *is* the set of instances of one struct,
+    /// which is what a producer maps over (SPEC.md §9.2).
+    Object(ObjectTypeName),
+    /// One per `FieldDef`. Holds the cells of exactly one field.
+    ObjectProp(ObjectTypeName, FieldName),
+    /// One per `ListDef`.
+    List(ObjectTypeName),
+    ListElem(ObjectTypeName),
+    /// Singular by necessity — registry-wide deduplication is the whole purpose of interning.
+    String,
+    Binary,
+    BigInt,
+    /// Singular because untyped values have no def to partition by.
+    AnyObject,
+    AnyArray,
+}
+
+/// Locates a cell within its buffer.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CellKey {
+    /// An object property, or an object's existence. The buffer already names the field, so the PID
+    /// is the whole key.
+    Pid(Pid),
     /// A list element. Lists are append-only in v1, so indices are stable (SPEC.md §4.4).
-    Elem { pid: Pid, index: u64 },
-    /// An object's existence. A cell like any other — it has to be, or it could not appear in a
-    /// read-set, and then deletion could not invalidate anything (SPEC.md §8.1).
-    ///
-    /// **Every cell read implicitly depends on its object's existence cell.** Otherwise a
-    /// `DeleteObject` writes only this cell, and everything depending on `company#100.name` never
-    /// observes a write to *that* cell and is never invalidated. Costs one extra read-set entry per
-    /// object touched, and keeps deletion `O(1)` rather than `O(fields)`.
-    Existence { pid: Pid },
+    Elem(Pid, u64),
+}
+
+impl CellKey {
+    pub const fn pid(&self) -> &Pid {
+        match self {
+            CellKey::Pid(pid) | CellKey::Elem(pid, _) => pid,
+        }
+    }
+}
+
+/// Addresses one cell.
+///
+/// **The buffer is part of the address, not derived from it.** A sharded store must be able to route
+/// a request from the cell address alone; were the shard key to require a schema lookup first, every
+/// read would need the defs before it could be sent anywhere (SPEC.md §17.2).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CellRef {
+    pub buffer: BufferId,
+    pub key: CellKey,
 }
 
 impl CellRef {
+    pub fn prop(struct_name: ObjectTypeName, field: FieldName, pid: Pid) -> Self {
+        Self {
+            buffer: BufferId::ObjectProp(struct_name, field),
+            key: CellKey::Pid(pid),
+        }
+    }
+
+    /// An object's existence. A cell like any other — it has to be, or it could not appear in a
+    /// read-set, and then deletion could not invalidate anything (SPEC.md §8.1).
+    pub fn existence(struct_name: ObjectTypeName, pid: Pid) -> Self {
+        Self {
+            buffer: BufferId::Object(struct_name),
+            key: CellKey::Pid(pid),
+        }
+    }
+
+    pub fn elem(list_def: ObjectTypeName, pid: Pid, index: u64) -> Self {
+        Self {
+            buffer: BufferId::ListElem(list_def),
+            key: CellKey::Elem(pid, index),
+        }
+    }
+
     pub const fn pid(&self) -> &Pid {
+        self.key.pid()
+    }
+}
+
+impl fmt::Debug for BufferId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CellRef::Prop { pid, .. } | CellRef::Elem { pid, .. } | CellRef::Existence { pid } => {
-                pid
-            }
+            BufferId::Object(name) => write!(f, "{name}"),
+            BufferId::ObjectProp(name, field) => write!(f, "{name}.{field}"),
+            BufferId::List(name) => write!(f, "List<{name}>"),
+            BufferId::ListElem(name) => write!(f, "List<{name}>[]"),
+            BufferId::String => f.write_str("String"),
+            BufferId::Binary => f.write_str("Binary"),
+            BufferId::BigInt => f.write_str("BigInt"),
+            BufferId::AnyObject => f.write_str("AnyObject"),
+            BufferId::AnyArray => f.write_str("AnyArray"),
         }
     }
 }
 
 impl fmt::Debug for CellRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CellRef::Prop { pid, field } => write!(f, "{pid:?}.{field}"),
-            CellRef::Elem { pid, index } => write!(f, "{pid:?}[{index}]"),
-            CellRef::Existence { pid } => write!(f, "{pid:?}.<exists>"),
+        match (&self.buffer, &self.key) {
+            (BufferId::Object(_), CellKey::Pid(pid)) => write!(f, "{pid:?}.<exists>"),
+            (buffer, CellKey::Pid(pid)) => write!(f, "{pid:?}@{buffer:?}"),
+            (buffer, CellKey::Elem(pid, i)) => write!(f, "{pid:?}[{i}]@{buffer:?}"),
         }
     }
 }
@@ -89,25 +165,4 @@ pub struct Derivation {
     /// Exactly the cells this invocation read, captured automatically via `ProducerCtx`
     /// (SPEC.md §9.4). Read forwards it drives invalidation; read backwards, lineage.
     pub read_set: Vec<CellRef>,
-}
-
-/// Identifies a buffer — a physical partition of cells. SPEC.md §4.2.
-///
-/// Buffers partition **by def where a def exists, and globally where one does not.** Objects get one
-/// buffer per struct, which is what makes "a producer maps over a source buffer" precise: the buffer
-/// *is* the set of instances of one struct. Interning buffers must be global, since registry-wide
-/// deduplication is their entire purpose.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-pub enum BufferId {
-    /// One per struct.
-    Object(crate::value::ObjectTypeName),
-    /// One per `ListDef`.
-    List(crate::value::ObjectTypeName),
-    /// Global — interning is registry-wide by definition.
-    String,
-    Binary,
-    BigInt,
-    /// Global — the `Any*` family has no def to partition by.
-    AnyObject,
-    AnyArray,
 }
