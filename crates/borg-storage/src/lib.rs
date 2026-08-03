@@ -10,7 +10,7 @@ pub mod memory;
 pub use memory::MemoryStorage;
 
 use async_trait::async_trait;
-use borg_core::{BranchId, BufferId, CellRecord, CellRef, LayerId, Result};
+use borg_core::{BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, Result};
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
 ///
@@ -39,14 +39,31 @@ pub struct SealedLayer {
 
 #[async_trait]
 pub trait StorageProvider: Send + Sync {
-    /// Resolve one cell as of a layer. The engine layers migration, validation and provenance on
-    /// top; this returns only what is physically stored.
+    /// Resolve one cell as of a layer, **at one def-version**.
+    ///
+    /// Version is part of the key, not a filter. Writes are never coerced (SPEC.md §5.4), so one
+    /// cell may be materialized at several versions simultaneously — the value a v1 client wrote and
+    /// the migrated view a v5 client reads coexist. Were version merely a tag, a migration would
+    /// overwrite the very value it migrated from.
+    ///
+    /// Returns only what is physically stored; the engine layers migration, validation and
+    /// provenance on top.
     async fn get_cell(
         &self,
         branch: BranchId,
         cell: &CellRef,
         layer: LayerId,
+        version: ClientVersion,
     ) -> Result<Option<CellRecord>>;
+
+    /// Which def-versions this cell is materialized at, as of a layer. Used by the resolver to find
+    /// a migration path when the requested version is not yet materialized.
+    async fn cell_versions(
+        &self,
+        branch: BranchId,
+        cell: &CellRef,
+        layer: LayerId,
+    ) -> Result<Vec<ClientVersion>>;
 
     /// Enumerate a buffer. **Engine-internal only** — used by the scheduler to discover new
     /// entities (SPEC.md §9.6). Enumeration is not exposed as a user-facing query in v1.

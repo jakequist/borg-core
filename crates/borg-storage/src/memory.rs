@@ -9,11 +9,13 @@
 
 use crate::{CellStream, OpenLayer, SealedLayer, StorageProvider};
 use async_trait::async_trait;
-use borg_core::{BorgError, BranchId, BufferId, CellRecord, CellRef, LayerId, Result};
+use borg_core::{
+    BorgError, BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, Result,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-type Committed = HashMap<BranchId, HashMap<CellRef, Vec<(LayerId, CellRecord)>>>;
+type Committed = HashMap<BranchId, HashMap<(CellRef, ClientVersion), Vec<(LayerId, CellRecord)>>>;
 
 #[derive(Default)]
 struct Inner {
@@ -91,12 +93,13 @@ impl StorageProvider for MemoryStorage {
         branch: BranchId,
         cell: &CellRef,
         layer: LayerId,
+        version: ClientVersion,
     ) -> Result<Option<CellRecord>> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .committed
             .get(&branch)
-            .and_then(|cells| cells.get(cell))
+            .and_then(|cells| cells.get(&(cell.clone(), version)))
             .and_then(|history| {
                 history
                     .iter()
@@ -104,6 +107,23 @@ impl StorageProvider for MemoryStorage {
                     .find(|(written_at, _)| written_at.0 <= layer.0)
                     .map(|(_, record)| record.clone())
             }))
+    }
+
+    async fn cell_versions(
+        &self,
+        branch: BranchId,
+        cell: &CellRef,
+        layer: LayerId,
+    ) -> Result<Vec<ClientVersion>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .committed
+            .get(&branch)
+            .into_iter()
+            .flatten()
+            .filter(|((c, _), history)| c == cell && history.iter().any(|(at, _)| at.0 <= layer.0))
+            .map(|((_, version), _)| *version)
+            .collect())
     }
 
     async fn scan_buffer(
@@ -118,8 +138,8 @@ impl StorageProvider for MemoryStorage {
             .get(&branch)
             .into_iter()
             .flatten()
-            .filter(|(cell, _)| &cell.buffer == buffer)
-            .filter_map(|(cell, history)| {
+            .filter(|((cell, _), _)| &cell.buffer == buffer)
+            .filter_map(|((cell, _), history)| {
                 history
                     .iter()
                     .rev()
@@ -177,7 +197,7 @@ impl StorageProvider for MemoryStorage {
         let branch_cells = inner.committed.entry(staged.branch).or_default();
         for (cell, record) in &staged.writes {
             branch_cells
-                .entry(cell.clone())
+                .entry((cell.clone(), record.version))
                 .or_default()
                 .push((layer.id, record.clone()));
         }

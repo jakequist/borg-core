@@ -43,6 +43,8 @@ struct RecordingCtx<'a> {
     /// reflect.
     reflects: LayerId,
     producer: ProducerId,
+    /// The def-view this producer's code was authored against. Reads resolve here and writes are
+    /// labelled with it.
     version: ClientVersion,
     layer: &'a mut LayerHandle,
     read_set: Vec<CellRef>,
@@ -52,6 +54,11 @@ struct RecordingCtx<'a> {
 #[async_trait]
 impl ProducerCtx for RecordingCtx<'_> {
     async fn get(&mut self, cell: &CellRef) -> Result<Option<Value>> {
+        let version = self.version;
+        self.get_at(cell, version).await
+    }
+
+    async fn get_at(&mut self, cell: &CellRef, version: ClientVersion) -> Result<Option<Value>> {
         // Recorded before the lookup, so that a read finding *nothing* is still a dependency.
         // Absence is a legitimate input, and a later write to that cell must invalidate this run.
         if !self.read_set.contains(cell) {
@@ -59,7 +66,7 @@ impl ProducerCtx for RecordingCtx<'_> {
         }
         let record = self
             .storage
-            .get_cell(self.branch, cell, self.read_at)
+            .get_cell(self.branch, cell, self.read_at, version)
             .await?;
         Ok(record.map(|r| r.value))
     }

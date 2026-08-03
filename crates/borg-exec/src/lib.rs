@@ -27,9 +27,18 @@ pub struct ProducerRef {
 /// through the derivation engine afterwards is a far larger change than paying for it now.
 #[async_trait]
 pub trait ProducerCtx: Send {
-    /// Read a cell. Recorded into the read-set — including reads that find nothing, since absence is
-    /// a legitimate dependency (SPEC.md §9.4).
+    /// Read a cell at this producer's own ClientVersion — the def-view its code was authored
+    /// against (SPEC.md §5.4). Recorded into the read-set, including reads that find nothing, since
+    /// absence is a legitimate dependency (SPEC.md §9.4).
     async fn get(&mut self, cell: &CellRef) -> Result<Option<Value>>;
+
+    /// Read a cell at an explicitly chosen def-version.
+    ///
+    /// Exists for exactly one case: a migration reading its own source cell. `up_v1→v2` runs at
+    /// ClientVersion v2, so an ordinary `get` of the cell it is migrating would resolve at v2 and
+    /// recurse into itself. Every *other* read a migration makes is an ordinary `get` and correctly
+    /// sees the target view (SPEC.md §9.3).
+    async fn get_at(&mut self, cell: &CellRef, version: ClientVersion) -> Result<Option<Value>>;
 
     /// Write a cell. Checked against field ownership: every field has exactly one writer, and a
     /// violation poisons this producer rather than the branch (SPEC.md §8, §14).

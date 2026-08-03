@@ -94,7 +94,10 @@ impl Harness {
 
     async fn read(&self, cell: &CellRef) -> Option<CellRecord> {
         let head = self.layers.head(BRANCH).unwrap();
-        self.storage.get_cell(BRANCH, cell, head).await.unwrap()
+        self.storage
+            .get_cell(BRANCH, cell, head, ClientVersion(LayerId(1)))
+            .await
+            .unwrap()
     }
 }
 

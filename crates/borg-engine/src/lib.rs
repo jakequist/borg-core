@@ -35,15 +35,18 @@
 //! See `SPEC.md` §16 for the full architecture and §16.3 for the invariants that hold it together.
 
 pub mod branch;
+pub mod defs;
 pub mod derive;
 pub mod index;
 pub mod log;
 pub mod resolve;
 pub mod seams;
 
+pub use defs::{DefRegistry, MigrationHop, VersionStep};
 pub use derive::DerivationEngine;
 pub use index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};
 pub use log::{LayerHandle, LayerManager};
 pub use resolve::FrontierTracker;
+pub use resolve::{Lineage, LineageEdge, Resolver};
 pub use seams::InProcessSequencer;
 pub use seams::{LayerSequencer, LockManager, WorkGap, WorkSource};
