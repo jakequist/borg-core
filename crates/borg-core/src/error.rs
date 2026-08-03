@@ -3,7 +3,7 @@
 //! Most interesting failures in Borg are only detectable at runtime — cycles, throwing migrations,
 //! field-ownership violations. They attach to the *producer*, not the branch (SPEC.md §14).
 
-use crate::cell::CellRef;
+use crate::cell::{CellAt, CellRef};
 use crate::ids::{BranchId, LayerId, ProducerId};
 use crate::value::ObjectTypeName;
 
@@ -38,7 +38,7 @@ pub enum BorgError {
     /// SPEC.md §8: every field has exactly one writer.
     #[error("producer {attempted:?} wrote {cell:?}, which is owned by producer {owner:?}")]
     FieldOwnershipViolation {
-        cell: CellRef,
+        cell: CellAt,
         owner: Option<ProducerId>,
         attempted: ProducerId,
     },

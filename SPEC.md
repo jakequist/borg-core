@@ -501,6 +501,16 @@ Migration reads resolve at the migration's own ClientVersion (§5.4). A migratio
 value of the type it is migrating recursively invokes itself on that value — which terminates on a
 DAG and trips the cycle detector otherwise.
 
+**A migration maps over the field's buffer**, not the struct's — it is defined per output field, and
+per-field buffers (§4.2) make that exactly expressible. A write at the source version is work for the
+migration in precisely the way a data write is work for a pipeline.
+
+**A producer is never triggered by its own output.** A migration writes into the very buffer it
+consumes from, one version along, and would otherwise re-trigger itself forever. Its own output
+appearing in its source buffer is not a new entity. This applies only to the new-entity trigger —
+the read-set trigger is deliberately *not* filtered by author, because a producer disturbing a cell
+it reads is exactly a cycle and must be caught rather than hidden.
+
 **Optimization:** if a migration's recorded read-set contains only its own source cell, the system
 *infers* purity and caches the result permanently with no invalidation. Inferred, never declared.
 
@@ -511,6 +521,16 @@ lossy or partial `down` migrations is deferred.
 
 Dependencies are captured at **field granularity, through hops**, including negative reads (checking
 a field that is absent is a dependency on its absence).
+
+**Read-sets record the version each cell was read at**, not the cell alone. `CellRef` is the shard
+key — where a cell lives, computable without a schema lookup; `CellAt` is the record key — which of
+that cell's versions you mean. The dependency index and field ownership both key on `CellAt`. Keying
+them on `CellRef` would make a migration, which reads `C@v1` and writes `C@v9`, observe its own
+output as a change to its own input and poison itself as a cycle. It also means a pipeline reading
+`C@v1` is correctly left alone when a migration materializes `C@v9`.
+
+**Field ownership is per version.** The same cell at v1 and at v9 is legitimately written by
+different producers — a client and the migration carrying its value forward.
 
 **Capture is automatic and requires no declaration.** Every cell access a producer makes goes through
 `ProducerCtx` (§17), so the engine observes reads and writes exactly, with nothing for an author to

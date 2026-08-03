@@ -75,6 +75,7 @@ impl Harness {
             index.clone(),
             Arc::new(executor),
             Arc::new(FrontierTracker::new()),
+            defs.clone(),
         ));
         engine.register(ProducerDef {
             id: SCORE,
@@ -258,7 +259,11 @@ async fn explain_walks_the_dependency_index_backwards() -> Result<()> {
 
     assert_eq!(lineage.produced_by, Some(SCORE));
     assert_eq!(lineage.from.len(), 1, "one input was read, so one edge");
-    assert_eq!(lineage.from[0].cell, prop(acme, "website"));
+    assert_eq!(lineage.from[0].cell.cell, prop(acme, "website"));
+    assert_eq!(
+        lineage.from[0].cell.version, V1,
+        "the edge records the version the producer read at"
+    );
     assert_eq!(
         lineage.from[0].origin,
         Origin::Source,

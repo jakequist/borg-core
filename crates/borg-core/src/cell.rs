@@ -128,6 +128,33 @@ impl fmt::Debug for CellRef {
     }
 }
 
+/// A cell at one def-version — the full address of a stored record.
+///
+/// `CellRef` is the *shard key*: where the cell lives, computable without a schema lookup. `CellAt`
+/// is the *record key*: which of that cell's versions you mean. One cell may be materialized at
+/// several versions at once, because writes are never coerced (SPEC.md §5.4).
+///
+/// Read-sets, the dependency index and field ownership all key on `CellAt`, not `CellRef`. Keying
+/// them on `CellRef` alone would make a migration — which reads `C@v1` and writes `C@v9` — observe
+/// its own output as a change to its own input, and poison itself as a cycle.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CellAt {
+    pub cell: CellRef,
+    pub version: ClientVersion,
+}
+
+impl CellAt {
+    pub const fn new(cell: CellRef, version: ClientVersion) -> Self {
+        Self { cell, version }
+    }
+}
+
+impl fmt::Debug for CellAt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}@{:?}", self.cell, self.version)
+    }
+}
+
 /// Whether a cell is ground truth or computed. SPEC.md §8.
 ///
 /// Origin is a property of the `(struct, field)` pair, not of the object: one `Company` may carry
@@ -162,7 +189,8 @@ pub struct Derivation {
     /// The source layer through which every input has been incorporated — i.e. *"replay the world at
     /// this layer and you get exactly this value."* SPEC.md §10.1.
     pub fresh_as_of: LayerId,
-    /// Exactly the cells this invocation read, captured automatically via `ProducerCtx`
-    /// (SPEC.md §9.4). Read forwards it drives invalidation; read backwards, lineage.
-    pub read_set: Vec<CellRef>,
+    /// Exactly the cells this invocation read, *at the versions it read them at*, captured
+    /// automatically via `ProducerCtx` (SPEC.md §9.4). Read forwards it drives invalidation; read
+    /// backwards, lineage.
+    pub read_set: Vec<CellAt>,
 }

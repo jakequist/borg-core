@@ -13,8 +13,8 @@ use crate::resolve::FrontierTracker;
 use crate::seams::WorkGap;
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, BranchId, CellRecord, CellRef, ClientVersion, Derivation, LayerAuthor, LayerId,
-    LayerKind, Origin, Pid, ProducerDef, ProducerId, Result, Value,
+    BorgError, BranchId, CellAt, CellRecord, CellRef, ClientVersion, Derivation, LayerAuthor,
+    LayerId, LayerKind, Origin, Pid, ProducerDef, ProducerId, ProducerKind, Result, Value,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_storage::StorageProvider;
@@ -47,8 +47,8 @@ struct RecordingCtx<'a> {
     /// labelled with it.
     version: ClientVersion,
     layer: &'a mut LayerHandle,
-    read_set: Vec<CellRef>,
-    write_set: Vec<CellRef>,
+    read_set: Vec<CellAt>,
+    write_set: Vec<CellAt>,
 }
 
 #[async_trait]
@@ -61,8 +61,12 @@ impl ProducerCtx for RecordingCtx<'_> {
     async fn get_at(&mut self, cell: &CellRef, version: ClientVersion) -> Result<Option<Value>> {
         // Recorded before the lookup, so that a read finding *nothing* is still a dependency.
         // Absence is a legitimate input, and a later write to that cell must invalidate this run.
-        if !self.read_set.contains(cell) {
-            self.read_set.push(cell.clone());
+        //
+        // Recorded *at the version read*, so that a migration writing `C@v9` does not appear to have
+        // disturbed its own read of `C@v1`.
+        let read = CellAt::new(cell.clone(), version);
+        if !self.read_set.contains(&read) {
+            self.read_set.push(read);
         }
         let record = self
             .storage
@@ -72,18 +76,21 @@ impl ProducerCtx for RecordingCtx<'_> {
     }
 
     async fn set(&mut self, cell: &CellRef, value: Value) -> Result<()> {
-        // Every field has exactly one writer, discovered at runtime (SPEC.md §8).
-        if let Some(owner) = self.index.writer_of(self.branch, cell)?
+        // Every field has exactly one writer, discovered at runtime (SPEC.md §8). Ownership is per
+        // *version*: the same cell at v1 and at v9 is legitimately written by different producers —
+        // a client and the migration that carries its value forward.
+        let written = CellAt::new(cell.clone(), self.version);
+        if let Some(owner) = self.index.writer_of(self.branch, &written)?
             && owner != self.producer
         {
             return Err(BorgError::FieldOwnershipViolation {
-                cell: cell.clone(),
+                cell: written,
                 owner: Some(owner),
                 attempted: self.producer,
             });
         }
-        if !self.write_set.contains(cell) {
-            self.write_set.push(cell.clone());
+        if !self.write_set.contains(&written) {
+            self.write_set.push(written);
         }
         let record = CellRecord {
             value,
@@ -107,6 +114,7 @@ pub struct DerivationEngine {
     index: Arc<dyn DependencyIndexProvider>,
     executor: Arc<dyn ExecutionProvider>,
     frontier: Arc<FrontierTracker>,
+    defs: Arc<crate::defs::DefRegistry>,
     producers: Mutex<HashMap<ProducerId, ProducerDef>>,
     /// Producers poisoned by a runtime failure. Scoped to the producer, never the branch — which is
     /// why main never breaks because someone merged a bad pipeline (SPEC.md §14).
@@ -120,6 +128,7 @@ impl DerivationEngine {
         index: Arc<dyn DependencyIndexProvider>,
         executor: Arc<dyn ExecutionProvider>,
         frontier: Arc<FrontierTracker>,
+        defs: Arc<crate::defs::DefRegistry>,
     ) -> Self {
         Self {
             storage,
@@ -127,6 +136,7 @@ impl DerivationEngine {
             index,
             executor,
             frontier,
+            defs,
             producers: Mutex::new(HashMap::new()),
             broken: Mutex::new(HashMap::new()),
         }
@@ -217,6 +227,16 @@ impl DerivationEngine {
                 if self.is_broken(branch, def.id).is_some() {
                     continue;
                 }
+                // A producer already caught up past this layer has no business in this round —
+                // otherwise a newly-registered producer replaying history would drag every
+                // up-to-date producer back through it.
+                if self.frontier.watermark(branch, def.id).0 >= source_layer.0 {
+                    continue;
+                }
+                // Migrations materialize only for versions that have live clients (SPEC.md §5.5).
+                if !self.is_materialized_version(&def) {
+                    continue;
+                }
                 for invocation in self.invalidated_by(branch, &cells, &def)? {
                     let runs = reruns.entry(invocation.clone()).or_insert(0);
                     *runs += 1;
@@ -258,13 +278,26 @@ impl DerivationEngine {
         Ok(executed)
     }
 
-    async fn cells_of(&self, layer: LayerId) -> Result<Vec<CellRef>> {
+    /// A committed layer's changeset: each cell at the version it was written at, and which
+    /// producer wrote it (`None` for source data).
+    async fn cells_of(&self, layer: LayerId) -> Result<Vec<(CellAt, Option<ProducerId>)>> {
         let mut stream = self.storage.read_layer(layer).await?;
         let mut cells = Vec::new();
         while let Some(row) = stream.next().await {
-            cells.push(row?.0);
+            let (cell, record) = row?;
+            let by = record.derivation.as_ref().map(|d| d.producer);
+            cells.push((CellAt::new(cell, record.version), by));
         }
         Ok(cells)
+    }
+
+    /// Whether this producer's output is worth materializing. SPEC.md §5.5.
+    fn is_materialized_version(&self, def: &ProducerDef) -> bool {
+        let ProducerKind::Migration { to, .. } = def.kind else {
+            return true;
+        };
+        let live = self.defs.live_versions();
+        live.is_empty() || live.contains(&ClientVersion(to))
     }
 
     fn producer_defs(&self) -> Vec<ProducerDef> {
@@ -275,24 +308,33 @@ impl DerivationEngine {
     fn invalidated_by(
         &self,
         branch: BranchId,
-        cells: &[CellRef],
+        cells: &[(CellAt, Option<ProducerId>)],
         def: &ProducerDef,
     ) -> Result<Vec<Invocation>> {
-        // (a) cell writes -> existing invocations that read those cells go dirty.
+        // (a) cell writes -> existing invocations that read those cells go dirty. Deliberately *not*
+        // filtered by author: a producer disturbing a cell it reads is exactly a cycle, and must be
+        // caught rather than hidden.
+        let written: Vec<CellAt> = cells.iter().map(|(cell, _)| cell.clone()).collect();
         let mut invocations: Vec<Invocation> = self
             .index
-            .dependents(branch, cells)?
+            .dependents(branch, &written)?
             .into_iter()
             .filter(|i| i.producer == def.id)
             .collect();
 
-        // (b) writes into this producer's source buffer -> new invocations. That buffer holds
-        // existence cells, so this is exactly "a new entity appeared" (SPEC.md §4.2).
-        for cell in cells {
-            if cell.buffer == def.source {
+        // (b) writes into this producer's source buffer -> new invocations.
+        //
+        // Skipping this producer's own output matters: a migration writes `C@v9` into the very
+        // buffer it consumes `C@v1` from, and would otherwise re-trigger itself forever. Its own
+        // output appearing in its source buffer is not a new entity.
+        for (cell, by) in cells {
+            if *by == Some(def.id) {
+                continue;
+            }
+            if cell.cell.buffer == def.source {
                 let candidate = Invocation {
                     producer: def.id,
-                    input: *cell.pid(),
+                    input: *cell.cell.pid(),
                 };
                 if !invocations.contains(&candidate) {
                     invocations.push(candidate);
@@ -323,9 +365,16 @@ impl DerivationEngine {
             )
             .await?;
 
+        // A migration's ClientVersion is the def-layer that introduced its target: it reads the
+        // world at the target view and writes the target version. Its own source cell is the one
+        // exception, reached through `ProducerCtx::get_at` (SPEC.md §9.3).
+        let version = match def.kind {
+            ProducerKind::Migration { to, .. } => ClientVersion(to),
+            ProducerKind::Pipeline => ClientVersion(def.version),
+        };
         let producer_ref = ProducerRef {
             id: def.id,
-            version: ClientVersion(def.version),
+            version,
         };
         let mut ctx = RecordingCtx {
             storage: self.storage.as_ref(),
@@ -334,7 +383,7 @@ impl DerivationEngine {
             read_at,
             reflects,
             producer: def.id,
-            version: ClientVersion(def.version),
+            version,
             layer: &mut layer,
             read_set: Vec::new(),
             write_set: Vec::new(),

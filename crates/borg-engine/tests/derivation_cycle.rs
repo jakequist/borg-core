@@ -5,11 +5,12 @@
 //! queued anywhere.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId, LayerKind,
-    Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    BranchId, BufferId, CellAt, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId,
+    LayerKind, Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
 };
 use borg_engine::{
-    DerivationEngine, FrontierTracker, InProcessSequencer, LayerManager, MemoryDependencyIndex,
+    DefRegistry, DerivationEngine, FrontierTracker, InProcessSequencer, LayerManager,
+    MemoryDependencyIndex,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -57,6 +58,7 @@ impl Harness {
             Arc::new(MemoryDependencyIndex::new()),
             Arc::new(executor),
             frontier.clone(),
+            Arc::new(DefRegistry::new()),
         ));
         engine.register(ProducerDef {
             id: SCORE,
@@ -146,8 +148,12 @@ async fn derives_on_create_and_tracks_at_field_granularity() -> Result<()> {
     assert_eq!(derivation.producer, SCORE);
     assert_eq!(
         derivation.read_set,
-        vec![prop(acme, "website")],
-        "the read-set is captured automatically, and contains only what was actually read"
+        vec![CellAt::new(
+            prop(acme, "website"),
+            ClientVersion(LayerId(1))
+        )],
+        "the read-set is captured automatically, at the version read, and contains only what was \
+         actually read"
     );
 
     // A write to a field nobody read must trigger nothing. This is the whole point of field-level

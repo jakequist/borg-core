@@ -7,8 +7,8 @@
 use crate::defs::DefRegistry;
 use crate::index::DependencyIndexProvider;
 use borg_core::{
-    BranchId, CellRef, ClientVersion, Freshness, FreshnessRequirement, LayerId, Origin, ProducerId,
-    Resolved, Result, Value,
+    BranchId, CellAt, CellRef, ClientVersion, Freshness, FreshnessRequirement, LayerId, Origin,
+    ProducerId, Resolved, Result, Value,
 };
 use borg_storage::StorageProvider;
 use std::collections::HashMap;
@@ -64,7 +64,7 @@ impl FrontierTracker {
 /// One edge of a cell's provenance. SPEC.md §11.
 #[derive(Clone, Debug)]
 pub struct LineageEdge {
-    pub cell: CellRef,
+    pub cell: CellAt,
     pub origin: Origin,
     pub written_at: LayerId,
 }
@@ -73,7 +73,7 @@ pub struct LineageEdge {
 /// backwards (SPEC.md §11).
 #[derive(Clone, Debug)]
 pub struct Lineage {
-    pub cell: CellRef,
+    pub cell: CellAt,
     pub produced_by: Option<ProducerId>,
     pub written_at: LayerId,
     pub fresh_as_of: LayerId,
@@ -145,14 +145,8 @@ impl Resolver {
                 }
             }
             FreshnessRequirement::Validated | FreshnessRequirement::Current => {
-                self.validate(
-                    branch,
-                    &derivation.read_set,
-                    derivation.fresh_as_of,
-                    layer,
-                    version,
-                )
-                .await?
+                self.validate(branch, &derivation.read_set, derivation.fresh_as_of, layer)
+                    .await?
             }
         };
 
@@ -184,15 +178,16 @@ impl Resolver {
     async fn validate(
         &self,
         branch: BranchId,
-        read_set: &[CellRef],
+        read_set: &[CellAt],
         fresh_as_of: LayerId,
         target: LayerId,
-        version: ClientVersion,
     ) -> Result<Freshness> {
         for dependency in read_set {
+            // Each dependency is checked at the version the producer *read it at*, not at the
+            // reader's version. Those differ whenever a migration is involved.
             let moved = self
                 .storage
-                .get_cell(branch, dependency, target, version)
+                .get_cell(branch, &dependency.cell, target, dependency.version)
                 .await?
                 .is_some_and(|record| record.written_at.0 > fresh_as_of.0);
             if moved {
@@ -249,13 +244,14 @@ impl Resolver {
         let Some(record) = self.storage.get_cell(branch, cell, layer, version).await? else {
             return Ok(None);
         };
-        let dependencies = self.index.dependencies(branch, cell)?;
+        let target = CellAt::new(cell.clone(), version);
+        let dependencies = self.index.dependencies(branch, &target)?;
 
         let mut from = Vec::new();
         for dependency in dependencies {
             if let Some(source) = self
                 .storage
-                .get_cell(branch, &dependency, layer, version)
+                .get_cell(branch, &dependency.cell, layer, dependency.version)
                 .await?
             {
                 from.push(LineageEdge {
@@ -267,7 +263,7 @@ impl Resolver {
         }
 
         Ok(Some(Lineage {
-            cell: cell.clone(),
+            cell: target,
             produced_by: record.derivation.as_ref().map(|d| d.producer),
             written_at: record.written_at,
             fresh_as_of: record
