@@ -90,6 +90,18 @@ impl CellRef {
         }
     }
 
+    /// A list's own cell. **Its value is the list's length**, so appending changes it — which is
+    /// what makes iterating a list a tracked dependency rather than an invisible one.
+    ///
+    /// The container cell holds whatever is true of the container as a whole: for an object, that it
+    /// exists; for a list, how far it extends.
+    pub fn list(element: ObjectTypeName, pid: Pid) -> Self {
+        Self {
+            buffer: BufferId::List(element),
+            key: CellKey::Pid(pid),
+        }
+    }
+
     pub fn elem(list_def: ObjectTypeName, pid: Pid, index: u64) -> Self {
         Self {
             buffer: BufferId::ListElem(list_def),
@@ -133,6 +145,7 @@ impl fmt::Debug for CellRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.buffer, &self.key) {
             (BufferId::Object(_), CellKey::Pid(pid)) => write!(f, "{pid:?}.<exists>"),
+            (BufferId::List(_), CellKey::Pid(pid)) => write!(f, "{pid:?}.<len>"),
             (buffer, CellKey::Pid(pid)) => write!(f, "{pid:?}@{buffer:?}"),
             (buffer, CellKey::Elem(pid, i)) => write!(f, "{pid:?}[{i}]@{buffer:?}"),
         }

@@ -174,6 +174,16 @@ producer — attaches to derived cells only, which in a normalized model are the
 Lists are **append-only in v1**. Element cells are keyed `(pid, index)`; mid-list insertion would
 shift every downstream key and is deferred.
 
+**A list's own cell holds its length.** The container cell holds whatever is true of the container as
+a whole — for an object, that it exists; for a list, how far it extends. This is what makes
+*iterating* a tracked dependency: a producer that walks a list reads the length cell, so an append
+changes a cell it read and recomputes it. Without that, appends would be invisible to anyone
+iterating.
+
+Note what this does *not* do: reading element `n` depends on element `n` alone. A producer that
+takes only the last element of a list is unaffected by an earlier element changing, even though both
+live in the same buffer.
+
 ---
 
 ## 5. Definitions
