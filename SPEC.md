@@ -995,7 +995,7 @@ without semantic change.
 
 | Provider | v1 implementation | Later |
 |---|---|---|
-| `StorageProvider` | external KV / SQL | native Borg storage |
+| `StorageProvider` | SQLite (`borg-storage-sqlite`), or in-memory | native Borg storage |
 | `DependencyIndexProvider` | in-memory, key-ranged | persistent, sharded by cell key |
 | `ProducerPolicyProvider` | `NaiveEagerProducerPolicy` | prioritized, incremental, batched |
 | `ExecutionProvider` | in-process Rust, full trust | container over a socket |
@@ -1019,7 +1019,16 @@ open_layer / seal_layer / commit_layer / abort_layer
 ```
 
 **Streaming commit is the binding constraint** (§6.2). Any provider that cannot accept an unbounded
-write stream into an uncommitted, invisible layer is disqualified. Nothing about derivation,
+write stream into an uncommitted, invisible layer is disqualified.
+
+The SQL shape that satisfies it: rows are inserted as they arrive and **visibility is a join, not a
+rewrite** — every read joins the cell table against a layer table and keeps only rows whose layer is
+committed. Committing is then a single-row update, `O(1)` however large the layer. Flipping a
+`visible` column on each row instead would make commit `O(rows)` and undo the very property the
+interface exists to preserve.
+
+Reading at HEAD is expressed as *no layer*, not as the branch's head: a fork that has not written
+anything yet has no head of its own, and its effective ceiling is the fork point it inherits. Nothing about derivation,
 dependency tracking or watermarks appears in this interface — all of that lives above the provider
 line.
 
@@ -1079,7 +1088,7 @@ async through the derivation engine afterwards is a far larger change than payin
 **In:**
 
 - Cell-addressed storage, buffers, content-addressed interning
-- `StorageProvider` interface + one external backing store, streaming commit
+- `StorageProvider` interface, SQLite and in-memory backends, streaming commit
 - Event log; source and derived layers; the layer state machine
 - Registry-scoped branch tree; time travel; O(1) fork
 - Def-events travelling the log; defs folded from them along a read path

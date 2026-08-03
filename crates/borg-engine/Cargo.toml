@@ -18,4 +18,5 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 
 [dev-dependencies]
 borg-exec-native.workspace = true
+borg-storage-sqlite.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }

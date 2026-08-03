@@ -121,7 +121,7 @@ impl Harness {
             .resolve(
                 BRANCH,
                 cell,
-                self.head(),
+                Some(self.head()),
                 version,
                 FreshnessRequirement::Validated,
             )

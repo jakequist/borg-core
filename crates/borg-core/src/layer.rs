@@ -116,6 +116,19 @@ impl ReadPath {
     pub fn branch(&self) -> Option<BranchId> {
         self.segments.first().map(|(branch, _)| *branch)
     }
+
+    /// The highest layer visible anywhere along the path.
+    ///
+    /// This, not the branch's own head, is what "read at HEAD" means: a fork that has not written
+    /// anything yet has no head of its own, and its effective ceiling is the fork point it inherits
+    /// from.
+    pub fn ceiling(&self) -> LayerId {
+        self.segments
+            .iter()
+            .map(|(_, bound)| *bound)
+            .max()
+            .unwrap_or(LayerId(0))
+    }
 }
 
 /// What a merge carries across. SPEC.md §13.

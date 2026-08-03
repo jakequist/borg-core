@@ -111,14 +111,17 @@ impl Resolver {
         &self,
         branch: BranchId,
         cell: &CellRef,
-        layer: LayerId,
+        layer: Option<LayerId>,
         version: ClientVersion,
         requirement: FreshnessRequirement,
     ) -> Result<Resolved<Option<Value>>> {
-        let path = self.branches.read_path(branch, Some(layer))?;
+        // `None` means HEAD — which for a fork that has not written anything yet is the fork point
+        // it inherits from, not a head of its own.
+        let path = self.branches.read_path(branch, layer)?;
+        let layer = layer.unwrap_or_else(|| path.ceiling());
         let Some(record) = self.storage.get_cell(&path, cell, version).await? else {
             return self
-                .resolve_unmaterialized(branch, cell, layer, version)
+                .resolve_unmaterialized(&path, cell, layer, version)
                 .await;
         };
 
@@ -209,17 +212,16 @@ impl Resolver {
     /// older clients (SPEC.md §9.3).
     async fn resolve_unmaterialized(
         &self,
-        branch: BranchId,
+        path: &ReadPath,
         cell: &CellRef,
-        layer: LayerId,
+        _layer: LayerId,
         version: ClientVersion,
     ) -> Result<Resolved<Option<Value>>> {
-        let path = self.branches.read_path(branch, Some(layer))?;
-        let available = self.storage.cell_versions(&path, cell).await?;
+        let available = self.storage.cell_versions(path, cell).await?;
 
         // Definitions are resolved along the same ancestry as data, so which migrations exist is
         // itself branch-scoped (SPEC.md §5).
-        let defs = self.defs.view(&path).await?;
+        let defs = self.defs.view(path).await?;
         let reachable = available
             .iter()
             .any(|from| defs.path(&cell.buffer, *from, version).is_some());
@@ -246,10 +248,10 @@ impl Resolver {
         &self,
         branch: BranchId,
         cell: &CellRef,
-        layer: LayerId,
+        layer: Option<LayerId>,
         version: ClientVersion,
     ) -> Result<Option<Lineage>> {
-        let path = self.branches.read_path(branch, Some(layer))?;
+        let path = self.branches.read_path(branch, layer)?;
         let Some(record) = self.storage.get_cell(&path, cell, version).await? else {
             return Ok(None);
         };

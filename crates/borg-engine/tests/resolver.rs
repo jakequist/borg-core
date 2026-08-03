@@ -147,7 +147,7 @@ async fn source_and_derived_cells_report_different_provenance() -> Result<()> {
         .resolve(
             BRANCH,
             &prop(acme, "website"),
-            h.head(),
+            Some(h.head()),
             V1,
             FreshnessRequirement::Validated,
         )
@@ -166,7 +166,7 @@ async fn source_and_derived_cells_report_different_provenance() -> Result<()> {
         .resolve(
             BRANCH,
             &prop(acme, "is_investible"),
-            h.head(),
+            Some(h.head()),
             V1,
             FreshnessRequirement::Validated,
         )
@@ -198,7 +198,7 @@ async fn validation_distinguishes_a_moved_dependency_from_an_unrelated_write() -
         .resolve(
             BRANCH,
             &prop(acme, "is_investible"),
-            h.head(),
+            Some(h.head()),
             V1,
             FreshnessRequirement::Validated,
         )
@@ -221,7 +221,7 @@ async fn validation_distinguishes_a_moved_dependency_from_an_unrelated_write() -
         .resolve(
             BRANCH,
             &prop(acme, "is_investible"),
-            h.head(),
+            Some(h.head()),
             V1,
             FreshnessRequirement::Validated,
         )
@@ -256,7 +256,7 @@ async fn explain_walks_the_dependency_index_backwards() -> Result<()> {
 
     let lineage = h
         .resolver
-        .explain(BRANCH, &prop(acme, "is_investible"), h.head(), V1)
+        .explain(BRANCH, &prop(acme, "is_investible"), Some(h.head()), V1)
         .await?
         .expect("derived cells have lineage");
 
@@ -321,7 +321,7 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
         .resolve(
             BRANCH,
             &prop(acme, "website"),
-            h.head(),
+            Some(h.head()),
             ClientVersion(mutated),
             FreshnessRequirement::Validated,
         )
@@ -340,7 +340,7 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
         .resolve(
             BRANCH,
             &prop(acme, "website"),
-            h.head(),
+            Some(h.head()),
             ClientVersion(declared),
             FreshnessRequirement::Validated,
         )
@@ -395,7 +395,7 @@ async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() 
         .resolve(
             BRANCH,
             &prop(acme, "website"),
-            h.head(),
+            Some(h.head()),
             ClientVersion(declared),
             FreshnessRequirement::Validated,
         )

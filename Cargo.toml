@@ -29,6 +29,8 @@ async-trait = "0.1"
 # every cell and are compared constantly during dependency-index lookups.
 serde = { version = "1", features = ["derive", "rc"] }
 thiserror = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
 [workspace.lints.rust]

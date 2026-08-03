@@ -12,3 +12,11 @@ workspace = true
 borg-core.workspace = true
 borg-storage.workspace = true
 async-trait.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+borg-storage.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
