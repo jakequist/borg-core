@@ -19,6 +19,6 @@ pub use def::{FieldDef, MigrationDirection, ObjectDef, ProducerDef, ProducerKind
 pub use error::{BorgError, MergeRejection, Result};
 pub use freshness::{Freshness, FreshnessRequirement, Resolved, Watermark};
 pub use ids::{AllocatorId, BranchId, ClientVersion, LayerId, ProducerId, RepoId};
-pub use layer::{Branch, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
+pub use layer::{Branch, Guard, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
 pub use pid::{Pid, PidAllocator, PidKind};
 pub use value::{ObjectTypeName, Value, ValueType};

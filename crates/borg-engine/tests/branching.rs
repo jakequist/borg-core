@@ -7,7 +7,7 @@ use borg_core::{
     BranchId, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId, LayerKind, MergeMode,
     Origin, Pid, PidKind, Result, Value,
 };
-use borg_engine::{BranchManager, InProcessSequencer, LayerManager};
+use borg_engine::{BranchManager, CellTouchIndex, InProcessSequencer, LayerManager};
 use borg_storage::{MemoryStorage, StorageProvider};
 use std::sync::Arc;
 
@@ -42,6 +42,7 @@ impl Harness {
         let layers = Arc::new(LayerManager::new(
             storage.clone(),
             Arc::new(InProcessSequencer::new()),
+            Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
         Self {

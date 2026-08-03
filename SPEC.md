@@ -743,8 +743,16 @@ type ObjectTransactionEvent = {
 }
 ```
 
-A guard asserts that nothing has touched those cells since that layer. Validated at commit against a
-cell-touch index (`cell -> layers that wrote it`). Violation rejects the commit.
+A guard asserts that nothing has touched those cells since that layer. **Validated at seal** — before
+anything becomes visible, so a rejected transaction leaves no trace on the branch.
+
+Checked against a **cell-touch index** (`cell -> layers that wrote it`). Only *source* layers are
+recorded in it: guards may name source cells only, so a derived write can never appear in a guard,
+and derived layers are the enormous ones. Skipping them bounds the index by authored data rather than
+by everything the derivation engine produces.
+
+The index is queried along the **read path** (§7.2) rather than one branch, which is exactly what
+lets a child's guard be re-evaluated against its parent at merge time.
 
 **Guards may reference source cells only.** Guarding a derived field is meaningless — its value is a
 function of source data with a lag, so the guard would be checking a shadow. Guard the sources
@@ -1074,7 +1082,8 @@ async through the derivation engine afterwards is a far larger change than payin
 - Stateless scheduler — work derived from watermark gaps, no queue
 - Watermarks, validate/recompute, provenance envelopes, `explain()`
 - Frontier tracking, `freshness` read modes, settled-frontier reads
-- Object transactions with source-only guards
+- Object transactions with source-only guards, validated at seal
+- Cell-touch index over source layers
 - Merge with guard-based conflict detection
 - Distribution seams (§17.2) behind traits, naive in-process implementations
 - Serializable command/response form for every engine operation

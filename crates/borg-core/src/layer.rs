@@ -1,5 +1,6 @@
 //! Layers and branches. SPEC.md §6, §7.
 
+use crate::cell::CellRef;
 use crate::ids::{BranchId, LayerId, ProducerId};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,18 @@ pub enum LayerAuthor {
     },
 }
 
+/// A condition a transaction is contingent on: *nothing has touched these cells since this layer*.
+/// SPEC.md §12.
+///
+/// **Guards may reference source cells only.** Guarding derived data is meaningless — its value is a
+/// function of source data with a lag, so the guard would be checking a shadow. Guard the sources
+/// instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Guard {
+    pub cells: Vec<CellRef>,
+    pub since: LayerId,
+}
+
 /// A layer's metadata.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
@@ -58,6 +71,9 @@ pub struct Layer {
     pub state: LayerState,
     /// The layer this one follows on its branch. `None` for a branch's first layer.
     pub parent: Option<LayerId>,
+    /// Validated at seal. Retained afterwards because merge re-evaluates them against the parent —
+    /// which is what makes guards the merge-conflict detector (SPEC.md §13).
+    pub guards: Vec<Guard>,
 }
 
 /// A branch. SPEC.md §7.1.

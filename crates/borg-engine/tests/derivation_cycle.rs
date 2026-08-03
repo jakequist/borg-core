@@ -9,8 +9,8 @@ use borg_core::{
     LayerKind, Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
 };
 use borg_engine::{
-    BranchManager, DefRegistry, DerivationEngine, FrontierTracker, InProcessSequencer,
-    LayerManager, MemoryDependencyIndex,
+    BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -51,6 +51,7 @@ impl Harness {
         let layers = Arc::new(LayerManager::new(
             storage.clone(),
             Arc::new(InProcessSequencer::new()),
+            Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
         let frontier = Arc::new(FrontierTracker::new());

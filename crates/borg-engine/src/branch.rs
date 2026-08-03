@@ -14,14 +14,12 @@ use borg_core::{
 };
 use borg_storage::StorageProvider;
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 pub struct BranchManager {
     layers: Arc<LayerManager>,
     storage: Arc<dyn StorageProvider>,
-    branches: Mutex<HashMap<BranchId, Branch>>,
     next_id: AtomicU64,
 }
 
@@ -31,7 +29,6 @@ impl BranchManager {
         Self {
             layers,
             storage,
-            branches: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -39,14 +36,11 @@ impl BranchManager {
     /// The root of the tree: a branch with no origin.
     pub fn create_root(&self, name: Option<String>) -> BranchId {
         let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.branches.lock().unwrap().insert(
+        self.layers.register_branch(Branch {
             id,
-            Branch {
-                id,
-                name,
-                origin: None,
-            },
-        );
+            name,
+            origin: None,
+        });
         id
     }
 
@@ -63,19 +57,16 @@ impl BranchManager {
             });
         }
         let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.branches.lock().unwrap().insert(
+        self.layers.register_branch(Branch {
             id,
-            Branch {
-                id,
-                name,
-                origin: Some(at),
-            },
-        );
+            name,
+            origin: Some(at),
+        });
         Ok(id)
     }
 
     pub fn branch(&self, id: BranchId) -> Option<Branch> {
-        self.branches.lock().unwrap().get(&id).cloned()
+        self.layers.branch(id)
     }
 
     /// The parent branch, inferred from the origin layer. There is deliberately no parent pointer
@@ -85,34 +76,9 @@ impl BranchManager {
         self.layers.layer(origin).map(|layer| layer.branch)
     }
 
-    /// The ancestry a read resolves through: this branch bounded at `layer` (or its head), then each
-    /// ancestor bounded at the fork point below it.
+    /// The ancestry a read resolves through. SPEC.md §7.2.
     pub fn read_path(&self, branch: BranchId, layer: Option<LayerId>) -> Result<ReadPath> {
-        let mut current = branch;
-        let mut bound = layer
-            .or_else(|| self.layers.head(branch))
-            .unwrap_or(LayerId(0));
-        let mut segments = Vec::new();
-
-        loop {
-            segments.push((current, bound));
-            let Some(origin) = self.branch(current).and_then(|b| b.origin) else {
-                break;
-            };
-            let Some(parent_layer) = self.layers.layer(origin) else {
-                break;
-            };
-            // An ancestor is bounded at the fork point — and *only* further clamped when the caller
-            // asked for an explicit layer, which may sit below the fork point. Clamping by the
-            // child's own bound instead would leave a fork that has not written anything yet unable
-            // to see its parent at all, since its head is still nothing.
-            bound = match layer {
-                Some(requested) => LayerId(requested.0.min(origin.0)),
-                None => origin,
-            };
-            current = parent_layer.branch;
-        }
-        Ok(ReadPath::new(segments))
+        self.layers.read_path(branch, layer)
     }
 
     /// Replay a child's source layers onto its parent. SPEC.md §13.
@@ -135,6 +101,27 @@ impl BranchManager {
         for layer in &replayable {
             let writes = self.contents_of(*layer).await?;
             self.check_dangling(parent, origin, &writes).await?;
+
+            // Re-evaluate the child's guards against the *parent*, since the fork point. "Has the
+            // parent touched this while I was working?" is exactly the definition of a merge
+            // conflict, so guards double as the conflict detector for free (SPEC.md §13).
+            let guards = self
+                .layers
+                .layer(*layer)
+                .map(|l| l.guards)
+                .unwrap_or_default();
+            if let Err(violation) = self
+                .layers
+                .check_guards(parent, &guards, Some(origin))
+                .await
+            {
+                return Err(match violation {
+                    BorgError::GuardViolated { cell, .. } => {
+                        BorgError::MergeRejected(MergeRejection::GuardConflict { cell })
+                    }
+                    other => other,
+                });
+            }
             staged.push(writes);
         }
 
@@ -217,7 +204,6 @@ impl BranchManager {
 // TODO(v1): def divergence — reject when the parent moved the same def since the fork point.
 // Needs def-pushes to be real DefEvents on a branch first; today `DefRegistry` is populated directly.
 //
-// TODO(v1): guard conflicts — re-evaluating the child's guards against the parent's history since
-// the fork point *is* the merge-conflict detector (SPEC.md §13). Waits on object transactions.
 //
-// Until both land, merge is last-write-wins per cell, which is the documented default.
+// Everything else is last-write-wins per cell, which is the documented default: guards are the
+// opt-in to safety, not the baseline.

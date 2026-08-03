@@ -41,6 +41,7 @@ pub mod index;
 pub mod log;
 pub mod resolve;
 pub mod seams;
+pub mod touch;
 
 pub use branch::BranchManager;
 pub use defs::{DefRegistry, MigrationHop, VersionStep};
@@ -51,3 +52,4 @@ pub use resolve::FrontierTracker;
 pub use resolve::{Lineage, LineageEdge, Resolver};
 pub use seams::InProcessSequencer;
 pub use seams::{LayerSequencer, LockManager, WorkGap, WorkSource};
+pub use touch::CellTouchIndex;
