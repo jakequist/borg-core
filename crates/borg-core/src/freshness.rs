@@ -1,0 +1,69 @@
+//! Freshness and provenance — what a read actually returns. SPEC.md §10.
+//!
+//! Borg does not pretend computed values are current. Every read carries what it reflects and how
+//! stale it may be. That honesty is what converts eager-vs-lazy from an architectural commitment
+//! into a scheduling policy which cannot affect correctness, only latency.
+
+use crate::ids::{LayerId, ProducerId};
+use serde::{Deserialize, Serialize};
+
+/// The confidence attached to a resolved value. SPEC.md §10.4.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Freshness {
+    /// `fresh_as_of == requested layer`. Guaranteed correct. Source cells are always this.
+    Current,
+    /// Behind, but unchecked. Cheap to resolve — see `validate` in SPEC.md §10.2.
+    Unvalidated,
+    /// A dependency is known to have moved. Definitely out of date.
+    Stale,
+    /// The producer threw or cycled. `IllegalState`, scoped to *this cell* rather than the branch,
+    /// which is why main never breaks because someone merged a bad pipeline (SPEC.md §14).
+    Broken,
+    /// Tombstoned, or reached through a dangling reference (SPEC.md §8.1).
+    Deleted,
+}
+
+/// What a client asks for. SPEC.md §10.5.
+///
+/// `Current` forces inline computation and blocks — which makes lazy materialization a *per-read
+/// client mode* rather than a system architecture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum FreshnessRequirement {
+    /// Take whatever is stored, however stale.
+    #[default]
+    Any,
+    /// Check the dependency index before answering; no user code runs.
+    Validated,
+    /// Compute inline if necessary and block until correct.
+    Current,
+}
+
+/// A resolved cell, with provenance. SPEC.md §10.4.
+///
+/// Named `Resolved` rather than the spec's `Cell<T>` to avoid confusion with `CellRef`/`CellRecord`
+/// and with `std::cell`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Resolved<T> {
+    pub value: T,
+    pub origin: crate::cell::Origin,
+    /// When this value was actually produced.
+    pub written_at: LayerId,
+    /// Certain-correct through here. For source cells this collapses into `written_at` — source data
+    /// is written once and correct thereafter, so the distinction only carries information for
+    /// derived data.
+    pub fresh_as_of: LayerId,
+    pub state: Freshness,
+    pub by: Option<ProducerId>,
+    // Deferred: expected_fresh_at — an ETA for when catch-up will complete (SPEC.md §10.4).
+}
+
+/// How far a producer has caught up. SPEC.md §10.3.
+///
+/// Watermarks compose through chained producers: `W(B) = min(target, W(A), W(other deps))`. So any
+/// derived cell can report an honest *transitive* freshness — the minimum over its entire derivation
+/// chain, migrations included.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Watermark {
+    pub producer: ProducerId,
+    pub reflects: LayerId,
+}

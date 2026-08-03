@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/borg-core",
+    "crates/borg-storage",
+    "crates/borg-storage-sqlite",
+    "crates/borg-exec",
+    "crates/borg-exec-native",
+    "crates/borg-engine",
+    "crates/borg-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/meteor-hq/borg"
+
+[workspace.dependencies]
+borg-core = { path = "crates/borg-core" }
+borg-storage = { path = "crates/borg-storage" }
+borg-storage-sqlite = { path = "crates/borg-storage-sqlite" }
+borg-exec = { path = "crates/borg-exec" }
+borg-exec-native = { path = "crates/borg-exec-native" }
+borg-engine = { path = "crates/borg-engine" }
+
+async-trait = "0.1"
+# "rc" enables Arc<str> — field and struct names are Arc-shared because they repeat across
+# every cell and are compared constantly during dependency-index lookups.
+serde = { version = "1", features = ["derive", "rc"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
