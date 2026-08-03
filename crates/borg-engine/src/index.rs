@@ -62,7 +62,7 @@ pub trait DependencyIndexProvider: Send + Sync {
 
 // --- Naive in-memory implementation ---
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// v1 `DependencyIndexProvider`: the fully-enumerated edge set, held in memory.
@@ -78,7 +78,11 @@ pub struct MemoryDependencyIndex {
 #[derive(Default)]
 struct IndexInner {
     /// Forward: cell -> invocations that read it. Drives invalidation.
-    dependents: HashMap<(BranchId, CellAt), Vec<Invocation>>,
+    ///
+    /// A `HashSet`, not a `Vec`. A widely-shared upstream cell accumulates one entry per dependent,
+    /// and every one of those dependents retracts itself on re-run — linear removal from a vector
+    /// would make a fan-out of `n` cost `O(n²)`.
+    dependents: HashMap<(BranchId, CellAt), HashSet<Invocation>>,
     /// Backward: cell -> what it was computed from. Drives lineage.
     dependencies: HashMap<(BranchId, CellAt), Vec<CellAt>>,
     /// Discovered field ownership. This lives here rather than in the def because discovery happens
@@ -109,7 +113,7 @@ impl DependencyIndexProvider for MemoryDependencyIndex {
         if let Some(previous) = inner.read_sets.remove(&(branch, invocation.clone())) {
             for cell in previous {
                 if let Some(deps) = inner.dependents.get_mut(&(branch, cell)) {
-                    deps.retain(|i| i != invocation);
+                    deps.remove(invocation);
                 }
             }
         }
@@ -119,7 +123,7 @@ impl DependencyIndexProvider for MemoryDependencyIndex {
                 .dependents
                 .entry((branch, cell.clone()))
                 .or_default()
-                .push(invocation.clone());
+                .insert(invocation.clone());
         }
         inner
             .read_sets
@@ -138,17 +142,15 @@ impl DependencyIndexProvider for MemoryDependencyIndex {
 
     fn dependents(&self, branch: BranchId, cells: &[CellAt]) -> Result<Vec<Invocation>> {
         let inner = self.inner.lock().unwrap();
-        let mut found: Vec<Invocation> = Vec::new();
+        // Deduplicated through a set: one hot cell can name a very large number of dependents, and
+        // a membership scan per candidate is the same `O(n²)` trap in a different place.
+        let mut found: HashSet<Invocation> = HashSet::new();
         for cell in cells {
             if let Some(invocations) = inner.dependents.get(&(branch, cell.clone())) {
-                for invocation in invocations {
-                    if !found.contains(invocation) {
-                        found.push(invocation.clone());
-                    }
-                }
+                found.extend(invocations.iter().cloned());
             }
         }
-        Ok(found)
+        Ok(found.into_iter().collect())
     }
 
     fn dependencies(&self, branch: BranchId, cell: &CellAt) -> Result<Vec<CellAt>> {

@@ -315,7 +315,9 @@ impl DerivationEngine {
         // filtered by author: a producer disturbing a cell it reads is exactly a cycle, and must be
         // caught rather than hidden.
         let written: Vec<CellAt> = cells.iter().map(|(cell, _)| cell.clone()).collect();
-        let mut invocations: Vec<Invocation> = self
+        // A set, because a large source layer can name a large number of new entities and a
+        // membership scan per candidate would be quadratic in the layer's size.
+        let mut invocations: std::collections::HashSet<Invocation> = self
             .index
             .dependents(branch, &written)?
             .into_iter()
@@ -332,16 +334,13 @@ impl DerivationEngine {
                 continue;
             }
             if cell.cell.buffer == def.source {
-                let candidate = Invocation {
+                invocations.insert(Invocation {
                     producer: def.id,
                     input: *cell.cell.pid(),
-                };
-                if !invocations.contains(&candidate) {
-                    invocations.push(candidate);
-                }
+                });
             }
         }
-        Ok(invocations)
+        Ok(invocations.into_iter().collect())
     }
 
     /// Execute one invocation into its own layer.

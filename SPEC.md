@@ -343,6 +343,11 @@ addressed by **source** layer and derived data resolved by `reflects`, never by 
 *(Coalescing across source layers is the natural v2 optimization and is a scheduler policy, not a
 redesign. It trades reproducible history granularity for less recomputation.)*
 
+**The cost of no-coalescing is one layer per invocation.** A source write that invalidates 100k
+entities produces 100k derived layers in a single round, each holding that invocation's output. This
+is inherent to "one run, one layer" and is what buys reproducible derived history. It is also the
+single largest constant in the fan-out path, and the first thing a coalescing policy would reclaim.
+
 ---
 
 ## 7. Branches
@@ -940,6 +945,10 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 4. **Locks are per-layer, never per-branch.** A branch-wide write lock would serialize derivation.
 5. **Derived data is addressed by `reflects`, never by derived LayerId.** This is what makes the
    ordering of concurrent independent producers unobservable.
+6. **No membership test in the dependency index may be a linear scan.** A widely-shared upstream
+   cell accumulates one dependent per invocation, and every one of them retracts itself on re-run.
+   Vector membership turns a fan-out of `n` into `O(n²)` — measured, and the difference between
+   1.3s and 0.28s at 32k dependents. Sets everywhere the index dedupes or removes.
 
 ### 16.4 The scheduler is stateless
 
