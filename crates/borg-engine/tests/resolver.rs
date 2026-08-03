@@ -4,13 +4,13 @@
 //! via `explain` — where it came from.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, Freshness, FreshnessRequirement,
-    LayerAuthor, LayerId, LayerKind, Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind,
-    RepoId, Result, Value,
+    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Freshness,
+    FreshnessRequirement, LayerAuthor, LayerId, LayerKind, Origin, Pid, PidKind, ProducerDef,
+    ProducerId, ProducerKind, RepoId, Result, Value, ValueType,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver, VersionStep,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -50,15 +50,15 @@ impl Harness {
     fn new() -> Self {
         let storage = Arc::new(MemoryStorage::new());
         let index = Arc::new(MemoryDependencyIndex::new());
-        let defs = Arc::new(DefRegistry::new());
         let layers = Arc::new(LayerManager::new(
             storage.clone(),
             Arc::new(InProcessSequencer::new()),
             Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
+        let defs = Arc::new(DefRegistry::new(layers.clone(), storage.clone()));
 
-        let mut executor = NativeExecutor::new();
+        let executor = NativeExecutor::new();
         executor.register(
             SCORE,
             Arc::new(|ctx: &mut dyn ProducerCtx, input: Pid| {
@@ -277,32 +277,52 @@ async fn explain_walks_the_dependency_index_backwards() -> Result<()> {
 
 #[tokio::test]
 async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind() -> Result<()> {
-    const V9: ClientVersion = ClientVersion(LayerId(9));
     const UP: ProducerId = ProducerId(50);
-
     let h = Harness::new();
+
+    // The field exists, and is then mutated with an `up` migration. Both def layers are real, so
+    // their ids *are* the two def-versions (SPEC.md §5.3).
+    let declared = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::DeclareField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::Int,
+                repo: RepoId(1),
+            }],
+        )
+        .await?;
     let acme = company(400);
-    h.push(vec![(prop(acme, "website"), Value::Int(9))]).await?;
+    h.push_at(
+        ClientVersion(declared),
+        vec![(prop(acme, "website"), Value::Int(9))],
+    )
+    .await?;
+    let mutated = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::MutateField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::String,
+                repo: RepoId(1),
+                up: UP,
+                down: None,
+            }],
+        )
+        .await?;
 
-    // A def-mutation exists carrying v1 forward to v9, but the migration has not run yet.
-    h.defs.push_step(
-        "Company".into(),
-        "website".into(),
-        VersionStep {
-            from: V1,
-            to: V9,
-            up: UP,
-            down: None,
-        },
-    );
-
+    // The migration exists but has not run.
     let ahead = h
         .resolver
         .resolve(
             BRANCH,
             &prop(acme, "website"),
             h.head(),
-            V9,
+            ClientVersion(mutated),
             FreshnessRequirement::Validated,
         )
         .await?;
@@ -313,15 +333,15 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
     );
     assert_eq!(ahead.value, None);
 
-    // The version it actually was written at still reads cleanly — writes are never coerced, so both
-    // coexist (SPEC.md §5.4).
+    // The version it was actually written at still reads cleanly — writes are never coerced, so
+    // both coexist (SPEC.md §5.4).
     let at_source = h
         .resolver
         .resolve(
             BRANCH,
             &prop(acme, "website"),
             h.head(),
-            V1,
+            ClientVersion(declared),
             FreshnessRequirement::Validated,
         )
         .await?;
@@ -332,25 +352,43 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
 
 #[tokio::test]
 async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() -> Result<()> {
-    const V9: ClientVersion = ClientVersion(LayerId(9));
-
     let h = Harness::new();
-    let acme = company(500);
-    // Written by a v9 client.
-    h.push_at(V9, vec![(prop(acme, "website"), Value::Int(9))])
+
+    let declared = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::DeclareField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::Int,
+                repo: RepoId(1),
+            }],
+        )
+        .await?;
+    // Mutated with an `up` but deliberately no `down`.
+    let mutated = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::MutateField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::String,
+                repo: RepoId(1),
+                up: ProducerId(50),
+                down: None,
+            }],
+        )
         .await?;
 
-    // The def-push supplied no `down`, so there is no way back to v1.
-    h.defs.push_step(
-        "Company".into(),
-        "website".into(),
-        VersionStep {
-            from: V1,
-            to: V9,
-            up: ProducerId(50),
-            down: None,
-        },
-    );
+    let acme = company(500);
+    // Written by a client on the new version.
+    h.push_at(
+        ClientVersion(mutated),
+        vec![(prop(acme, "website"), Value::Int(9))],
+    )
+    .await?;
 
     let old_client = h
         .resolver
@@ -358,7 +396,7 @@ async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() 
             BRANCH,
             &prop(acme, "website"),
             h.head(),
-            V1,
+            ClientVersion(declared),
             FreshnessRequirement::Validated,
         )
         .await?;

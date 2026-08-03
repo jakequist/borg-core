@@ -189,6 +189,15 @@ ListDef    { elementType }
 
 `SetDef` and `MapDef` are deferred alongside their value types.
 
+**There is no separate schema store.** The definitions in force at a point are *folded* from the
+`DefEvent`s on the def layers along a read path (§7.2), exactly as data is resolved from value
+layers. That is what makes a schema change forkable, time-travellable and mergeable rather than an
+offline ritual — and it means "the def-view at layer L on branch B" needs no machinery beyond what
+reading data already requires.
+
+Note there is deliberately no `CreateObjectDef` in §6.1: a struct has no owner and exists because
+someone declared a field on it (§5.2), so creation falls out of declaration.
+
 ### 5.2 Repos and the flat namespace
 
 A **repo** is a contribution unit that lets different teams — eventually in different languages —
@@ -782,7 +791,7 @@ parent.
 
 | Situation | Result |
 |---|---|
-| Parent moved the same def since fork | reject merge |
+| Parent moved the same def since fork | reject merge — the child authored against a def-view the parent has since moved, so re-fork from head and redo |
 | Child wrote to an object the parent deleted | reject merge |
 | Child guard fails when re-evaluated against parent history since the fork point | reject merge |
 | Two branches wrote the same cell, unguarded | last-write-wins — child wins |
@@ -1073,6 +1082,7 @@ async through the derivation engine afterwards is a far larger change than payin
 - `StorageProvider` interface + one external backing store, streaming commit
 - Event log; source and derived layers; the layer state machine
 - Registry-scoped branch tree; time travel; O(1) fork
+- Def-events travelling the log; defs folded from them along a read path
 - Multi-repo defs, flat namespace, implicit extension, collision errors
 - Def-versions, ClientVersion resolution, live-version set
 - Tombstones as a general cell-valued concept; dangling references permitted

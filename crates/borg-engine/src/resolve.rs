@@ -217,9 +217,12 @@ impl Resolver {
         let path = self.branches.read_path(branch, Some(layer))?;
         let available = self.storage.cell_versions(&path, cell).await?;
 
+        // Definitions are resolved along the same ancestry as data, so which migrations exist is
+        // itself branch-scoped (SPEC.md §5).
+        let defs = self.defs.view(&path).await?;
         let reachable = available
             .iter()
-            .any(|from| self.defs.path(&cell.buffer, *from, version).is_some());
+            .any(|from| defs.path(&cell.buffer, *from, version).is_some());
 
         Ok(Resolved {
             value: None,

@@ -75,3 +75,65 @@ pub enum MigrationDirection {
     /// Kept working so that old clients keep reading. v1 trusts these (SPEC.md §9.3).
     Down,
 }
+
+/// A mutation of the data model. SPEC.md §6.1.
+///
+/// Note there is deliberately no `CreateObjectDef`: a struct has no owner and exists because someone
+/// declared a field on it (SPEC.md §5.2). Creation falls out of declaration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DefEvent {
+    /// Add a field. The declaring repo becomes its owner — the only repo permitted to mutate or
+    /// delete it. Two repos declaring the same field is a hard error.
+    DeclareField {
+        struct_name: ObjectTypeName,
+        field: FieldName,
+        ty: ValueType,
+        repo: RepoId,
+    },
+    /// Change a field's shape. **Must** supply migrations: `up` carries existing values forward, and
+    /// `down` — optional — keeps older clients reading (SPEC.md §9.3).
+    MutateField {
+        struct_name: ObjectTypeName,
+        field: FieldName,
+        ty: ValueType,
+        repo: RepoId,
+        up: ProducerId,
+        down: Option<ProducerId>,
+    },
+    DeleteField {
+        struct_name: ObjectTypeName,
+        field: FieldName,
+        repo: RepoId,
+    },
+    /// Register a producer *definition*. The implementation is resolved separately by the
+    /// `ExecutionProvider` (SPEC.md §9.2).
+    PushProducer(ProducerDef),
+}
+
+impl DefEvent {
+    /// Which definition this event touches, if any. Used to detect two branches moving the same def
+    /// (SPEC.md §13).
+    pub fn touches(&self) -> Option<(ObjectTypeName, FieldName)> {
+        match self {
+            DefEvent::DeclareField {
+                struct_name, field, ..
+            }
+            | DefEvent::MutateField {
+                struct_name, field, ..
+            }
+            | DefEvent::DeleteField {
+                struct_name, field, ..
+            } => Some((struct_name.clone(), field.clone())),
+            DefEvent::PushProducer(_) => None,
+        }
+    }
+
+    pub const fn repo(&self) -> Option<RepoId> {
+        match self {
+            DefEvent::DeclareField { repo, .. }
+            | DefEvent::MutateField { repo, .. }
+            | DefEvent::DeleteField { repo, .. } => Some(*repo),
+            DefEvent::PushProducer(def) => Some(def.declaring_repo),
+        }
+    }
+}

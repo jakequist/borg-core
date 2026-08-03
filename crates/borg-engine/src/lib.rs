@@ -44,7 +44,7 @@ pub mod seams;
 pub mod touch;
 
 pub use branch::BranchManager;
-pub use defs::{DefRegistry, MigrationHop, VersionStep};
+pub use defs::{DefRegistry, DefView, MigrationHop, VersionStep};
 pub use derive::DerivationEngine;
 pub use index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};
 pub use log::{LayerHandle, LayerManager};

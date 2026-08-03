@@ -61,7 +61,7 @@ impl Harness {
             Arc::new(MemoryDependencyIndex::new()),
             Arc::new(executor),
             frontier.clone(),
-            Arc::new(DefRegistry::new()),
+            Arc::new(DefRegistry::new(layers.clone(), storage.clone())),
             branches.clone(),
         ));
         engine.register(ProducerDef {
@@ -111,7 +111,7 @@ impl Harness {
 
 /// A producer reading exactly one field and writing exactly one other.
 fn score_producer() -> NativeExecutor {
-    let mut executor = NativeExecutor::new();
+    let executor = NativeExecutor::new();
     executor.register(
         SCORE,
         Arc::new(|ctx: &mut dyn ProducerCtx, input: Pid| {
@@ -204,7 +204,7 @@ async fn a_producer_reading_another_producers_output_is_triggered_by_it() -> Res
     // output, so B can only be triggered by A's *derived* layer.
     const DOWNSTREAM: ProducerId = ProducerId(9);
 
-    let mut executor = NativeExecutor::new();
+    let executor = NativeExecutor::new();
     executor.register(
         SCORE,
         Arc::new(|ctx: &mut dyn ProducerCtx, input: Pid| {
@@ -297,7 +297,7 @@ async fn absence_is_a_tracked_dependency() -> Result<()> {
 #[tokio::test]
 async fn a_cycling_producer_poisons_itself_and_not_the_branch() -> Result<()> {
     // Reads the very field it writes — the definition of a cycle, and undetectable statically.
-    let mut executor = NativeExecutor::new();
+    let executor = NativeExecutor::new();
     executor.register(
         SCORE,
         Arc::new(|ctx: &mut dyn ProducerCtx, input: Pid| {
@@ -346,7 +346,7 @@ async fn a_second_writer_to_one_field_is_rejected() -> Result<()> {
         })
     }
 
-    let mut executor = NativeExecutor::new();
+    let executor = NativeExecutor::new();
     executor.register(SCORE, Arc::new(write_investible));
     executor.register(OTHER, Arc::new(write_investible));
 

@@ -9,8 +9,8 @@
 
 use crate::log::LayerManager;
 use borg_core::{
-    BorgError, Branch, BranchId, CellRecord, CellRef, LayerAuthor, LayerId, LayerKind, MergeMode,
-    MergeRejection, ReadPath, Result,
+    BorgError, Branch, BranchId, CellRecord, CellRef, FieldName, LayerAuthor, LayerId, LayerKind,
+    MergeMode, MergeRejection, ObjectTypeName, ReadPath, Result,
 };
 use borg_storage::StorageProvider;
 use futures_util::StreamExt;
@@ -97,8 +97,22 @@ impl BranchManager {
         let replayable = self.replayable_layers(child, mode);
 
         // Validate the whole merge first. Nothing is written until every layer has passed.
+        let moved_on_parent = self.defs_touched_since(parent, origin).await?;
+
         let mut staged = Vec::new();
         for layer in &replayable {
+            // The child authored its def-mutations against the def-view at the fork point. If the
+            // parent has moved the same def since, they cannot cleanly rebase — re-fork from head
+            // and redo (SPEC.md §13).
+            for event in self.storage.read_def_layer(*layer).await? {
+                if let Some(touched) = event.touches()
+                    && moved_on_parent.contains(&touched)
+                {
+                    return Err(BorgError::MergeRejected(MergeRejection::DefDiverged {
+                        struct_name: touched.0,
+                    }));
+                }
+            }
             let writes = self.contents_of(*layer).await?;
             self.check_dangling(parent, origin, &writes).await?;
 
@@ -132,6 +146,9 @@ impl BranchManager {
                 .layer(*source)
                 .map_or(LayerKind::Value, |layer| layer.kind);
             let mut layer = self.layers.open(parent, kind, LayerAuthor::Source).await?;
+            for event in self.storage.read_def_layer(*source).await? {
+                layer.put_def(event).await?;
+            }
             for (cell, mut record) in writes {
                 // Each event keeps the ClientVersion it was authored at, so the parent's readers
                 // migrate rather than anything being coerced (SPEC.md §13).
@@ -160,6 +177,28 @@ impl BranchManager {
             .collect();
         layers.sort_by_key(|layer| layer.id.0);
         layers.into_iter().map(|layer| layer.id).collect()
+    }
+
+    /// Which definitions the parent has moved since the fork point.
+    async fn defs_touched_since(
+        &self,
+        parent: BranchId,
+        fork_point: LayerId,
+    ) -> Result<Vec<(ObjectTypeName, FieldName)>> {
+        let mut touched = Vec::new();
+        for layer in self.layers.layers_of(parent) {
+            if layer.kind != LayerKind::Def || layer.id.0 <= fork_point.0 {
+                continue;
+            }
+            for event in self.storage.read_def_layer(layer.id).await? {
+                if let Some(key) = event.touches()
+                    && !touched.contains(&key)
+                {
+                    touched.push(key);
+                }
+            }
+        }
+        Ok(touched)
     }
 
     async fn contents_of(&self, layer: LayerId) -> Result<Vec<(CellRef, CellRecord)>> {
@@ -201,8 +240,6 @@ impl BranchManager {
     }
 }
 
-// TODO(v1): def divergence — reject when the parent moved the same def since the fork point.
-// Needs def-pushes to be real DefEvents on a branch first; today `DefRegistry` is populated directly.
 //
 //
 // Everything else is last-write-wins per cell, which is the documented default: guards are the

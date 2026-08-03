@@ -26,9 +26,11 @@ pub type ProducerFn = Arc<
         + Sync,
 >;
 
+/// Registrations are interior-mutable because producer *definitions* arrive as def-events at
+/// runtime (SPEC.md §9.2) — an implementation may be installed long after the engine was built.
 #[derive(Default)]
 pub struct NativeExecutor {
-    registry: HashMap<ProducerId, ProducerFn>,
+    registry: std::sync::Mutex<HashMap<ProducerId, ProducerFn>>,
 }
 
 impl NativeExecutor {
@@ -36,8 +38,8 @@ impl NativeExecutor {
         Self::default()
     }
 
-    pub fn register(&mut self, id: ProducerId, f: ProducerFn) {
-        self.registry.insert(id, f);
+    pub fn register(&self, id: ProducerId, f: ProducerFn) {
+        self.registry.lock().unwrap().insert(id, f);
     }
 }
 
@@ -49,13 +51,17 @@ impl ExecutionProvider for NativeExecutor {
         input: Pid,
         ctx: &mut dyn ProducerCtx,
     ) -> Result<()> {
+        // Cloned out of the lock before running: producer code may itself install producers, and a
+        // socket-backed provider will hold this handle across an await.
         let f = self
             .registry
+            .lock()
+            .unwrap()
             .get(&producer.id)
+            .cloned()
             .ok_or_else(|| {
                 BorgError::Execution(format!("no implementation for {:?}", producer.id))
-            })?
-            .clone();
+            })?;
         f(ctx, input).await
     }
 }

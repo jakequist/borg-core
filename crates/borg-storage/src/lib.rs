@@ -11,7 +11,7 @@ pub use memory::MemoryStorage;
 
 use async_trait::async_trait;
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, ReadPath, Result,
+    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerId, ReadPath, Result,
 };
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
@@ -26,6 +26,10 @@ pub trait OpenLayer: Send {
 
     /// Append one cell write. Called an unbounded number of times.
     async fn put_cell(&mut self, cell: &CellRef, record: CellRecord) -> Result<()>;
+
+    /// Append one def mutation. A layer holds value events *xor* def events, never both
+    /// (SPEC.md §6.2), so a layer taking these takes no cells.
+    async fn put_def(&mut self, event: DefEvent) -> Result<()>;
 
     /// Close to writes. Validation and durability happen here.
     async fn seal(self: Box<Self>) -> Result<SealedLayer>;
@@ -71,6 +75,9 @@ pub trait StorageProvider: Send + Sync {
     /// Read a committed layer's contents. This is what drives invalidation: the committed layer *is*
     /// the changeset, so buffers need no observation machinery (SPEC.md §9.6).
     async fn read_layer(&self, layer: LayerId) -> Result<CellStream>;
+
+    /// A committed def layer's events, in order.
+    async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>>;
 
     async fn open_layer(&self, branch: BranchId, id: LayerId) -> Result<Box<dyn OpenLayer>>;
 

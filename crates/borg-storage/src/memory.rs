@@ -10,7 +10,8 @@
 use crate::{CellStream, OpenLayer, SealedLayer, StorageProvider};
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, ReadPath, Result,
+    BorgError, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerId, ReadPath,
+    Result,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,11 +26,14 @@ struct Inner {
     staged: HashMap<LayerId, StagedLayer>,
     /// A committed layer's contents — the changeset that drives invalidation (SPEC.md §9.6).
     layer_contents: HashMap<LayerId, Vec<(CellRef, CellRecord)>>,
+    /// A committed def layer's events.
+    def_contents: HashMap<LayerId, Vec<DefEvent>>,
 }
 
 struct StagedLayer {
     branch: BranchId,
     writes: Vec<(CellRef, CellRecord)>,
+    defs: Vec<DefEvent>,
     sealed: bool,
 }
 
@@ -67,6 +71,19 @@ impl OpenLayer for MemoryOpenLayer {
             return Err(BorgError::Storage(format!("layer {} is sealed", self.id)));
         }
         staged.writes.push((cell.clone(), record));
+        Ok(())
+    }
+
+    async fn put_def(&mut self, event: DefEvent) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let staged = inner
+            .staged
+            .get_mut(&self.id)
+            .ok_or_else(|| BorgError::Storage(format!("layer {} is not open", self.id)))?;
+        if staged.sealed {
+            return Err(BorgError::Storage(format!("layer {} is sealed", self.id)));
+        }
+        staged.defs.push(event);
         Ok(())
     }
 
@@ -168,6 +185,11 @@ impl StorageProvider for MemoryStorage {
         Ok(Box::pin(futures_util::stream::iter(rows)))
     }
 
+    async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.def_contents.get(&layer).cloned().unwrap_or_default())
+    }
+
     async fn open_layer(&self, branch: BranchId, id: LayerId) -> Result<Box<dyn OpenLayer>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.staged.contains_key(&id) || inner.layer_contents.contains_key(&id) {
@@ -178,6 +200,7 @@ impl StorageProvider for MemoryStorage {
             StagedLayer {
                 branch,
                 writes: Vec::new(),
+                defs: Vec::new(),
                 sealed: false,
             },
         );
@@ -207,6 +230,7 @@ impl StorageProvider for MemoryStorage {
                 .push((layer.id, record.clone()));
         }
         inner.layer_contents.insert(layer.id, staged.writes);
+        inner.def_contents.insert(layer.id, staged.defs);
         Ok(())
     }
 }

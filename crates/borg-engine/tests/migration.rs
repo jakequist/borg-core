@@ -5,13 +5,13 @@
 //! triggered by a data write, a migration by a def-mutation.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, Freshness, FreshnessRequirement,
-    LayerAuthor, LayerId, LayerKind, MigrationDirection, Origin, Pid, PidKind, ProducerDef,
-    ProducerId, ProducerKind, RepoId, Result, Value,
+    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Freshness,
+    FreshnessRequirement, LayerAuthor, LayerId, LayerKind, MigrationDirection, Origin, Pid,
+    PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value, ValueType,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver, VersionStep,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -19,10 +19,6 @@ use borg_storage::MemoryStorage;
 use std::sync::Arc;
 
 const BRANCH: BranchId = BranchId(1);
-/// The original def-view.
-const V1: ClientVersion = ClientVersion(LayerId(1));
-/// The def-view introduced by the def-mutation under test.
-const V9: ClientVersion = ClientVersion(LayerId(9));
 const UP: ProducerId = ProducerId(50);
 const SCORE: ProducerId = ProducerId(1);
 
@@ -48,10 +44,12 @@ struct Harness {
     engine: Arc<DerivationEngine>,
     resolver: Resolver,
     frontier: Arc<FrontierTracker>,
+    defs: Arc<DefRegistry>,
+    executor: Arc<NativeExecutor>,
 }
 
 impl Harness {
-    fn new(executor: NativeExecutor, defs: Arc<DefRegistry>) -> Self {
+    fn new() -> Self {
         let storage = Arc::new(MemoryStorage::new());
         let index = Arc::new(MemoryDependencyIndex::new());
         let layers = Arc::new(LayerManager::new(
@@ -60,12 +58,14 @@ impl Harness {
             Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
+        let defs = Arc::new(DefRegistry::new(layers.clone(), storage.clone()));
+        let executor = Arc::new(NativeExecutor::new());
         let frontier = Arc::new(FrontierTracker::new());
         let engine = Arc::new(DerivationEngine::new(
             storage.clone(),
             layers.clone(),
             index.clone(),
-            Arc::new(executor),
+            executor.clone(),
             frontier.clone(),
             defs.clone(),
             branches.clone(),
@@ -73,8 +73,10 @@ impl Harness {
         Self {
             layers,
             engine,
-            resolver: Resolver::new(storage, index, defs, branches.clone()),
+            resolver: Resolver::new(storage, index, defs.clone(), branches.clone()),
             frontier,
+            defs,
+            executor,
         }
     }
 
@@ -98,6 +100,12 @@ impl Harness {
                 .await?;
         }
         self.layers.commit(layer).await
+    }
+
+    /// Install a producer implementation. The log records the *definition*; this is the other half
+    /// (SPEC.md §9.2).
+    fn install(&self, id: ProducerId, f: borg_exec_native::ProducerFn) {
+        self.executor.register(id, f);
     }
 
     fn head(&self) -> LayerId {
@@ -126,10 +134,10 @@ impl Harness {
 /// The `get_at` is the one place a migration departs from an ordinary producer. An ordinary `get`
 /// resolves at the migration's own ClientVersion — which *is* v9 — and would recurse straight into
 /// the value it is supposed to be producing (SPEC.md §9.3).
-fn website_up() -> borg_exec_native::ProducerFn {
-    Arc::new(|ctx: &mut dyn ProducerCtx, input: Pid| {
+fn website_up(from: ClientVersion) -> borg_exec_native::ProducerFn {
+    Arc::new(move |ctx: &mut dyn ProducerCtx, input: Pid| {
         Box::pin(async move {
-            let old = ctx.get_at(&prop(input, "website"), V1).await?;
+            let old = ctx.get_at(&prop(input, "website"), from).await?;
             let migrated = match old {
                 Some(Value::Int(n)) => Value::Int(n * 10),
                 Some(other) => other,
@@ -140,99 +148,116 @@ fn website_up() -> borg_exec_native::ProducerFn {
     })
 }
 
-fn migration_def() -> ProducerDef {
+fn migration_def(from: ClientVersion, to: ClientVersion) -> ProducerDef {
     ProducerDef {
         id: UP,
         kind: ProducerKind::Migration {
-            from: V1.0,
-            to: V9.0,
+            from: from.0,
+            to: to.0,
             direction: MigrationDirection::Up,
         },
         // A migration maps over the *field's* buffer, not the struct's: it is defined per output
         // field (SPEC.md §9.3), and per-field buffers make that exactly expressible (SPEC.md §4.2).
         source: BufferId::ObjectProp("Company".into(), "website".into()),
-        version: V9.0,
+        version: to.0,
         declaring_repo: RepoId(1),
     }
 }
 
-fn version_step(down: Option<ProducerId>) -> VersionStep {
-    VersionStep {
-        from: V1,
-        to: V9,
-        up: UP,
-        down,
-    }
+/// Declare `Company.website`, then mutate it — two def layers, whose ids *are* the two def-versions
+/// (SPEC.md §5.3). Returns them.
+async fn declare_then_mutate(h: &Harness) -> Result<(ClientVersion, ClientVersion)> {
+    let declared = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::DeclareField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::Int,
+                repo: RepoId(1),
+            }],
+        )
+        .await?;
+    let mutated = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::MutateField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::Int,
+                repo: RepoId(1),
+                up: UP,
+                down: None,
+            }],
+        )
+        .await?;
+    Ok((ClientVersion(declared), ClientVersion(mutated)))
 }
 
 #[tokio::test]
 async fn a_migration_materializes_the_new_version_without_disturbing_the_old() -> Result<()> {
-    let defs = Arc::new(DefRegistry::new());
-    defs.push_step("Company".into(), "website".into(), version_step(None));
-
-    let mut executor = NativeExecutor::new();
-    executor.register(UP, website_up());
-    let h = Harness::new(executor, defs);
-    h.engine.register(migration_def());
+    let h = Harness::new();
+    let (v_from, v_to) = declare_then_mutate(&h).await?;
+    h.install(UP, website_up(v_from));
+    h.engine.register(migration_def(v_from, v_to));
 
     let acme = company(100);
     let source = h
-        .push(V1, vec![(prop(acme, "website"), Value::Int(9))])
+        .push(v_from, vec![(prop(acme, "website"), Value::Int(9))])
         .await?;
     assert_eq!(
         h.engine.catch_up(BRANCH).await?,
         1,
-        "a write at v1 is work for the migration, exactly as it would be for a pipeline"
+        "a write at the old version is work for the migration, exactly as it would be for a pipeline"
     );
 
-    let at_v9 = h.read(&prop(acme, "website"), V9).await?;
-    assert_eq!(at_v9.value, Some(Value::Int(90)), "the migrated view");
-    assert_eq!(at_v9.origin, Origin::Derived);
+    let migrated = h.read(&prop(acme, "website"), v_to).await?;
+    assert_eq!(migrated.value, Some(Value::Int(90)), "the migrated view");
+    assert_eq!(migrated.origin, Origin::Derived);
     assert_eq!(
-        at_v9.by,
+        migrated.by,
         Some(UP),
         "attributed to the migration that made it"
     );
-    assert_eq!(at_v9.state, Freshness::Current);
+    assert_eq!(migrated.state, Freshness::Current);
 
     // Writes are never coerced, so the value its author wrote is still there, untouched.
-    let at_v1 = h.read(&prop(acme, "website"), V1).await?;
-    assert_eq!(at_v1.value, Some(Value::Int(9)));
-    assert_eq!(at_v1.origin, Origin::Source);
+    let original = h.read(&prop(acme, "website"), v_from).await?;
+    assert_eq!(original.value, Some(Value::Int(9)));
+    assert_eq!(original.origin, Origin::Source);
 
-    // And a migration carries a watermark like any other producer — pointing into the *source*
-    // stream, not at head, which by now is the derived layer it just committed (SPEC.md §6.3).
+    // A migration carries a watermark like any other producer — pointing into the *source* stream,
+    // not at head, which by now is the derived layer it just committed (SPEC.md §6.3).
     assert_eq!(h.frontier.watermark(BRANCH, UP), source);
     Ok(())
 }
 
 #[tokio::test]
 async fn a_later_write_at_the_old_version_re_runs_the_migration() -> Result<()> {
-    let defs = Arc::new(DefRegistry::new());
-    defs.push_step("Company".into(), "website".into(), version_step(None));
-
-    let mut executor = NativeExecutor::new();
-    executor.register(UP, website_up());
-    let h = Harness::new(executor, defs);
-    h.engine.register(migration_def());
+    let h = Harness::new();
+    let (v_from, v_to) = declare_then_mutate(&h).await?;
+    h.install(UP, website_up(v_from));
+    h.engine.register(migration_def(v_from, v_to));
 
     let acme = company(200);
-    h.push(V1, vec![(prop(acme, "website"), Value::Int(9))])
+    h.push(v_from, vec![(prop(acme, "website"), Value::Int(9))])
         .await?;
     h.engine.catch_up(BRANCH).await?;
 
-    // An old client writes again. The v9 view must follow.
-    h.push(V1, vec![(prop(acme, "website"), Value::Int(4))])
+    // An old client writes again. The new version's view must follow.
+    h.push(v_from, vec![(prop(acme, "website"), Value::Int(4))])
         .await?;
     assert_eq!(h.engine.catch_up(BRANCH).await?, 1);
     assert_eq!(
-        h.read(&prop(acme, "website"), V9).await?.value,
+        h.read(&prop(acme, "website"), v_to).await?.value,
         Some(Value::Int(40)),
         "an old client's write stays visible to new clients"
     );
 
-    // The migration is not poisoned: writing `C@v9` into the very buffer it consumes `C@v1` from
-    // must not read as a new entity, or it would re-trigger itself forever.
+    // Writing `C@v_to` into the very buffer it consumes `C@v_from` from must not read as a new
+    // entity, or the migration would re-trigger itself forever.
     assert!(
         h.engine.is_broken(BRANCH, UP).is_none(),
         "a migration does not mistake its own output for its input"
@@ -242,12 +267,10 @@ async fn a_later_write_at_the_old_version_re_runs_the_migration() -> Result<()> 
 
 #[tokio::test]
 async fn a_pipeline_at_the_old_version_is_untouched_by_the_migration() -> Result<()> {
-    let defs = Arc::new(DefRegistry::new());
-    defs.push_step("Company".into(), "website".into(), version_step(None));
-
-    let mut executor = NativeExecutor::new();
-    executor.register(UP, website_up());
-    executor.register(
+    let h = Harness::new();
+    let (v_from, v_to) = declare_then_mutate(&h).await?;
+    h.install(UP, website_up(v_from));
+    h.install(
         SCORE,
         Arc::new(|ctx: &mut dyn ProducerCtx, input: Pid| {
             Box::pin(async move {
@@ -258,20 +281,18 @@ async fn a_pipeline_at_the_old_version_is_untouched_by_the_migration() -> Result
             })
         }),
     );
-
-    let h = Harness::new(executor, defs);
-    h.engine.register(migration_def());
+    h.engine.register(migration_def(v_from, v_to));
     h.engine.register(ProducerDef {
         id: SCORE,
         kind: ProducerKind::Pipeline,
         source: BufferId::Object("Company".into()),
-        version: V1.0,
+        version: v_from.0,
         declaring_repo: RepoId(1),
     });
 
     let acme = company(300);
     h.push(
-        V1,
+        v_from,
         vec![
             (existence(acme), Value::Bool(true)),
             (prop(acme, "website"), Value::Int(9)),
@@ -280,45 +301,42 @@ async fn a_pipeline_at_the_old_version_is_untouched_by_the_migration() -> Result
     .await?;
     h.engine.catch_up(BRANCH).await?;
 
-    // The v1 pipeline read `website@v1`; the migration wrote `website@v9`. Same CellRef, different
-    // record — so the migration's output must not read as a change to the pipeline's input.
+    // The pipeline read `website@v_from`; the migration wrote `website@v_to`. Same CellRef,
+    // different record — so neither may read as a change to the other's input.
     assert_eq!(
         h.engine.catch_up(BRANCH).await?,
         0,
         "everything has settled: neither producer is triggered by the other's output"
     );
     assert_eq!(
-        h.read(&prop(acme, "is_investible"), V1).await?.state,
+        h.read(&prop(acme, "is_investible"), v_from).await?.state,
         Freshness::Current,
-        "the v1 pipeline's result is not made stale by a migration to v9"
+        "the old version's pipeline result is not made stale by a migration to the new one"
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn a_migration_is_skipped_when_no_client_is_live_on_its_target() -> Result<()> {
-    let defs = Arc::new(DefRegistry::new());
-    defs.push_step("Company".into(), "website".into(), version_step(None));
-    // Only v1 has clients, so materializing v9 is wasted work (SPEC.md §5.5).
-    defs.mark_live(V1);
-
-    let mut executor = NativeExecutor::new();
-    executor.register(UP, website_up());
-    let h = Harness::new(executor, defs);
-    h.engine.register(migration_def());
+    let h = Harness::new();
+    let (v_from, v_to) = declare_then_mutate(&h).await?;
+    h.install(UP, website_up(v_from));
+    h.engine.register(migration_def(v_from, v_to));
+    // Only the old version has clients, so materializing the new one is wasted work (SPEC.md §5.5).
+    h.defs.mark_live(v_from);
 
     let acme = company(400);
-    h.push(V1, vec![(prop(acme, "website"), Value::Int(9))])
+    h.push(v_from, vec![(prop(acme, "website"), Value::Int(9))])
         .await?;
     assert_eq!(
         h.engine.catch_up(BRANCH).await?,
         0,
-        "no live client on v9, so nothing is materialized for it"
+        "no live client on the target version, so nothing is materialized for it"
     );
 
-    // And the reader is told plainly that v9 is behind rather than being handed a wrong answer.
+    // And the reader is told plainly that it is behind rather than handed a wrong answer.
     assert_eq!(
-        h.read(&prop(acme, "website"), V9).await?.state,
+        h.read(&prop(acme, "website"), v_to).await?.state,
         Freshness::Stale
     );
     Ok(())

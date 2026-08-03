@@ -41,6 +41,15 @@ impl LayerHandle {
     pub async fn put(&mut self, cell: &CellRef, record: CellRecord) -> Result<()> {
         self.open.put_cell(cell, record).await
     }
+
+    /// Append a def mutation. A layer holds value events *xor* def events (SPEC.md §6.2), so a
+    /// layer taking these takes no cells.
+    pub async fn put_def(&mut self, event: borg_core::DefEvent) -> Result<()> {
+        if self.layer.kind != LayerKind::Value {
+            return self.open.put_def(event).await;
+        }
+        Err(BorgError::MixedLayerKind)
+    }
 }
 
 pub struct LayerManager {
