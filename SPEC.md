@@ -60,8 +60,13 @@ A PID identifies every value except primitives. Two flavors, split by mutability
 | `String`, `Binary`, `BigInt` | content-addressed (hash of content) | no |
 | `Int`, `Boolean`, `Double` | none — primitive, stored inline | n/a |
 
-**Allocated PIDs** are `(branchId, counter)`. Small, ordered within a branch, and collision-free
-across branches by construction — which makes merge safe without coordination.
+**Allocated PIDs** are `(branchId, allocatorId, counter)`. Small, ordered within an allocator, and
+collision-free by construction — which makes merge safe without coordination.
+
+> The `allocatorId` component exists so that **any node may allocate PIDs without coordinating.** A
+> bare `(branchId, counter)` would require a global per-branch counter — a coordination point on the
+> hottest path in the system. This is a persisted format, so it is fixed now rather than retrofitted
+> (§17.2).
 
 **Content-addressed PIDs** are branch-independent and eternal. The string `"hello"` has the same PID
 on every branch, forever. Consequences: string writes can never conflict across branches, and equal
@@ -411,6 +416,11 @@ The recorded read-set is `{(company, website), (company, founders), (founder_i, 
 **Pushing new pipeline source is a `DefEvent`** that moves the producer's ClientVersion and
 invalidates all of its prior output, triggering a full recompute across its source buffer.
 
+**Definition and implementation are separate.** The log records only the *definition* — `ProducerId`,
+source buffer, ClientVersion. The `ExecutionProvider` (§17) resolves that ID to an *implementation*.
+In v1 that resolution is a static registry of Rust functions compiled into the binary; later it is a
+container image reference reached over a socket. The log's model is identical either way.
+
 ### 9.3 Migrations
 
 A migration accompanies every shape-changing `DefEvent`. It is **a set of per-output-field
@@ -440,12 +450,21 @@ lossy or partial `down` migrations is deferred.
 Dependencies are captured at **field granularity, through hops**, including negative reads (checking
 a field that is absent is a dependency on its absence).
 
-In **v1 the read and write sets are declared manually** by the producer author, but are **verified at
-runtime by a proxy that throws on any undeclared access**. A mis-declared dependency therefore
-surfaces immediately as an error rather than silently producing stale derived data.
+**Capture is automatic and requires no declaration.** Every cell access a producer makes goes through
+`ProducerCtx` (§17), so the engine observes reads and writes exactly, with nothing for an author to
+declare or mis-declare. This is why `ExecutionProvider` is defined as *"run this code, mediating
+every cell access through me"* rather than merely *"run this code"* — the mediation is what makes
+tracking free, and it is equally satisfiable by an in-process call and by a socket round-trip.
 
-*(Later versions will capture read/write sets automatically using language-native facilities —
-proxies, decorators, compile-time instrumentation — rather than plain JSON-shaped objects.)*
+Example: `is_top_company` reads `Company#100.description` and `Person#300.title`, then writes
+`Company#100.is_top_company`. v1 records the fully-enumerated edge set:
+
+```
+[Company#100.description, Person#300.title]  ->  [Company#100.is_top_company]
+```
+
+This is deliberately verbose and costly. Compressed and probabilistic tracking policies are deferred
+to v2+.
 
 The dependency index is maintained in both directions:
 
@@ -690,13 +709,21 @@ these edges is later work.
 
 ## 15. Code Generation
 
-v1 generates a **TypeScript SDK** from the registry's defs at a chosen layer. That layer becomes the
-generated client's ClientVersion.
+**Generated SDKs are deferred out of v1.** A generated client needs a transport to reach the engine,
+and v1 has no network layer — building one competes directly with building the engine.
 
-- All fields are emitted as writable; ownership violations throw at runtime. Static read-only marking
-  of derived fields is deferred.
+When SDKs arrive they will come with a socket/network layer, and the generation contract is:
+
+- Generated from the registry's defs at a chosen layer; that layer becomes the client's ClientVersion.
+- All fields emitted as writable; ownership violations throw at runtime. Static read-only marking of
+  derived fields is deferred further still.
 - Reads return the provenance envelope of §10.4.
-- Python, Rust and Go generators are deferred.
+- TypeScript first, then Python, Rust, Go.
+
+**The v1 constraint that makes this possible later:** every engine operation must have a
+**serializable command/response form** — no callbacks, no borrowed references escaping the API
+surface, no in-process-only affordances. This is nearly free now and expensive to retrofit; it is the
+difference between "add a transport" and "redesign the API."
 
 ---
 
@@ -759,7 +786,7 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 | `DefRegistry` | defs, def-versions, ClientVersion resolution, live-version set |
 | `Invalidator` | walks a committing layer, converts it into dirty invocations |
 | `DependencyIndex` | bidirectional cell ↔ invocation graph; in-memory-primary |
-| `Scheduler` | queue of pending invocations per branch; delegates ordering to the policy provider |
+| `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, delegates ordering to the policy provider |
 | `ProducerRuntime` | executes user code; owns the read proxy that records and verifies read/write sets |
 | `Resolver` | read path: locate cell, migrate for version skew, validate, build envelope |
 | `FrontierTracker` | per-producer watermarks, settled frontier, `frontier.reaches()` |
@@ -788,6 +815,34 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 5. **Derived data is addressed by `reflects`, never by derived LayerId.** This is what makes the
    ordering of concurrent independent producers unobservable.
 
+### 16.4 The scheduler is stateless
+
+**There is no work queue.** Pending work is fully implied by the gap between a producer's watermark
+and the branch head, plus the dependency index. The scheduler *derives* what to run by streaming the
+layers in that gap, rather than materializing a list of invocations.
+
+This is not merely an optimization. Without it, naive-eager with no coalescing is exactly the
+configuration that explodes: one write to a widely-depended-on cell enqueues 100k invocations, and a
+def-mutation on a large type enqueues millions. Three properties fall out of having no queue:
+
+- **Bounded memory** — work is streamed, never accumulated.
+- **Free crash recovery** — restart and recompute the gap; there is no queue to lose or replay.
+- **Distributability** — workers derive their own work from shared state instead of contending on a
+  shared queue.
+
+### 16.5 Cycle detection
+
+A cycle is a producer that transitively depends on a field it writes. It cannot be detected
+statically, and under a stateless scheduler it does not surface as re-entry — it **livelocks**: the
+producer runs, advances its watermark, dirties its own input, and is rediscovered forever.
+
+**v1 detection is a per-invocation re-run counter within a single derivation pass.** If an invocation
+runs more than `K` times while the branch head has not moved, it is cycling; the producer is marked
+broken (§14) and its output cells report `state: 'broken'`.
+
+*(The precise form — walk the forward index from each written cell and test whether it reaches
+anything in the transitive closure of the read-set — is deferred to a v2 policy provider.)*
+
 ---
 
 ## 17. Provider Interfaces
@@ -798,11 +853,11 @@ without semantic change.
 | Provider | v1 implementation | Later |
 |---|---|---|
 | `StorageProvider` | external KV / SQL | native Borg storage |
-| `DependencyIndexProvider` | in-memory-primary | persistent, sharded |
+| `DependencyIndexProvider` | in-memory, key-ranged | persistent, sharded by cell key |
 | `ProducerPolicyProvider` | `NaiveEagerProducerPolicy` | prioritized, incremental, batched |
-| `ExecutionProvider` | in-process, full trust | LXC / container isolation |
-| `PidAllocator` | `(branchId, counter)` | — |
-| `CodegenProvider` | TypeScript | Python, Rust, Go |
+| `ExecutionProvider` | in-process Rust, full trust | container over a socket |
+| `ErrorPolicyProvider` | `NaiveProducerPoisonPolicy` | partial / per-cell recovery |
+| `CodegenProvider` | — (deferred, §15) | TypeScript, Python, Rust, Go |
 
 The dependency index is designed **in-memory-primary** rather than as a disk structure with a cache.
 This is a deliberate bet on the normalization thesis (§1): identity makes normalization free,
@@ -825,6 +880,55 @@ write stream into an uncommitted, invisible layer is disqualified. Nothing about
 dependency tracking or watermarks appears in this interface — all of that lives above the provider
 line.
 
+### 17.2 Distributable, not distributed
+
+Borg is **designed to be distributable and implemented single-node.** Building a distributed system
+from day one reliably produces coordination overhead everywhere, distributed code paths no test
+exercises, and a system that is both slower and still not distributed.
+
+Instead, every point that would require coordination sits behind a trait with a naive in-process
+implementation. Distribution later is five swaps, not a rewrite:
+
+| Seam | v1 | Later |
+|---|---|---|
+| `LayerSequencer` | in-process atomic counter per branch | consensus, or partition by branch |
+| `PidAllocator` | one allocator id per process | many, no coordination (§3.1) |
+| `LockManager` | in-process map with expiry | lease service |
+| `WorkSource` | in-process, stateless (§16.4) | unchanged — workers derive their own work |
+| `DependencyIndexProvider` | in-memory, key-ranged | sharded by cell key |
+
+Two decisions taken earlier for unrelated reasons turn out to be what makes this viable:
+content-addressed string PIDs require no coordination at all (any node computes the same hash), and
+deterministic output PIDs (§9.5) mean two workers racing the same invocation produce identical
+output — which is what makes at-least-once work dispatch safe.
+
+**Constraint on the index interface:** all dependency-index access must be expressed as key-ranged
+lookups, never "iterate everything." Identical single-node, shardable later.
+
+### 17.3 `ExecutionProvider` surface
+
+The contract is *"run this code, mediating every cell access through me"* — not merely "run this
+code." That mediation is what makes dependency capture free (§9.4) and is equally satisfiable by an
+in-process call and a socket round-trip.
+
+```rust
+#[async_trait]
+pub trait ExecutionProvider {
+    async fn run(&self, producer: &ProducerRef, input: Pid,
+                 ctx: &mut dyn ProducerCtx) -> Result<()>;
+}
+
+#[async_trait]
+pub trait ProducerCtx {
+    async fn get(&mut self, cell: CellRef) -> Result<Option<Value>>;  // recorded
+    async fn set(&mut self, cell: CellRef, v: Value) -> Result<()>;   // ownership-checked
+}
+```
+
+**`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
+returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting
+async through the derivation engine afterwards is a far larger change than paying for it now.
+
 ---
 
 ## 18. v1 Scope
@@ -838,14 +942,16 @@ line.
 - Multi-repo defs, flat namespace, implicit extension, collision errors
 - Def-versions, ClientVersion resolution, live-version set
 - Tombstoned deletes with dangling references permitted
-- Unified producer engine: pipelines and migrations
-- Declared read/write sets with runtime proxy verification
-- Dependency index (bidirectional), cycle detection, producer-scoped `IllegalState`
+- Unified producer engine: pipelines and migrations, in-process Rust under full trust
+- `ExecutionProvider` / `ProducerCtx` with automatic, ctx-mediated dependency capture
+- Dependency index (bidirectional, key-ranged), re-run cycle detection, producer-scoped `IllegalState`
+- Stateless scheduler — work derived from watermark gaps, no queue
 - Watermarks, validate/recompute, provenance envelopes, `explain()`
 - Frontier tracking, `freshness` read modes, settled-frontier reads
 - Object transactions with source-only guards
 - Merge with guard-based conflict detection
-- TypeScript SDK generator
+- Distribution seams (§17.2) behind traits, naive in-process implementations
+- Serializable command/response form for every engine operation
 
 **Out:**
 
@@ -854,11 +960,13 @@ line.
 - `Set`, `Map`
 - Aggregation pipelines
 - Mid-list insertion
-- Non-TypeScript codegen
-- Network / server layer — v1 is a library exercised by tests
-- Static read-only codegen for derived fields
+- **All generated SDKs** (§15) — they arrive with the network layer
+- Network / server layer — v1 is a library exercised by Rust tests
+- Actual distribution — only the seams (§17.2)
+- Coalescing of derived layers across source layers
 - `down`-migration validation
 - `expectedFreshAt` ETAs
+- Referential integrity / dangling-reference prevention
 
 **Acceptance scenarios:**
 
