@@ -10,7 +10,9 @@ pub mod memory;
 pub use memory::MemoryStorage;
 
 use async_trait::async_trait;
-use borg_core::{BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, Result};
+use borg_core::{
+    BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, ReadPath, Result,
+};
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
 ///
@@ -48,31 +50,23 @@ pub trait StorageProvider: Send + Sync {
     ///
     /// Returns only what is physically stored; the engine layers migration, validation and
     /// provenance on top.
+    /// Reads resolve through a [`ReadPath`] rather than a bare branch, so that a fork inherits its
+    /// parent by ancestry instead of by copying (SPEC.md §7.2). Storage never has to know what a
+    /// branch *is* — only how to walk the segments it is handed.
     async fn get_cell(
         &self,
-        branch: BranchId,
+        path: &ReadPath,
         cell: &CellRef,
-        layer: LayerId,
         version: ClientVersion,
     ) -> Result<Option<CellRecord>>;
 
     /// Which def-versions this cell is materialized at, as of a layer. Used by the resolver to find
     /// a migration path when the requested version is not yet materialized.
-    async fn cell_versions(
-        &self,
-        branch: BranchId,
-        cell: &CellRef,
-        layer: LayerId,
-    ) -> Result<Vec<ClientVersion>>;
+    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<ClientVersion>>;
 
     /// Enumerate a buffer. **Engine-internal only** — used by the scheduler to discover new
     /// entities (SPEC.md §9.6). Enumeration is not exposed as a user-facing query in v1.
-    async fn scan_buffer(
-        &self,
-        branch: BranchId,
-        buffer: &BufferId,
-        layer: LayerId,
-    ) -> Result<CellStream>;
+    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<CellStream>;
 
     /// Read a committed layer's contents. This is what drives invalidation: the committed layer *is*
     /// the changeset, so buffers need no observation machinery (SPEC.md §9.6).

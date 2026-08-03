@@ -16,9 +16,9 @@ pub mod value;
 
 pub use cell::{BufferId, CellAt, CellKey, CellRecord, CellRef, Derivation, FieldName, Origin};
 pub use def::{FieldDef, MigrationDirection, ObjectDef, ProducerDef, ProducerKind};
-pub use error::{BorgError, Result};
+pub use error::{BorgError, MergeRejection, Result};
 pub use freshness::{Freshness, FreshnessRequirement, Resolved, Watermark};
 pub use ids::{AllocatorId, BranchId, ClientVersion, LayerId, ProducerId, RepoId};
-pub use layer::{Branch, Layer, LayerAuthor, LayerKind, LayerState};
+pub use layer::{Branch, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
 pub use pid::{Pid, PidAllocator, PidKind};
 pub use value::{ObjectTypeName, Value, ValueType};

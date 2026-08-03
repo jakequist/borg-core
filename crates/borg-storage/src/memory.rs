@@ -10,7 +10,7 @@
 use crate::{CellStream, OpenLayer, SealedLayer, StorageProvider};
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, Result,
+    BorgError, BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerId, ReadPath, Result,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -90,63 +90,68 @@ impl OpenLayer for MemoryOpenLayer {
 impl StorageProvider for MemoryStorage {
     async fn get_cell(
         &self,
-        branch: BranchId,
+        path: &ReadPath,
         cell: &CellRef,
-        layer: LayerId,
         version: ClientVersion,
     ) -> Result<Option<CellRecord>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .committed
-            .get(&branch)
-            .and_then(|cells| cells.get(&(cell.clone(), version)))
-            .and_then(|history| {
-                history
-                    .iter()
-                    .rev()
-                    .find(|(written_at, _)| written_at.0 <= layer.0)
-                    .map(|(_, record)| record.clone())
-            }))
+        // Walk outward. The first segment holding *any* record wins — including a tombstone, which
+        // must stop the walk rather than fall through and resurrect the parent's value.
+        for (branch, bound) in &path.segments {
+            let found = inner
+                .committed
+                .get(branch)
+                .and_then(|cells| cells.get(&(cell.clone(), version)))
+                .and_then(|history| {
+                    history
+                        .iter()
+                        .rev()
+                        .find(|(written_at, _)| written_at.0 <= bound.0)
+                        .map(|(_, record)| record.clone())
+                });
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 
-    async fn cell_versions(
-        &self,
-        branch: BranchId,
-        cell: &CellRef,
-        layer: LayerId,
-    ) -> Result<Vec<ClientVersion>> {
+    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<ClientVersion>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .committed
-            .get(&branch)
-            .into_iter()
-            .flatten()
-            .filter(|((c, _), history)| c == cell && history.iter().any(|(at, _)| at.0 <= layer.0))
-            .map(|((_, version), _)| *version)
-            .collect())
+        let mut versions = Vec::new();
+        for (branch, bound) in &path.segments {
+            for ((c, version), history) in inner.committed.get(branch).into_iter().flatten() {
+                if c == cell
+                    && !versions.contains(version)
+                    && history.iter().any(|(at, _)| at.0 <= bound.0)
+                {
+                    versions.push(*version);
+                }
+            }
+        }
+        Ok(versions)
     }
 
-    async fn scan_buffer(
-        &self,
-        branch: BranchId,
-        buffer: &BufferId,
-        layer: LayerId,
-    ) -> Result<CellStream> {
+    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<CellStream> {
         let inner = self.inner.lock().unwrap();
-        let rows: Vec<_> = inner
-            .committed
-            .get(&branch)
-            .into_iter()
-            .flatten()
-            .filter(|((cell, _), _)| &cell.buffer == buffer)
-            .filter_map(|((cell, _), history)| {
-                history
+        // A child's own record shadows the parent's, so remember what the inner segments covered.
+        let mut seen: Vec<CellRef> = Vec::new();
+        let mut rows = Vec::new();
+        for (branch, bound) in &path.segments {
+            for ((cell, _), history) in inner.committed.get(branch).into_iter().flatten() {
+                if &cell.buffer != buffer || seen.contains(cell) {
+                    continue;
+                }
+                if let Some((_, record)) = history
                     .iter()
                     .rev()
-                    .find(|(written_at, _)| written_at.0 <= layer.0)
-                    .map(|(_, record)| Ok((cell.clone(), record.clone())))
-            })
-            .collect();
+                    .find(|(written_at, _)| written_at.0 <= bound.0)
+                {
+                    seen.push(cell.clone());
+                    rows.push(Ok((cell.clone(), record.clone())));
+                }
+            }
+        }
         Ok(Box::pin(futures_util::stream::iter(rows)))
     }
 

@@ -346,8 +346,19 @@ read another repo's data.
 
 ### 7.2 Reads
 
-A read is `(branchId, layerId?, clientVersion, freshness?)`. The layer must lie on the branch's own
-chain — its layers plus the ancestor chain up to each fork point. Omitting the layer reads HEAD.
+A read is `(branchId, layerId?, clientVersion, freshness?)`. Omitting the layer reads HEAD.
+
+The engine resolves this into a **read path**: the branch bounded at the requested layer (or its
+head), then each ancestor bounded at the fork point below it. Storage walks the segments outward and
+**the first segment holding any record wins** — *any record*, not any value, because a tombstone on a
+child must stop the walk rather than fall through and resurrect the parent's value.
+
+An ancestor is bounded at the fork point, and further clamped only when an explicit layer was
+requested, which may sit below that fork point. Clamping an ancestor by the child's own head instead
+would leave a fork that has not yet written anything unable to see its parent at all.
+
+Storage is handed the read path and never has to know what a branch *is* — which keeps
+`StorageProvider` (§17.1) free of branch semantics.
 
 ### 7.3 Commit
 
@@ -754,6 +765,10 @@ is rejected — re-fork from head and redo. Different defs touched, no conflict.
 
 **Def+data.** Also replays ValueEvents. Each retains its authored ClientVersion, so the parent's
 readers migrate as needed; nothing is coerced.
+
+**Validation precedes any write.** v1 rejects a whole merge rather than applying it partially, so
+every layer is checked before the first one is replayed and a rejected merge leaves no trace on the
+parent.
 
 **Failure and conflict rules:**
 

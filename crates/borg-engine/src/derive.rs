@@ -14,7 +14,8 @@ use crate::seams::WorkGap;
 use async_trait::async_trait;
 use borg_core::{
     BorgError, BranchId, CellAt, CellRecord, CellRef, ClientVersion, Derivation, LayerAuthor,
-    LayerId, LayerKind, Origin, Pid, ProducerDef, ProducerId, ProducerKind, Result, Value,
+    LayerId, LayerKind, Origin, Pid, ProducerDef, ProducerId, ProducerKind, ReadPath, Result,
+    Value,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_storage::StorageProvider;
@@ -34,9 +35,8 @@ struct RecordingCtx<'a> {
     storage: &'a dyn StorageProvider,
     index: &'a dyn DependencyIndexProvider,
     branch: BranchId,
-    /// The layer reads resolve at: this round's ceiling — the source layer plus every derived layer
-    /// already committed as a consequence of it. Distinct from `reflects` on purpose.
-    read_at: LayerId,
+    /// This round's ancestry, resolved once rather than per read.
+    path: ReadPath,
     /// The source layer this run is bringing the world up to. This is the *label* on the output, not
     /// where its inputs are read from: a producer consuming another producer's output must see that
     /// output, which lives in a derived layer with a higher id than the source layer they both
@@ -68,10 +68,7 @@ impl ProducerCtx for RecordingCtx<'_> {
         if !self.read_set.contains(&read) {
             self.read_set.push(read);
         }
-        let record = self
-            .storage
-            .get_cell(self.branch, cell, self.read_at, version)
-            .await?;
+        let record = self.storage.get_cell(&self.path, cell, version).await?;
         Ok(record.map(|r| r.value))
     }
 
@@ -115,6 +112,7 @@ pub struct DerivationEngine {
     executor: Arc<dyn ExecutionProvider>,
     frontier: Arc<FrontierTracker>,
     defs: Arc<crate::defs::DefRegistry>,
+    branches: Arc<crate::branch::BranchManager>,
     producers: Mutex<HashMap<ProducerId, ProducerDef>>,
     /// Producers poisoned by a runtime failure. Scoped to the producer, never the branch — which is
     /// why main never breaks because someone merged a bad pipeline (SPEC.md §14).
@@ -129,6 +127,7 @@ impl DerivationEngine {
         executor: Arc<dyn ExecutionProvider>,
         frontier: Arc<FrontierTracker>,
         defs: Arc<crate::defs::DefRegistry>,
+        branches: Arc<crate::branch::BranchManager>,
     ) -> Self {
         Self {
             storage,
@@ -137,6 +136,7 @@ impl DerivationEngine {
             executor,
             frontier,
             defs,
+            branches,
             producers: Mutex::new(HashMap::new()),
             broken: Mutex::new(HashMap::new()),
         }
@@ -380,7 +380,10 @@ impl DerivationEngine {
             storage: self.storage.as_ref(),
             index: self.index.as_ref(),
             branch,
-            read_at,
+            // This round's ceiling — the source layer plus every derived layer already committed as
+            // a consequence of it — resolved through the branch's ancestry once, rather than per
+            // read. Distinct from `reflects` on purpose (SPEC.md §16.5).
+            path: self.branches.read_path(branch, Some(read_at))?,
             reflects,
             producer: def.id,
             version,

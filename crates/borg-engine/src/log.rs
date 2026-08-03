@@ -66,6 +66,23 @@ impl LayerManager {
         self.state.lock().unwrap().layers.get(&id).cloned()
     }
 
+    /// Every committed layer belonging to a branch. A layer belongs to exactly one branch
+    /// (SPEC.md §6.2), so this needs no ancestry walk.
+    pub fn layers_of(&self, branch: BranchId) -> Vec<Layer> {
+        self.state
+            .lock()
+            .unwrap()
+            .layers
+            .values()
+            .filter(|layer| layer.branch == branch && layer.state == LayerState::Committed)
+            .cloned()
+            .collect()
+    }
+
+    pub fn storage(&self) -> Arc<dyn StorageProvider> {
+        Arc::clone(&self.storage)
+    }
+
     /// Open a layer. Order within a branch is established at *commit*, not here — many layers may be
     /// open on a branch simultaneously (SPEC.md §7.3).
     pub async fn open(

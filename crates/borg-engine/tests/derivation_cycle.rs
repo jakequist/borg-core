@@ -9,8 +9,8 @@ use borg_core::{
     LayerKind, Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
 };
 use borg_engine::{
-    DefRegistry, DerivationEngine, FrontierTracker, InProcessSequencer, LayerManager,
-    MemoryDependencyIndex,
+    BranchManager, DefRegistry, DerivationEngine, FrontierTracker, InProcessSequencer,
+    LayerManager, MemoryDependencyIndex,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -39,6 +39,7 @@ fn prop(pid: Pid, field: &str) -> CellRef {
 
 struct Harness {
     storage: Arc<MemoryStorage>,
+    branches: Arc<BranchManager>,
     layers: Arc<LayerManager>,
     engine: Arc<DerivationEngine>,
     frontier: Arc<FrontierTracker>,
@@ -51,6 +52,7 @@ impl Harness {
             storage.clone(),
             Arc::new(InProcessSequencer::new()),
         ));
+        let branches = Arc::new(BranchManager::new(layers.clone()));
         let frontier = Arc::new(FrontierTracker::new());
         let engine = Arc::new(DerivationEngine::new(
             storage.clone(),
@@ -59,6 +61,7 @@ impl Harness {
             Arc::new(executor),
             frontier.clone(),
             Arc::new(DefRegistry::new()),
+            branches.clone(),
         ));
         engine.register(ProducerDef {
             id: SCORE,
@@ -69,6 +72,7 @@ impl Harness {
         });
         Self {
             storage,
+            branches,
             layers,
             engine,
             frontier,
@@ -96,8 +100,9 @@ impl Harness {
 
     async fn read(&self, cell: &CellRef) -> Option<CellRecord> {
         let head = self.layers.head(BRANCH).unwrap();
+        let path = self.branches.read_path(BRANCH, Some(head)).unwrap();
         self.storage
-            .get_cell(BRANCH, cell, head, ClientVersion(LayerId(1)))
+            .get_cell(&path, cell, ClientVersion(LayerId(1)))
             .await
             .unwrap()
     }

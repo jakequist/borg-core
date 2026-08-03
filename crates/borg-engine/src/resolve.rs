@@ -4,11 +4,12 @@
 //! skew, validate the watermark, and build the provenance envelope. Borg never returns a bare
 //! value — every read states what it reflects and how stale it may be.
 
+use crate::branch::BranchManager;
 use crate::defs::DefRegistry;
 use crate::index::DependencyIndexProvider;
 use borg_core::{
     BranchId, CellAt, CellRef, ClientVersion, Freshness, FreshnessRequirement, LayerId, Origin,
-    ProducerId, Resolved, Result, Value,
+    ProducerId, ReadPath, Resolved, Result, Value,
 };
 use borg_storage::StorageProvider;
 use std::collections::HashMap;
@@ -84,6 +85,7 @@ pub struct Resolver {
     storage: Arc<dyn StorageProvider>,
     index: Arc<dyn DependencyIndexProvider>,
     defs: Arc<DefRegistry>,
+    branches: Arc<BranchManager>,
 }
 
 impl Resolver {
@@ -91,11 +93,13 @@ impl Resolver {
         storage: Arc<dyn StorageProvider>,
         index: Arc<dyn DependencyIndexProvider>,
         defs: Arc<DefRegistry>,
+        branches: Arc<BranchManager>,
     ) -> Self {
         Self {
             storage,
             index,
             defs,
+            branches,
         }
     }
 
@@ -111,7 +115,8 @@ impl Resolver {
         version: ClientVersion,
         requirement: FreshnessRequirement,
     ) -> Result<Resolved<Option<Value>>> {
-        let Some(record) = self.storage.get_cell(branch, cell, layer, version).await? else {
+        let path = self.branches.read_path(branch, Some(layer))?;
+        let Some(record) = self.storage.get_cell(&path, cell, version).await? else {
             return self
                 .resolve_unmaterialized(branch, cell, layer, version)
                 .await;
@@ -145,7 +150,7 @@ impl Resolver {
                 }
             }
             FreshnessRequirement::Validated | FreshnessRequirement::Current => {
-                self.validate(branch, &derivation.read_set, derivation.fresh_as_of, layer)
+                self.validate(&path, &derivation.read_set, derivation.fresh_as_of)
                     .await?
             }
         };
@@ -177,17 +182,16 @@ impl Resolver {
     /// advances to head for the cost of a few lookups (SPEC.md §10.2).
     async fn validate(
         &self,
-        branch: BranchId,
+        path: &ReadPath,
         read_set: &[CellAt],
         fresh_as_of: LayerId,
-        target: LayerId,
     ) -> Result<Freshness> {
         for dependency in read_set {
             // Each dependency is checked at the version the producer *read it at*, not at the
             // reader's version. Those differ whenever a migration is involved.
             let moved = self
                 .storage
-                .get_cell(branch, &dependency.cell, target, dependency.version)
+                .get_cell(path, &dependency.cell, dependency.version)
                 .await?
                 .is_some_and(|record| record.written_at.0 > fresh_as_of.0);
             if moved {
@@ -210,7 +214,8 @@ impl Resolver {
         layer: LayerId,
         version: ClientVersion,
     ) -> Result<Resolved<Option<Value>>> {
-        let available = self.storage.cell_versions(branch, cell, layer).await?;
+        let path = self.branches.read_path(branch, Some(layer))?;
+        let available = self.storage.cell_versions(&path, cell).await?;
 
         let reachable = available
             .iter()
@@ -241,7 +246,8 @@ impl Resolver {
         layer: LayerId,
         version: ClientVersion,
     ) -> Result<Option<Lineage>> {
-        let Some(record) = self.storage.get_cell(branch, cell, layer, version).await? else {
+        let path = self.branches.read_path(branch, Some(layer))?;
+        let Some(record) = self.storage.get_cell(&path, cell, version).await? else {
             return Ok(None);
         };
         let target = CellAt::new(cell.clone(), version);
@@ -251,7 +257,7 @@ impl Resolver {
         for dependency in dependencies {
             if let Some(source) = self
                 .storage
-                .get_cell(branch, &dependency.cell, layer, dependency.version)
+                .get_cell(&path, &dependency.cell, dependency.version)
                 .await?
             {
                 from.push(LineageEdge {

@@ -100,6 +100,17 @@ impl CellRef {
     pub const fn pid(&self) -> &Pid {
         self.key.pid()
     }
+
+    /// The existence cell of the object this cell belongs to. Returns `self` when this *is* an
+    /// existence cell, or when the cell belongs to something with no existence cell of its own.
+    pub fn existence_of(cell: &Self) -> Self {
+        match &cell.buffer {
+            BufferId::ObjectProp(struct_name, _) => {
+                Self::existence(struct_name.clone(), *cell.pid())
+            }
+            _ => cell.clone(),
+        }
+    }
 }
 
 impl fmt::Debug for BufferId {

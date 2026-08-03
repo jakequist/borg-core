@@ -9,8 +9,8 @@ use borg_core::{
     RepoId, Result, Value,
 };
 use borg_engine::{
-    DefRegistry, DerivationEngine, FrontierTracker, InProcessSequencer, LayerManager,
-    MemoryDependencyIndex, Resolver, VersionStep,
+    BranchManager, DefRegistry, DerivationEngine, FrontierTracker, InProcessSequencer,
+    LayerManager, MemoryDependencyIndex, Resolver, VersionStep,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -55,6 +55,7 @@ impl Harness {
             storage.clone(),
             Arc::new(InProcessSequencer::new()),
         ));
+        let branches = Arc::new(BranchManager::new(layers.clone()));
 
         let mut executor = NativeExecutor::new();
         executor.register(
@@ -76,6 +77,7 @@ impl Harness {
             Arc::new(executor),
             Arc::new(FrontierTracker::new()),
             defs.clone(),
+            branches.clone(),
         ));
         engine.register(ProducerDef {
             id: SCORE,
@@ -88,7 +90,7 @@ impl Harness {
         Self {
             layers,
             engine,
-            resolver: Resolver::new(storage, index, defs.clone()),
+            resolver: Resolver::new(storage, index, defs.clone(), branches.clone()),
             defs,
         }
     }

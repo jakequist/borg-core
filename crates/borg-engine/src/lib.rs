@@ -42,6 +42,7 @@ pub mod log;
 pub mod resolve;
 pub mod seams;
 
+pub use branch::BranchManager;
 pub use defs::{DefRegistry, MigrationHop, VersionStep};
 pub use derive::DerivationEngine;
 pub use index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};

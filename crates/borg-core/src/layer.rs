@@ -72,3 +72,42 @@ pub struct Branch {
     /// `None` marks the root of the tree.
     pub origin: Option<LayerId>,
 }
+
+/// The ancestry a read resolves through. SPEC.md §7.2.
+///
+/// A fork inherits its parent by *ancestry*, never by copying, which is what keeps forking O(1) even
+/// under eager derivation (SPEC.md §7.4). Resolving a cell walks the segments outward: the first one
+/// holding any record for that cell wins.
+///
+/// "Holding any record" rather than "holding a value" is the important part — a tombstone on a child
+/// must stop the walk, or a deletion would fall through and resurrect the parent's value.
+///
+/// The engine computes this and hands it to storage, so that `StorageProvider` never has to know
+/// what a branch is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadPath {
+    /// Innermost first. Each segment is a branch and the highest layer visible on it — head for the
+    /// branch being read, and the fork point for every ancestor.
+    pub segments: Vec<(BranchId, LayerId)>,
+}
+
+impl ReadPath {
+    pub fn new(segments: Vec<(BranchId, LayerId)>) -> Self {
+        Self { segments }
+    }
+
+    /// The branch being read, before ancestry.
+    pub fn branch(&self) -> Option<BranchId> {
+        self.segments.first().map(|(branch, _)| *branch)
+    }
+}
+
+/// What a merge carries across. SPEC.md §13.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MergeMode {
+    /// Definition mutations only — the common case. The parent's existing values are then read
+    /// through the new lens.
+    DefOnly,
+    /// Definitions and data both.
+    DefAndData,
+}
