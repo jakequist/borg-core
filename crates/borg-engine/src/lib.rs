@@ -41,5 +41,9 @@ pub mod log;
 pub mod resolve;
 pub mod seams;
 
-pub use index::{DependencyIndexProvider, Invocation};
+pub use derive::DerivationEngine;
+pub use index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};
+pub use log::{LayerHandle, LayerManager};
+pub use resolve::FrontierTracker;
+pub use seams::InProcessSequencer;
 pub use seams::{LayerSequencer, LockManager, WorkGap, WorkSource};

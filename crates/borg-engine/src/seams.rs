@@ -72,3 +72,27 @@ impl WorkGap {
         self.from.0 >= self.to.0
     }
 }
+
+// --- Naive in-process implementations (SPEC.md §17.2) ---
+
+/// v1 `LayerSequencer`: a process-local counter.
+///
+/// Layer ids are registry-unique rather than per-branch, so one counter serves every branch.
+#[derive(Default)]
+pub struct InProcessSequencer {
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl InProcessSequencer {
+    pub fn new() -> Self {
+        Self {
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+impl LayerSequencer for InProcessSequencer {
+    fn next_layer_id(&self, _branch: BranchId) -> LayerId {
+        LayerId(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}

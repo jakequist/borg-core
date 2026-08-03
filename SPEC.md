@@ -850,7 +850,7 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 | `DefRegistry` | defs, def-versions, ClientVersion resolution, live-version set |
 | `Invalidator` | walks a committing layer, converts it into dirty invocations |
 | `DependencyIndex` | bidirectional cell ↔ invocation graph; in-memory-primary |
-| `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, delegates ordering to the policy provider |
+| `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, settles each source layer as a closure (§16.5) |
 | `ProducerRuntime` | executes user code; owns the read proxy that records and verifies read/write sets |
 | `Resolver` | read path: locate cell, migrate for version skew, validate, build envelope |
 | `FrontierTracker` | per-producer watermarks, settled frontier, `frontier.reaches()` |
@@ -894,14 +894,41 @@ def-mutation on a large type enqueues millions. Three properties fall out of hav
 - **Distributability** — workers derive their own work from shared state instead of contending on a
   shared queue.
 
-### 16.5 Cycle detection
+### 16.5 A source layer settles as a closure
+
+A committed layer triggers producers; their output commits further layers, which trigger more.
+**All of it carries the same `reflects`**, because it is all the consequence of one source layer. A
+producer's watermark advances to `L` only once that whole closure has settled — which is precisely
+what makes the watermark's claim true: *replay the world at `L` and you get exactly this.*
+
+Only **source** layers open a round. Derived layers are consequences, picked up inside the closure
+rather than driving rounds of their own. Skipping derived layers entirely is tempting and wrong: it
+silently breaks every chained producer, since a producer consuming another's output can only ever be
+triggered by that producer's derived layer.
+
+**The layer a producer reads at is not the layer it reflects.** Within a round, reads resolve at the
+round's **ceiling** — the source layer plus every derived layer already committed as a consequence of
+it — while the output is labelled with the source layer. Without that separation a downstream
+producer could never see its upstream's output, because that output lives in a derived layer with a
+*higher* id than the source layer they both reflect.
+
+Ordering within a round is not prescribed. If a downstream producer happens to run before its
+upstream, it computes from an absent input, the upstream then commits, and the downstream's
+dependency on that cell brings it back round. The fixpoint self-corrects; only the settled result is
+guaranteed.
+
+> The ceiling is safe because derivation is the only writer while a round settles. Under concurrent
+> source writes the precise formulation is *"the highest layer that is either ≤ L, or is a derived
+> layer with `reflects == L`"* — same meaning, expressed without relying on quiescence.
+
+### 16.6 Cycle detection
 
 A cycle is a producer that transitively depends on a field it writes. It cannot be detected
 statically, and under a stateless scheduler it does not surface as re-entry — it **livelocks**: the
 producer runs, advances its watermark, dirties its own input, and is rediscovered forever.
 
-**v1 detection is a per-invocation re-run counter within a single derivation pass.** If an invocation
-runs more than `K` times while the branch head has not moved, it is cycling; the producer is marked
+**v1 detection is a per-invocation re-run counter scoped to one round (§16.5).** If an invocation
+runs more than `K` times while settling a single source layer, it is cycling; the producer is marked
 broken (§14) and its output cells report `state: 'broken'`.
 
 *(The precise form — walk the forward index from each written cell and test whether it reaches

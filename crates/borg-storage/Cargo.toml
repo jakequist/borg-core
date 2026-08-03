@@ -12,3 +12,4 @@ workspace = true
 borg-core.workspace = true
 async-trait.workspace = true
 futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

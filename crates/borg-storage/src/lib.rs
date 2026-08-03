@@ -6,6 +6,9 @@
 //! about derivation, dependency tracking, or watermarks appears here** — all of that lives above the
 //! provider line, so that swapping backends never means reimplementing the engine.
 
+pub mod memory;
+pub use memory::MemoryStorage;
+
 use async_trait::async_trait;
 use borg_core::{BranchId, BufferId, CellRecord, CellRef, LayerId, Result};
 

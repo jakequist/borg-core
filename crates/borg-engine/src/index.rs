@@ -59,3 +59,124 @@ pub trait DependencyIndexProvider: Send + Sync {
 // bounded result. **Nothing iterates the whole index.** That constraint is what keeps the interface
 // identical when the implementation shards by cell key (SPEC.md §17.2) — it is cheap to honor now
 // and impossible to retrofit onto an API that hands out a whole map.
+
+// --- Naive in-memory implementation ---
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// v1 `DependencyIndexProvider`: the fully-enumerated edge set, held in memory.
+///
+/// Deliberately dumb. Every method still takes an explicit key or key-slice and returns a bounded
+/// result — nothing here iterates the whole index — so the interface survives being sharded by cell
+/// key later (SPEC.md §17.2).
+#[derive(Default)]
+pub struct MemoryDependencyIndex {
+    inner: Mutex<IndexInner>,
+}
+
+#[derive(Default)]
+struct IndexInner {
+    /// Forward: cell -> invocations that read it. Drives invalidation.
+    dependents: HashMap<(BranchId, CellRef), Vec<Invocation>>,
+    /// Backward: cell -> what it was computed from. Drives lineage.
+    dependencies: HashMap<(BranchId, CellRef), Vec<CellRef>>,
+    /// Discovered field ownership. This lives here rather than in the def because discovery happens
+    /// during derivation, and defs may only be mutated by def-layers (SPEC.md §8).
+    writers: HashMap<(BranchId, CellRef), ProducerId>,
+    /// What each invocation read, so a re-run can retract its stale forward edges.
+    read_sets: HashMap<(BranchId, Invocation), Vec<CellRef>>,
+}
+
+impl MemoryDependencyIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl DependencyIndexProvider for MemoryDependencyIndex {
+    fn record(
+        &self,
+        branch: BranchId,
+        invocation: &Invocation,
+        read_set: &[CellRef],
+        write_set: &[CellRef],
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // Retract the previous run's forward edges before adding this run's, or a producer whose
+        // dependencies shrink would stay subscribed to cells it no longer reads.
+        if let Some(previous) = inner.read_sets.remove(&(branch, invocation.clone())) {
+            for cell in previous {
+                if let Some(deps) = inner.dependents.get_mut(&(branch, cell)) {
+                    deps.retain(|i| i != invocation);
+                }
+            }
+        }
+
+        for cell in read_set {
+            inner
+                .dependents
+                .entry((branch, cell.clone()))
+                .or_default()
+                .push(invocation.clone());
+        }
+        inner
+            .read_sets
+            .insert((branch, invocation.clone()), read_set.to_vec());
+
+        for cell in write_set {
+            inner
+                .dependencies
+                .insert((branch, cell.clone()), read_set.to_vec());
+            inner
+                .writers
+                .insert((branch, cell.clone()), invocation.producer);
+        }
+        Ok(())
+    }
+
+    fn dependents(&self, branch: BranchId, cells: &[CellRef]) -> Result<Vec<Invocation>> {
+        let inner = self.inner.lock().unwrap();
+        let mut found: Vec<Invocation> = Vec::new();
+        for cell in cells {
+            if let Some(invocations) = inner.dependents.get(&(branch, cell.clone())) {
+                for invocation in invocations {
+                    if !found.contains(invocation) {
+                        found.push(invocation.clone());
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn dependencies(&self, branch: BranchId, cell: &CellRef) -> Result<Vec<CellRef>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .dependencies
+            .get(&(branch, cell.clone()))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn writer_of(&self, branch: BranchId, cell: &CellRef) -> Result<Option<ProducerId>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.writers.get(&(branch, cell.clone())).copied())
+    }
+
+    fn forget_producer(&self, branch: BranchId, producer: ProducerId) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.dependents.retain(|(b, _), v| {
+            v.retain(|i| i.producer != producer);
+            *b != branch || !v.is_empty()
+        });
+        inner
+            .writers
+            .retain(|(b, _), p| *b != branch || *p != producer);
+        inner
+            .read_sets
+            .retain(|(b, i), _| *b != branch || i.producer != producer);
+        Ok(())
+    }
+}
