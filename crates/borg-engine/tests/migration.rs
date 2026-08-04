@@ -5,13 +5,13 @@
 //! triggered by a data write, a migration by a def-mutation.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Freshness,
-    FreshnessRequirement, LayerAuthor, LayerId, LayerKind, MigrationDirection, Origin, Pid,
-    PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value, ValueType,
+    BranchId, BufferId, CellRef, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
+    LayerAuthor, LayerId, MigrationDirection, Origin, Ownership, Pid, PidKind, ProducerDef,
+    ProducerId, ProducerKind, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver, WriteSession,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -81,25 +81,20 @@ impl Harness {
     }
 
     async fn push(&self, version: ClientVersion, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(BRANCH, LayerKind::Value, LayerAuthor::Source)
-            .await?;
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            BRANCH,
+            None,
+            version,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for (cell, value) in writes {
-            layer
-                .put(
-                    &cell,
-                    CellRecord {
-                        value,
-                        version,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     /// Install a producer implementation. The log records the *definition*; this is the other half
@@ -171,12 +166,24 @@ async fn declare_then_mutate(h: &Harness) -> Result<(ClientVersion, ClientVersio
         .defs
         .push(
             BRANCH,
-            vec![DefEvent::DeclareField {
-                struct_name: "Company".into(),
-                field: "website".into(),
-                ty: ValueType::Int,
-                repo: RepoId(1),
-            }],
+            vec![
+                DefEvent::DeclareField {
+                    struct_name: "Company".into(),
+                    field: "website".into(),
+                    ty: ValueType::Int,
+                    repo: RepoId(1),
+                    ownership: Ownership::Source,
+                },
+                // The pipeline below writes this one. Ownership is declared, so the field names its
+                // producer rather than the producer claiming the field (SPEC.md §8).
+                DefEvent::DeclareField {
+                    struct_name: "Company".into(),
+                    field: "is_investible".into(),
+                    ty: ValueType::Bool,
+                    repo: RepoId(1),
+                    ownership: Ownership::Derived(SCORE),
+                },
+            ],
         )
         .await?;
     let mutated = h

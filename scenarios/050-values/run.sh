@@ -9,6 +9,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../lib.sh"
 setup
 
+# Nine fields, one per thing a value can be. Declaring them is what lets the text below be parsed
+# *against* a type rather than guessed at from its syntax (§3.4, §5.1).
+borg def push "$HERE/schema.json"
+
 # The `interned:` line of `borg get` names the content-addressed PID behind a value, and appears
 # only when there is one. It is the surface that shows deduplication actually happening.
 interned() { borg get "$1" | sed -n 's/^[[:space:]]*interned:[[:space:]]*//p'; }
@@ -70,19 +74,42 @@ borg set 'Company#1.debt' -129n
 assert_eq "$(borg get 'Company#1.debt' --value)" "-129n" \
     "negative bigints too — the encoding is two's complement, and minimal"
 
-# --- What is *not* a string -----------------------------------------------------------------------
+# --- Primitives and references ----------------------------------------------------------------
 
-# The older forms win, which is the documented cost of parsing without a declared type. Milestone B
-# makes parsing type-directed and resolves it; until then, this is what borg guesses.
 borg set 'Company#1.founded' 1999
 assert_eq "$(interned 'Company#1.founded')" "" "an integer is a primitive — nothing to intern"
 assert_eq "$(borg get 'Company#1.founded' --value)" "1999" "and reads back as an integer"
 
 borg set 'Company#1.is_public' true
 assert_eq "$(interned 'Company#1.is_public')" "" "a bool is a primitive too"
-assert_eq "$(borg get 'Company#1.is_public' --value)" "true" \
-    "so the text 'true' is a Bool, and a string field cannot hold it yet"
 
 borg set 'Company#1.owner' '@Company#2'
 assert_contains "$(borg get 'Company#1.owner' --value)" "@o-" \
-    "and @<pid> is still a reference, not the text of one"
+    "a reference is a PID, and reads back as one"
+
+# --- Parsing is directed by the declared type -----------------------------------------------------
+
+# This is the reservation §3.4 recorded as temporary, lifted. Parsing used to guess a type from the
+# syntax alone, so `true`, `42`, `0x` and `@jake` all meant something *other* than their text and no
+# string field could hold them. Now the field says what it holds, and the text is just text.
+for literal in true 42 1.5 0x 7n '@jake' 99999999999999999999999; do
+    borg set 'Company#1.slogan' "$literal" >/dev/null
+    assert_eq "$(borg get 'Company#1.slogan' --value)" "$literal" \
+        "a String field holds the literal text \`$literal\`"
+    assert_contains "$(interned 'Company#1.slogan')" "@s-" \
+        "…and it is interned as a string, not read as $literal's old meaning"
+done
+
+# The same knowledge, used the other way: a field that cannot hold a value says so instead of
+# storing something that looks almost right.
+assert_rejected "declared Int" "an Int field refuses a word" \
+    -- borg set 'Company#1.founded' acme
+assert_rejected "declared Bool" "a Bool field refuses anything but true or false" \
+    -- borg set 'Company#1.is_public' yes
+assert_rejected "declared Company" "a reference field refuses a bare word" \
+    -- borg set 'Company#1.owner' acme
+
+# `~` stays reserved on every field whatever its type: deletion has to be expressible (§8.1).
+borg delete 'Company#1.slogan'
+assert_field "$(borg get 'Company#1.slogan')" "state" "tombstoned" \
+    "a tombstone is accepted by every declared type"

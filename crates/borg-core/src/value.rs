@@ -109,6 +109,63 @@ pub enum ValueType {
     // Set/Map deferred (SPEC.md §3.3).
 }
 
+impl ValueType {
+    /// Whether a value may be stored in a cell declared this type. SPEC.md §5.1, §8.
+    ///
+    /// **A tombstone satisfies every type.** It means *explicitly removed* (§8.1) rather than "a
+    /// value of the wrong shape", and deletion has to be expressible for every field or
+    /// `borg delete` would only work on `Any`.
+    ///
+    /// **What this cannot check.** A `Ref` carries a PID, and a PID records a *kind*, not a struct
+    /// (§3.1). So a field declared `Object(Company)` is checked for "is this an object at all" and
+    /// no further — nothing in the value says which struct the object belongs to, and finding out
+    /// would mean a read of its existence cell on the write path. This is stated rather than faked:
+    /// a check that looks total and is not is worse than one that admits its edge.
+    pub fn accepts(&self, value: &Value) -> bool {
+        if value.is_tombstone() {
+            return true;
+        }
+        match (self, value) {
+            (Self::Any, _)
+            | (Self::Int, Value::Int(_))
+            | (Self::Bool, Value::Bool(_))
+            | (Self::Double, Value::Double(_))
+            | (Self::AnyNumber, Value::Int(_) | Value::Double(_)) => true,
+            (Self::String, Value::Ref(pid)) => pid.kind() == PidKind::String,
+            (Self::Binary, Value::Ref(pid)) => pid.kind() == PidKind::Binary,
+            (Self::BigInt | Self::AnyNumber, Value::Ref(pid)) => pid.kind() == PidKind::BigInt,
+            (Self::Object(_) | Self::AnyObject, Value::Ref(pid)) => {
+                matches!(pid.kind(), PidKind::Object | PidKind::AnyObject)
+            }
+            (Self::List(_) | Self::AnyArray, Value::Ref(pid)) => {
+                matches!(pid.kind(), PidKind::List | PidKind::AnyArray)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The name a type wears in a def file, an error message and `borg def show` — one spelling, so a
+/// type named in a rejection is a type the reader can paste back into a declaration.
+impl std::fmt::Display for ValueType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int => f.write_str("Int"),
+            Self::Bool => f.write_str("Bool"),
+            Self::Double => f.write_str("Double"),
+            Self::String => f.write_str("String"),
+            Self::Binary => f.write_str("Binary"),
+            Self::BigInt => f.write_str("BigInt"),
+            Self::Object(name) => f.write_str(name),
+            Self::List(element) => write!(f, "{element}[]"),
+            Self::Any => f.write_str("Any"),
+            Self::AnyObject => f.write_str("AnyObject"),
+            Self::AnyArray => f.write_str("AnyArray"),
+            Self::AnyNumber => f.write_str("AnyNumber"),
+        }
+    }
+}
+
 /// A struct name. The namespace is flat and registry-wide: a struct has no owner, only its fields do
 /// (SPEC.md §5.2).
 pub type ObjectTypeName = std::sync::Arc<str>;

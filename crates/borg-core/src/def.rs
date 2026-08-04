@@ -7,7 +7,7 @@
 //! The consequence worth internalizing: a struct has no owner. Only its fields do. `Company` exists
 //! because somebody declared a field on it.
 
-use crate::cell::{BufferId, FieldName, Origin};
+use crate::cell::{BufferId, FieldName};
 use crate::ids::{LayerId, ProducerId, RepoId};
 use crate::value::{ObjectTypeName, ValueType};
 use serde::{Deserialize, Serialize};
@@ -20,21 +20,57 @@ pub struct ObjectDef {
     pub fields: BTreeMap<FieldName, FieldDef>,
 }
 
-/// A single field.
+/// Who writes a field. SPEC.md §5.1, §8.
 ///
-/// **There is deliberately no `writer` here.** Every field has exactly one writer, but that
-/// ownership is *discovered* at runtime, and defs are mutated only by DefEvents in def-layers.
-/// Recording a discovered owner into the def would mean the derivation engine emitting
-/// def-mutations — violating the value-xor-def rule and letting a producer's first run silently
-/// rewrite the schema. Ownership is discovered state and lives in the dependency index with the rest
-/// of it (SPEC.md §8).
+/// **One enum, not an `origin` beside an optional `writer`.** Every field has exactly one writer, so
+/// "derived but unowned" and "source but owned by P1" are not states the system has an answer for —
+/// and a pair of loose fields is exactly how they become spellable.
+///
+/// Ownership is **declared, not discovered**. The author of a repo knows which producer computes
+/// which field, so a violation is caught on the *first* wrong write rather than on the second
+/// producer's collision with the first. Runtime enforcement then checks a write against the
+/// declaration instead of inventing one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Ownership {
+    /// Ground truth, pushed by external clients.
+    Source,
+    /// Computed by exactly one producer. No client may write it.
+    Derived(ProducerId),
+}
+
+impl Ownership {
+    /// The producer that owns this field, if one does.
+    ///
+    /// There is deliberately no `Origin` conversion here. A *record's* `Origin` follows the actor
+    /// that wrote it ([`Writer::origin`](crate::cell::Writer::origin)), not the declaration, because
+    /// an `up` migration is a producer writing a field declared `Source` and the record it leaves is
+    /// still derived (SPEC.md §9.3). Deriving one from the other would be wrong in exactly that case.
+    pub const fn producer(&self) -> Option<ProducerId> {
+        match self {
+            Self::Source => None,
+            Self::Derived(producer) => Some(*producer),
+        }
+    }
+}
+
+impl std::fmt::Display for Ownership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Source => f.write_str("source data, written by clients"),
+            Self::Derived(producer) => write!(f, "derived by producer {producer}"),
+        }
+    }
+}
+
+/// A single field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FieldDef {
     pub name: FieldName,
     pub ty: ValueType,
     /// The repo that declared this field. Only that repo may mutate or delete it.
     pub declaring_repo: RepoId,
-    pub origin: Origin,
+    /// Who may write this field, and therefore whether its cells are source or derived (SPEC.md §8).
+    pub ownership: Ownership,
     /// The def-layer that last mutated this field — i.e. its def-version. There is no separate
     /// versioning scheme (SPEC.md §5.3).
     pub version: LayerId,
@@ -84,11 +120,15 @@ pub enum MigrationDirection {
 pub enum DefEvent {
     /// Add a field. The declaring repo becomes its owner — the only repo permitted to mutate or
     /// delete it. Two repos declaring the same field is a hard error.
+    ///
+    /// `ownership` is what makes a derived field declarable at all: before it existed every field
+    /// was implicitly source, so no producer could legally write anything (SPEC.md §8).
     DeclareField {
         struct_name: ObjectTypeName,
         field: FieldName,
         ty: ValueType,
         repo: RepoId,
+        ownership: Ownership,
     },
     /// Change a field's shape. **Must** supply migrations: `up` carries existing values forward, and
     /// `down` — optional — keeps older clients reading (SPEC.md §9.3).

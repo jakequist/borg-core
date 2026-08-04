@@ -61,3 +61,22 @@ assert_fails() {
     fi
     pass "$desc"
 }
+
+# assert_rejected <needle> <description> -- <command...>
+#
+# Like assert_fails, but also asserts what the failure *said*. A rejection nobody can act on is
+# barely better than a crash, so the message is part of the behaviour under test.
+assert_rejected() {
+    local needle="$1" desc="$2"; shift 3
+    local output status
+    output="$("$@" 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+        fail "$desc (command unexpectedly succeeded)"
+    fi
+    case "$output" in
+        *"$needle"*) pass "$desc" ;;
+        *) fail "$desc
+      expected the error to mention: $needle
+      actual error:                  $output" ;;
+    esac
+}

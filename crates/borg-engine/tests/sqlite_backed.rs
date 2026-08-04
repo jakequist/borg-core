@@ -5,13 +5,13 @@
 //! above the provider line changes.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Freshness,
-    FreshnessRequirement, LayerAuthor, LayerId, LayerKind, MergeMode, Origin, Pid, PidKind,
-    ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value, ValueType,
+    BranchId, BufferId, CellRef, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
+    LayerAuthor, LayerId, MergeMode, Ownership, Pid, PidKind, ProducerDef, ProducerId,
+    ProducerKind, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver, WriteSession,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -27,6 +27,16 @@ fn company(branch: BranchId, n: u64) -> Pid {
         branch,
         allocator: borg_core::AllocatorId(0),
         counter: n,
+    }
+}
+
+fn declare(field: &str, ty: ValueType, ownership: Ownership) -> DefEvent {
+    DefEvent::DeclareField {
+        struct_name: "Company".into(),
+        field: field.into(),
+        ty,
+        repo: RepoId(1),
+        ownership,
     }
 }
 
@@ -100,26 +110,37 @@ impl Harness {
         })
     }
 
-    async fn push(&self, branch: BranchId, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(branch, LayerKind::Value, LayerAuthor::Source)
+    /// A root branch with the schema these tests write against.
+    async fn root(&self) -> Result<BranchId> {
+        let branch = self.branches.create_root(None).await?;
+        self.defs
+            .push(
+                branch,
+                vec![
+                    declare("website", ValueType::Int, Ownership::Source),
+                    declare("name", ValueType::Int, Ownership::Source),
+                    declare("is_investible", ValueType::Bool, Ownership::Derived(SCORE)),
+                ],
+            )
             .await?;
+        Ok(branch)
+    }
+
+    async fn push(&self, branch: BranchId, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            branch,
+            None,
+            V1,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for (cell, value) in writes {
-            layer
-                .put(
-                    &cell,
-                    CellRecord {
-                        value,
-                        version: V1,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     async fn read(&self, branch: BranchId, cell: &CellRef) -> Result<Option<Value>> {
@@ -134,7 +155,7 @@ impl Harness {
 #[tokio::test]
 async fn the_derivation_cycle_runs_unchanged_on_sqlite() -> Result<()> {
     let h = Harness::new()?;
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     h.push(
@@ -169,7 +190,7 @@ async fn the_derivation_cycle_runs_unchanged_on_sqlite() -> Result<()> {
 #[tokio::test]
 async fn branching_and_merge_run_unchanged_on_sqlite() -> Result<()> {
     let h = Harness::new()?;
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -216,19 +237,7 @@ async fn branching_and_merge_run_unchanged_on_sqlite() -> Result<()> {
 #[tokio::test]
 async fn def_events_and_provenance_survive_a_real_store() -> Result<()> {
     let h = Harness::new()?;
-    let main = h.branches.create_root(None).await?;
-
-    h.defs
-        .push(
-            main,
-            vec![DefEvent::DeclareField {
-                struct_name: "Company".into(),
-                field: "website".into(),
-                ty: ValueType::Int,
-                repo: RepoId(1),
-            }],
-        )
-        .await?;
+    let main = h.root().await?;
 
     let acme = company(main, 1);
     h.push(

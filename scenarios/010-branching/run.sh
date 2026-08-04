@@ -4,6 +4,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../lib.sh"
 setup
 
+# Definitions are branch-scoped mutations like any other, and a write is checked against them
+# (§5.1, §8) — so main declares its schema before anything is written, and the fork inherits it.
+borg def push "$HERE/schema.json"
+
 borg set 'Company#1.name' Acme
 fork_point="$(borg layer head)"
 

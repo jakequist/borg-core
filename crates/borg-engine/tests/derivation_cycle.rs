@@ -5,12 +5,13 @@
 //! queued anywhere.
 
 use borg_core::{
-    BranchId, BufferId, CellAt, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId,
-    LayerKind, Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    BranchId, BufferId, CellAt, CellRecord, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId,
+    Origin, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, WriteSession,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -19,6 +20,29 @@ use std::sync::Arc;
 
 const BRANCH: BranchId = BranchId(1);
 const SCORE: ProducerId = ProducerId(1);
+const DOWNSTREAM: ProducerId = ProducerId(9);
+const V1: ClientVersion = ClientVersion(LayerId(1));
+
+/// The schema every test here writes against.
+///
+/// Ownership is declared, not discovered (SPEC.md §8): `website` and `name` are ground truth, and
+/// each computed field names the one producer allowed to write it.
+fn schema() -> Vec<DefEvent> {
+    let declare = |field: &str, ty: ValueType, ownership: Ownership| DefEvent::DeclareField {
+        struct_name: "Company".into(),
+        field: field.into(),
+        ty,
+        repo: RepoId(1),
+        ownership,
+    };
+    vec![
+        declare("website", ValueType::Int, Ownership::Source),
+        declare("name", ValueType::Int, Ownership::Source),
+        declare("is_investible", ValueType::Bool, Ownership::Derived(SCORE)),
+        declare("tier", ValueType::Int, Ownership::Derived(DOWNSTREAM)),
+        declare("counter", ValueType::Int, Ownership::Derived(SCORE)),
+    ]
+}
 
 fn company(n: u64) -> Pid {
     Pid::Allocated {
@@ -41,12 +65,13 @@ struct Harness {
     storage: Arc<MemoryStorage>,
     branches: Arc<BranchManager>,
     layers: Arc<LayerManager>,
+    defs: Arc<DefRegistry>,
     engine: Arc<DerivationEngine>,
     frontier: Arc<FrontierTracker>,
 }
 
 impl Harness {
-    fn new(executor: NativeExecutor) -> Self {
+    async fn new(executor: NativeExecutor) -> Result<Self> {
         let storage = Arc::new(MemoryStorage::new());
         let layers = Arc::new(LayerManager::new(
             storage.clone(),
@@ -54,6 +79,7 @@ impl Harness {
             Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
+        let defs = Arc::new(DefRegistry::new(layers.clone(), storage.clone()));
         let frontier = Arc::new(FrontierTracker::new());
         let engine = Arc::new(DerivationEngine::new(
             storage.clone(),
@@ -61,7 +87,7 @@ impl Harness {
             Arc::new(MemoryDependencyIndex::new()),
             Arc::new(executor),
             frontier.clone(),
-            Arc::new(DefRegistry::new(layers.clone(), storage.clone())),
+            defs.clone(),
             branches.clone(),
         ));
         engine.register(ProducerDef {
@@ -71,32 +97,34 @@ impl Harness {
             version: LayerId(1),
             declaring_repo: RepoId(1),
         });
-        Self {
+        // The schema comes first, because nothing may be written until it does (SPEC.md §8).
+        defs.push(BRANCH, schema()).await?;
+        Ok(Self {
             storage,
             branches,
             layers,
+            defs,
             engine,
             frontier,
-        }
+        })
     }
 
-    /// Commit a source layer holding the given writes.
+    /// Commit a source layer holding the given writes, through the validated write path.
     async fn push(&self, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(BRANCH, LayerKind::Value, LayerAuthor::Source)
-            .await?;
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            BRANCH,
+            None,
+            V1,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for (cell, value) in writes {
-            let record = CellRecord {
-                value,
-                version: ClientVersion(LayerId(1)),
-                written_at: layer.id(),
-                origin: Origin::Source,
-                derivation: None,
-            };
-            layer.put(&cell, record).await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     async fn read(&self, cell: &CellRef) -> Option<CellRecord> {
@@ -128,7 +156,7 @@ fn score_producer() -> NativeExecutor {
 
 #[tokio::test]
 async fn derives_on_create_and_tracks_at_field_granularity() -> Result<()> {
-    let h = Harness::new(score_producer());
+    let h = Harness::new(score_producer()).await?;
     let acme = company(100);
 
     // A new entity appears in the producer's source buffer.
@@ -154,10 +182,7 @@ async fn derives_on_create_and_tracks_at_field_granularity() -> Result<()> {
     assert_eq!(derivation.producer, SCORE);
     assert_eq!(
         derivation.read_set,
-        vec![CellAt::new(
-            prop(acme, "website"),
-            ClientVersion(LayerId(1))
-        )],
+        vec![CellAt::new(prop(acme, "website"), V1)],
         "the read-set is captured automatically, at the version read, and contains only what was \
          actually read"
     );
@@ -202,8 +227,6 @@ async fn derives_on_create_and_tracks_at_field_granularity() -> Result<()> {
 async fn a_producer_reading_another_producers_output_is_triggered_by_it() -> Result<()> {
     // The case that motivated running a source layer's consequences to a fixpoint: B depends on A's
     // output, so B can only be triggered by A's *derived* layer.
-    const DOWNSTREAM: ProducerId = ProducerId(9);
-
     let executor = NativeExecutor::new();
     executor.register(
         SCORE,
@@ -230,7 +253,7 @@ async fn a_producer_reading_another_producers_output_is_triggered_by_it() -> Res
         }),
     );
 
-    let h = Harness::new(executor);
+    let h = Harness::new(executor).await?;
     h.engine.register(ProducerDef {
         id: DOWNSTREAM,
         kind: ProducerKind::Pipeline,
@@ -269,7 +292,7 @@ async fn a_producer_reading_another_producers_output_is_triggered_by_it() -> Res
 
 #[tokio::test]
 async fn absence_is_a_tracked_dependency() -> Result<()> {
-    let h = Harness::new(score_producer());
+    let h = Harness::new(score_producer()).await?;
     let acme = company(200);
 
     // Created with no website at all: the producer reads nothing and must still depend on it.
@@ -312,7 +335,7 @@ async fn a_cycling_producer_poisons_itself_and_not_the_branch() -> Result<()> {
         }),
     );
 
-    let h = Harness::new(executor);
+    let h = Harness::new(executor).await?;
     let acme = company(300);
     h.push(vec![(existence(acme), Value::Bool(true))]).await?;
     h.engine.catch_up(BRANCH).await?;
@@ -332,8 +355,11 @@ async fn a_cycling_producer_poisons_itself_and_not_the_branch() -> Result<()> {
     Ok(())
 }
 
+/// Every field has exactly one writer, and the **declaration** says which. Before ownership was
+/// declarable this could only be discovered — whichever producer wrote first won, and which one that
+/// was depended on scheduling order.
 #[tokio::test]
-async fn a_second_writer_to_one_field_is_rejected() -> Result<()> {
+async fn a_producer_that_does_not_own_a_field_is_the_one_poisoned() -> Result<()> {
     const OTHER: ProducerId = ProducerId(2);
 
     fn write_investible(
@@ -350,7 +376,7 @@ async fn a_second_writer_to_one_field_is_rejected() -> Result<()> {
     executor.register(SCORE, Arc::new(write_investible));
     executor.register(OTHER, Arc::new(write_investible));
 
-    let h = Harness::new(executor);
+    let h = Harness::new(executor).await?;
     h.engine.register(ProducerDef {
         id: OTHER,
         kind: ProducerKind::Pipeline,
@@ -363,15 +389,17 @@ async fn a_second_writer_to_one_field_is_rejected() -> Result<()> {
     h.push(vec![(existence(acme), Value::Bool(true))]).await?;
     h.engine.catch_up(BRANCH).await?;
 
-    // Every field has exactly one writer. Whichever producer claimed it first, the other is poisoned
-    // and the field keeps its owner.
-    let broken = [SCORE, OTHER]
-        .into_iter()
-        .filter(|p| h.engine.is_broken(BRANCH, *p).is_some())
-        .count();
-    assert_eq!(
-        broken, 1,
-        "exactly one of two competing writers is poisoned"
+    assert!(
+        h.engine.is_broken(BRANCH, SCORE).is_none(),
+        "the declared owner writes its own field unimpeded"
+    );
+    let rejection = h
+        .engine
+        .is_broken(BRANCH, OTHER)
+        .expect("the producer that does not own the field is poisoned");
+    assert!(
+        rejection.contains("may not write"),
+        "and told why: {rejection}"
     );
     Ok(())
 }

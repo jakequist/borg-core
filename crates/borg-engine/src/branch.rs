@@ -192,6 +192,12 @@ impl BranchManager {
                 // Each event keeps the ClientVersion it was authored at, so the parent's readers
                 // migrate rather than anything being coerced (SPEC.md §13).
                 record.written_at = layer.id();
+                // Replay writes through the log directly rather than through a `WriteSession`.
+                // These were validated once already, on the child, against the def-view they were
+                // authored under; the def layers that made them legal are replayed in this same
+                // merge. Re-checking them against a def-view that is itself mid-replay would reject
+                // a `DefOnly` merge's own data half and turn "the merge is atomic" into "the merge
+                // is atomic if you ordered your layers correctly".
                 layer.put(&cell, record).await?;
             }
             replayed.push(self.layers.commit(layer).await?);

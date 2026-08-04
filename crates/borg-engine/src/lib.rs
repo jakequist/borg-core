@@ -44,6 +44,7 @@ pub mod resolve;
 pub mod seams;
 pub mod touch;
 pub mod values;
+pub mod write;
 
 pub use branch::BranchManager;
 pub use defs::{DefRegistry, DefView, MigrationHop, VersionStep};
@@ -57,3 +58,4 @@ pub use seams::InProcessSequencer;
 pub use seams::{LayerSequencer, LockManager, WorkGap, WorkSource};
 pub use touch::CellTouchIndex;
 pub use values::Values;
+pub use write::WriteSession;

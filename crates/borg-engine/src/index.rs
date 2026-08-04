@@ -46,13 +46,14 @@ pub trait DependencyIndexProvider: Send + Sync {
     /// **Backward** — what this cell was computed from. Drives `explain()` (SPEC.md §11).
     fn dependencies(&self, branch: BranchId, cell: &CellAt) -> Result<Vec<CellAt>>;
 
-    /// Which producer claimed this cell. Every field has exactly one writer (SPEC.md §8), and in v1
-    /// ownership is discovered at runtime rather than declared.
-    fn writer_of(&self, branch: BranchId, cell: &CellAt) -> Result<Option<ProducerId>>;
-
     /// Drop everything a producer recorded. Used when a producer's `ClientVersion` moves, which
     /// invalidates all of its prior output (SPEC.md §9.2).
     fn forget_producer(&self, branch: BranchId, producer: ProducerId) -> Result<()>;
+
+    // There is deliberately no `writer_of`. Field ownership used to be *discovered* here — whoever
+    // wrote a cell first owned it — and is now **declared** on the `FieldDef` (SPEC.md §5.1, §8).
+    // The declaration catches a violation on the first wrong write rather than on the second
+    // producer's collision with the first, and it leaves this index with one job: edges.
 }
 
 // Note the shape of every method above: each takes an explicit key or key-slice and returns a
@@ -85,9 +86,6 @@ struct IndexInner {
     dependents: HashMap<(BranchId, CellAt), HashSet<Invocation>>,
     /// Backward: cell -> what it was computed from. Drives lineage.
     dependencies: HashMap<(BranchId, CellAt), Vec<CellAt>>,
-    /// Discovered field ownership. This lives here rather than in the def because discovery happens
-    /// during derivation, and defs may only be mutated by def-layers (SPEC.md §8).
-    writers: HashMap<(BranchId, CellAt), ProducerId>,
     /// What each invocation read, so a re-run can retract its stale forward edges.
     read_sets: HashMap<(BranchId, Invocation), Vec<CellAt>>,
 }
@@ -133,9 +131,6 @@ impl DependencyIndexProvider for MemoryDependencyIndex {
             inner
                 .dependencies
                 .insert((branch, cell.clone()), read_set.to_vec());
-            inner
-                .writers
-                .insert((branch, cell.clone()), invocation.producer);
         }
         Ok(())
     }
@@ -162,20 +157,12 @@ impl DependencyIndexProvider for MemoryDependencyIndex {
             .unwrap_or_default())
     }
 
-    fn writer_of(&self, branch: BranchId, cell: &CellAt) -> Result<Option<ProducerId>> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.writers.get(&(branch, cell.clone())).copied())
-    }
-
     fn forget_producer(&self, branch: BranchId, producer: ProducerId) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.dependents.retain(|(b, _), v| {
             v.retain(|i| i.producer != producer);
             *b != branch || !v.is_empty()
         });
-        inner
-            .writers
-            .retain(|(b, _), p| *b != branch || *p != producer);
         inner
             .read_sets
             .retain(|(b, i), _| *b != branch || i.producer != producer);

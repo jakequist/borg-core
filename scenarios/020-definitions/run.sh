@@ -16,6 +16,13 @@ assert_contains "$out" "revenue" "the second repo's field lands on the same stru
 assert_fails "two repos declaring the same field is a hard error" \
     -- borg def push "$HERE"/../020-definitions/collision.json
 
+# The *same* repo redeclaring the *same* shape is a repeat, not a conflict. `borg repo push` emits a
+# repo's whole schema every time it runs, so a push that only worked once would be a push nobody
+# trusts. Changing a declared field still needs a MutateField and a migration (§6.1).
+borg def push "$HERE"/../020-definitions/sales.json
+assert_contains "$(borg def show Company)" "name" \
+    "re-declaring an unchanged field is idempotent, not a collision"
+
 assert_contains "$(borg def show Company)" "name" \
     "and the rejected push leaves the def untouched"
 

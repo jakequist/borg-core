@@ -9,9 +9,9 @@
 
 use crate::log::LayerManager;
 use borg_core::{
-    BorgError, BranchId, BufferId, ClientVersion, DefEvent, FieldDef, FieldName, LayerAuthor,
-    LayerId, LayerKind, MigrationDirection, ObjectDef, ObjectTypeName, Origin, ProducerDef,
-    ProducerId, ReadPath, Result,
+    BorgError, BranchId, BufferId, CellRef, ClientVersion, DefEvent, FieldDef, FieldName,
+    LayerAuthor, LayerId, LayerKind, MigrationDirection, ObjectDef, ObjectTypeName, Ownership,
+    ProducerDef, ProducerId, ReadPath, Result, Value, ValueType, WriteRejection, Writer,
 };
 use borg_storage::StorageProvider;
 use std::collections::BTreeMap;
@@ -56,6 +56,137 @@ impl DefView {
         self.producers.values()
     }
 
+    /// The declaration governing a cell, if the cell names a declared field.
+    pub fn field(&self, cell: &CellRef) -> Option<&FieldDef> {
+        let BufferId::ObjectProp(struct_name, field) = &cell.buffer else {
+            return None;
+        };
+        self.objects.get(struct_name)?.fields.get(field)
+    }
+
+    /// Validate one cell write against the definitions in force. SPEC.md §5.1, §8.
+    ///
+    /// This is the whole of what "definitions are load-bearing" means, and it lives on the def-view
+    /// rather than beside the store because it is a pure question about a *branch's* schema: no I/O,
+    /// no layer, nothing to mock. `WriteSession` is what guarantees it is asked.
+    ///
+    /// Four things are checked, in the order a human would ask them: does the struct exist, does the
+    /// field exist, may this writer write it, and will the value fit.
+    ///
+    pub fn check_write(&self, cell: &CellRef, value: &Value, writer: Writer) -> Result<()> {
+        match &cell.buffer {
+            BufferId::ObjectProp(struct_name, field) => {
+                let Some(object) = self.objects.get(struct_name) else {
+                    return Err(WriteRejection::UndeclaredStruct {
+                        cell: cell.clone(),
+                        struct_name: struct_name.clone(),
+                    }
+                    .into());
+                };
+                let Some(declared) = object.fields.get(field) else {
+                    return Err(WriteRejection::UndeclaredField {
+                        cell: cell.clone(),
+                        struct_name: struct_name.clone(),
+                        field: field.to_string(),
+                        known: object
+                            .fields
+                            .keys()
+                            .map(|name| name.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }
+                    .into());
+                };
+                self.check_ownership(cell, struct_name, field, declared, writer)?;
+                if !declared.ty.accepts(value) {
+                    return Err(WriteRejection::TypeMismatch {
+                        cell: cell.clone(),
+                        expected: declared.ty.clone(),
+                        actual: borg_core::parse::render(value),
+                    }
+                    .into());
+                }
+                Ok(())
+            }
+            // An existence cell has no `FieldDef` of its own — a struct exists because someone
+            // declared a field *on* it (§5.2), so "is this struct declared" is the whole check. It
+            // holds `true` or a tombstone and nothing else, and either writer may set it: a client
+            // creating an object, or a producer whose output is a new object (§9.5).
+            BufferId::Object(struct_name) => {
+                if !self.objects.contains_key(struct_name) {
+                    return Err(WriteRejection::UndeclaredStruct {
+                        cell: cell.clone(),
+                        struct_name: struct_name.clone(),
+                    }
+                    .into());
+                }
+                if ValueType::Bool.accepts(value) {
+                    Ok(())
+                } else {
+                    Err(WriteRejection::TypeMismatch {
+                        cell: cell.clone(),
+                        expected: ValueType::Bool,
+                        actual: borg_core::parse::render(value),
+                    }
+                    .into())
+                }
+            }
+            // Lists and the untyped containers are **deliberately unchecked**. There is no
+            // `ListDef` event in §6.1 and no way to declare one, so requiring a declaration would
+            // make them unwritable rather than validated. They become checkable in the same change
+            // that gives them a declaration to check against.
+            BufferId::List(_)
+            | BufferId::ListElem(_)
+            | BufferId::AnyObject
+            | BufferId::AnyArray => Ok(()),
+        }
+    }
+
+    /// Whether this writer is the one the declaration names. SPEC.md §8.
+    fn check_ownership(
+        &self,
+        cell: &CellRef,
+        struct_name: &ObjectTypeName,
+        field: &FieldName,
+        declared: &FieldDef,
+        writer: Writer,
+    ) -> Result<()> {
+        let permitted = match (declared.ownership, writer) {
+            (Ownership::Source, Writer::Client) => true,
+            (Ownership::Derived(owner), Writer::Producer(attempted)) => owner == attempted,
+            // A migration writes *someone else's* field — the same cell at a newer def-version is
+            // its entire job (§9.3) — so the declaration it is checked against is the one naming it
+            // as `up` or `down`, not the one naming the field's ordinary writer.
+            (_, Writer::Producer(attempted)) => self.migrates(struct_name, field, attempted),
+            (Ownership::Derived(_), Writer::Client) => false,
+        };
+        if permitted {
+            return Ok(());
+        }
+        Err(WriteRejection::OwnershipViolation {
+            cell: cell.clone(),
+            ownership: declared.ownership,
+            attempted: writer,
+        }
+        .into())
+    }
+
+    /// Whether this producer is a declared migration for this field.
+    fn migrates(
+        &self,
+        struct_name: &ObjectTypeName,
+        field: &FieldName,
+        producer: ProducerId,
+    ) -> bool {
+        self.chains
+            .get(&(struct_name.clone(), field.clone()))
+            .is_some_and(|chain| {
+                chain
+                    .iter()
+                    .any(|step| step.up == producer || step.down == Some(producer))
+            })
+    }
+
     /// Fold one event in. Returns an error when the event is not permitted, which is how collisions
     /// and cross-repo mutations are caught at push time.
     fn apply(&mut self, event: &DefEvent, at: LayerId) -> Result<()> {
@@ -65,6 +196,7 @@ impl DefView {
                 field,
                 ty,
                 repo,
+                ownership,
             } => {
                 let object = self
                     .objects
@@ -75,7 +207,19 @@ impl DefView {
                     });
                 // Two repos declaring the same field is a hard error — the "repos never conflict"
                 // guarantee, checked at the point of intent (SPEC.md §5.2).
+                //
+                // The *same* repo redeclaring the *same* shape is not a conflict but a repeat, and
+                // is a no-op. `borg repo push` emits a repo's whole schema every time it runs, so
+                // without this the second push of an unchanged repo would fail — and a push that
+                // only works once is a push nobody trusts. Changing a declared field's shape still
+                // requires `MutateField` and a migration (§6.1).
                 if let Some(existing) = object.fields.get(field) {
+                    let unchanged = existing.declaring_repo == *repo
+                        && existing.ty == *ty
+                        && existing.ownership == *ownership;
+                    if unchanged {
+                        return Ok(());
+                    }
                     return Err(BorgError::FieldCollision {
                         struct_name: struct_name.clone(),
                         field: field.to_string(),
@@ -88,7 +232,7 @@ impl DefView {
                         name: field.clone(),
                         ty: ty.clone(),
                         declaring_repo: *repo,
-                        origin: Origin::Source,
+                        ownership: *ownership,
                         version: at,
                     },
                 );

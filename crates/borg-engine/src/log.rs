@@ -38,7 +38,13 @@ impl LayerHandle {
 
     /// Append one cell write. Called an unbounded number of times — a producer run writes *all* of
     /// its output into this one layer.
-    pub async fn put(&mut self, cell: &CellRef, record: CellRecord) -> Result<()> {
+    ///
+    /// **Crate-private on purpose.** This is the log's raw append, and it knows nothing about
+    /// definitions; every write from outside the engine goes through `WriteSession`, which validates
+    /// against the branch's def-view first (§5.1, §8). Making it public again would make that check
+    /// a convention rather than a property. The one caller here that legitimately skips validation
+    /// is merge replay — see `BranchManager::merge`.
+    pub(crate) async fn put(&mut self, cell: &CellRef, record: CellRecord) -> Result<()> {
         self.open.put_cell(cell, record).await
     }
 

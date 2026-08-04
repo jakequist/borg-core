@@ -15,12 +15,13 @@ as subprocesses over a wire protocol — demonstrated by a pipeline written in b
 Values are real: `String`, `Binary` and `BigInt` are interned on the way in and resolved on the way
 out, invisibly, so a pipeline can finally read `company.website.ends_with('.ai')`.
 
-The **definition half is decorative.** Definitions can be pushed, folded and read, but the write path
-never consults them. `ValueType` has never rejected a write — which is also why value parsing has to
-guess at a type from the text alone, and why the text `true` cannot yet be a string.
+The **definition half is now load-bearing.** Every cell write — from the CLI, from a producer, from
+anywhere — is validated against the def-view of its branch, ownership is declared rather than
+discovered, value parsing is directed by the declared type, and a repo emits its own struct
+definitions alongside its producers.
 
-That gap is what the next three milestones close, and it is why "Act 1 is the modern ORM" is not yet
-true.
+What remains before "Act 1 is the modern ORM" is true: migrations reachable end to end through the
+CLI (C), and derivation that runs without being asked (D).
 
 ---
 
@@ -64,14 +65,20 @@ the kind letters `o l a j y m s b n`. `Company#100` survives as input-only short
 ### B — definitions become load-bearing
 
 Writes validate against the def view: unknown struct or field rejected, type mismatch rejected, and
-`origin` enforced so a client cannot write a derived field.
+ownership enforced so a client cannot write a derived field.
 
-This connects the two halves. It will break every existing scenario, because none of them declare
-anything — that is the right kind of breakage, and the scenarios should end up looking like real
-usage.
+This connects the two halves. It broke every existing scenario, because none of them declared
+anything — the right kind of breakage, and the scenarios now look like real usage.
 
-Includes **repos emitting their own definitions** (see decisions below) and two branch-visibility
-tests that nothing currently covers.
+**Done.** `FieldDef.origin` became `Ownership::{Source, Derived(ProducerId)}` and `DeclareField`
+carries it, so a derived field is declarable at all for the first time;
+`DependencyIndexProvider::writer_of` and the state behind it are gone. Enforcement lives in
+`borg_engine::write::WriteSession` — one open layer plus the branch's def-view, with
+`LayerHandle::put` made crate-private so there is no second door. Parsing is type-directed
+(`parse::value_as`), which lifts both reservations §3.4 recorded as temporary. `describe` returns
+structs as well as producers, and `borg repo push` folds them into one def layer. §5.1, §5.2, §6.1,
+§8, §9.2, §16.1 and §17.4 are updated; §8 is rewritten. `scenarios/060-definitions-enforced` and
+`070-branch-visibility` are the proof, and every other scenario now declares a schema first.
 
 ### C — migrations end to end, through the CLI
 
@@ -138,12 +145,15 @@ and a form that needs quoting is one that will eventually be typed unquoted. `0x
 trailing `n` on digits is `BigInt`, and everything unmatched is a `String` — which makes value
 parsing infallible, since every input names some value.
 
-The cost is real and is documented rather than hidden (§3.4): `true` is a `Bool`, so a string field
-cannot yet hold the text "true"; likewise `42`, `0xff`, `7n`, and a malformed `@…` that quietly
-becomes data instead of an error. **Milestone B resolves this properly** by making parsing
-type-directed against the declared `FieldDef` — a field declared `String` reads `true` as four
-characters. Quoting was the alternative and it buys the same thing at the cost of the shell-first
-stance.
+The cost was real and was documented rather than hidden (§3.4): `true` is a `Bool`, so a string field
+could not hold the text "true"; likewise `42`, `0xff`, `7n`. Quoting was the alternative and it buys
+the same thing at the cost of the shell-first stance.
+
+**B resolved it**, as predicted, by making parsing type-directed against the declared `FieldDef`: the
+write path calls `parse::value_as`, so a field declared `String` reads `true` as four characters and
+a field declared `Int` refuses `acme`. The guessing parse survives only where there is genuinely no
+declared type to consult — an `Any` field, an error message, a `describe` payload — so its
+reservations no longer reach stored data.
 
 ### Interning is invisible to workers
 
@@ -222,13 +232,10 @@ to, so rewriting it would make any property write look like a new entity.
 
 ## Tests we owe
 
-- **Branch visibility of definitions.** Fork, define `Company` on the fork, assert main can neither
-  see it nor write to it until merged. The read side is covered today; the *write rejection* side
-  becomes possible only after B.
-- **Second-order forks.** A fork of a fork sees `Company`, adds `Company.founded`, and that field is
-  invisible to both main and the first fork. **Nothing in the codebase exercises a branch chain
-  deeper than one fork** — `read_path` walks arbitrary depth and should handle it, which is exactly
-  the kind of "should" that deserves a test.
 - **Unit coverage generally.** Tests are almost entirely integration-level. `borg-storage`,
   `borg-engine`'s internals and the CLI have essentially none of their own. Landing alongside each
   milestone rather than as a separate push.
+
+Paid off in B: branch visibility of definitions, including the write-rejection half
+(`scenarios/070-branch-visibility`), and second-order forks — a fork of a fork, in that scenario and
+in `def_events.rs`. Nothing had exercised a branch chain deeper than one fork before.

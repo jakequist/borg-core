@@ -90,6 +90,11 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - `settle()` is sequential; parallel workers need its round-ceiling reworked.
 - `scan_buffer` and `read_layer` materialise results before streaming them.
 - SQLite `Registry::open` rebuilds indexes by replaying the log — `O(log)` per CLI invocation.
+- Writes to list and untyped-container cells are **not** validated: there is no `ListDef` event to
+  validate against, so requiring a declaration would make them unwritable (§8).
+- `WriteSession` validates against the def-view of the *branch*, not of the writer's ClientVersion.
+  §5.4 argues for the latter; v1 has no actor carrying a real ClientVersion, so it would reject
+  everything. Milestone C is where that changes.
 - `Set`, `Map`, aggregation pipelines, mid-list insertion, container isolation and generated SDKs
   are all deferred (§18).
 

@@ -24,7 +24,10 @@ use crate::resolve::{FrontierTracker, Resolver};
 use crate::seams::InProcessSequencer;
 use crate::touch::CellTouchIndex;
 use crate::values::Values;
-use borg_core::{BranchId, CellAt, LayerAuthor, LayerId, LayerState, Result};
+use crate::write::WriteSession;
+use borg_core::{
+    BranchId, CellAt, ClientVersion, LayerAuthor, LayerId, LayerState, Result, Writer,
+};
 use borg_exec::ExecutionProvider;
 use borg_storage::StorageProvider;
 use futures_util::StreamExt;
@@ -159,6 +162,26 @@ impl Registry {
     /// The branch a bare command operates on: the first root, by convention named `main`.
     pub fn default_branch(&self) -> Option<BranchId> {
         self.branches.roots().into_iter().min_by_key(|id| id.0)
+    }
+
+    /// Open the sanctioned write path: a layer plus the definitions it will be checked against
+    /// (SPEC.md §5.1, §8). This is the only way to write a cell from outside the engine.
+    pub async fn begin_write(
+        &self,
+        branch: BranchId,
+        version: ClientVersion,
+        writer: Writer,
+    ) -> Result<WriteSession> {
+        WriteSession::open(
+            &self.layers,
+            &self.defs,
+            branch,
+            None,
+            version,
+            writer,
+            LayerAuthor::Source,
+        )
+        .await
     }
 }
 

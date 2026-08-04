@@ -7,9 +7,9 @@
 //! indexes are rebuilt from the log on open (see `Registry`).
 
 use borg_core::{
-    BorgError, BranchId, CellRecord, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
-    LayerAuthor, LayerId, LayerKind, MergeMode, ObjectTypeName, Origin, ProducerId, RepoId, Result,
-    ValueType, parse,
+    BorgError, BranchId, ClientVersion, DefEvent, Freshness, FreshnessRequirement, LayerAuthor,
+    LayerId, LayerKind, MergeMode, ObjectTypeName, Origin, Ownership, ProducerId, RepoId, Result,
+    ValueType, Writer, parse,
 };
 use borg_engine::Registry;
 use borg_exec_native::NativeExecutor;
@@ -59,10 +59,14 @@ Cells are written Struct:pid.field, Struct:pid, Element[]:pid or Element[]:pid[n
 looks like o-1234abcd and names the whole identity. Struct#100 is accepted on input as a
 shorthand for counter 100 on the root branch; what borg prints is always the canonical form.
 
-Values are 42, 1.5, true, false, ~ (tombstone), @o-1234abcd (a reference), 0xdeadbeef (binary),
--129n (a bigint), and anything else is a string. Strings, binary and bigints are interned by
-content, which borg does for you — you write the text and read the text back. Note the corollary:
-the forms above win, so a string field cannot yet hold the text `true` or `42`.
+A value is parsed against the type its field is declared to hold, so a String field takes `true`,
+`42` and `@jake` as those characters and an Int field refuses `acme`. Strings, binary and bigints
+are interned by content, which borg does for you — you write the text and read the text back.
+`~` is a tombstone on every field, whatever its type.
+
+Every write is checked against the definitions on the branch: the struct must be declared, the
+field must be declared, the value must fit, and a field declared derived may be written only by
+the producer that owns it. Declare a schema with `borg def push` or `borg repo push` first.
 
 Options:
   --store <path>   store file (default ./borg.db)
@@ -178,83 +182,26 @@ async fn init(args: &Args) -> Result<()> {
 }
 
 /// Write one source cell as its own layer.
+///
+/// Everything interesting happens inside the session: it folds the branch's definitions, parses the
+/// text against the field's *declared* type, rejects an undeclared struct or field or a value that
+/// does not fit, and interns content on the way in (§3.4, §5.1, §8). The CLI's job is to name the
+/// cell and hand over the text.
 async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
-    // A string, blob or bigint is content-addressed and has no identity until the store has seen it
-    // (§3.1). Interning here, rather than asking the caller to do it, is what makes `borg set
-    // Company#1.website acme.ai` the whole story — there is no PID to create first and none to
-    // quote back (§3.4).
-    let value = parse::value(value, allocation_branch(&registry)?, ALLOCATOR)?;
-    let value = registry.values.intern(value).await?;
 
-    let mut layer = registry
-        .layers
-        .open(branch, LayerKind::Value, LayerAuthor::Source)
+    let mut session = registry
+        .begin_write(branch, CLIENT_VERSION, Writer::Client)
         .await?;
-
-    // Writing a property implies the object exists. Producers map over a struct's `ObjectBuffer`,
-    // which holds existence cells (§4.2), so without this a `Company` whose fields were set but
-    // which was never explicitly created would be invisible to every pipeline.
-    //
-    // Only when absent, never on every write: the existence cell lives in the buffer producers
-    // subscribe to, so rewriting it would make *any* property write look like a new entity and
-    // re-run pipelines that read nothing of the sort.
-    if let Some(existence) = implied_existence(&cell)
-        && registry
-            .resolver
-            .resolve(
-                branch,
-                &existence,
-                None,
-                CLIENT_VERSION,
-                FreshnessRequirement::Any,
-            )
-            .await?
-            .value
-            .is_none()
-    {
-        layer
-            .put(
-                &existence,
-                CellRecord {
-                    value: borg_core::Value::Bool(true),
-                    version: CLIENT_VERSION,
-                    written_at: layer.id(),
-                    origin: Origin::Source,
-                    derivation: None,
-                },
-            )
-            .await?;
+    if let Err(rejection) = session.set_text(&cell, value).await {
+        // A rejected write leaves no trace, so the layer it would have landed in never commits.
+        session.abort().await?;
+        return Err(rejection);
     }
-
-    layer
-        .put(
-            &cell,
-            CellRecord {
-                value,
-                version: CLIENT_VERSION,
-                written_at: layer.id(),
-                origin: Origin::Source,
-                derivation: None,
-            },
-        )
-        .await?;
-    let id = registry.layers.commit(layer).await?;
-    println!("{id}");
+    println!("{}", session.commit().await?);
     Ok(())
-}
-
-/// The existence cell a property write implies, if this is a property write.
-fn implied_existence(cell: &borg_core::CellRef) -> Option<borg_core::CellRef> {
-    match &cell.buffer {
-        borg_core::BufferId::ObjectProp(struct_name, _) => Some(borg_core::CellRef::existence(
-            struct_name.clone(),
-            *cell.pid(),
-        )),
-        _ => None,
-    }
 }
 
 async fn get(args: &Args, cell: &str) -> Result<()> {
@@ -424,6 +371,11 @@ enum DefEventSpec {
         struct_name: String,
         field: String,
         ty: String,
+        /// The producer that owns this field, if it is derived. Absent means source data, written
+        /// by clients (SPEC.md §8). A numeric id here because this file *is* the log's own form; a
+        /// repo names its producers by name and `borg repo push` resolves them (§9.2).
+        #[serde(default)]
+        derived_by: Option<u64>,
     },
     MutateField {
         struct_name: String,
@@ -437,6 +389,14 @@ enum DefEventSpec {
         struct_name: String,
         field: String,
     },
+}
+
+/// A field is source data unless a producer is named as its writer (SPEC.md §8).
+const fn ownership(producer: Option<ProducerId>) -> Ownership {
+    match producer {
+        Some(producer) => Ownership::Derived(producer),
+        None => Ownership::Source,
+    }
 }
 
 fn value_type(name: &str) -> ValueType {
@@ -470,11 +430,13 @@ async fn def_push(args: &Args, file: &str) -> Result<()> {
                 struct_name,
                 field,
                 ty,
+                derived_by,
             } => DefEvent::DeclareField {
                 struct_name: struct_name.into(),
                 field: field.into(),
                 ty: value_type(&ty),
                 repo,
+                ownership: ownership(derived_by.map(ProducerId)),
             },
             DefEventSpec::MutateField {
                 struct_name,
@@ -515,9 +477,14 @@ async fn def_show(args: &Args, name: &str) -> Result<()> {
     };
     println!("{name}");
     for (field, def) in &def.fields {
+        // Ownership is shown because it is now enforced: this line is the answer to "why was my
+        // write rejected" (§8).
         println!(
-            "  {field:<16} {:<10} repo {:<4} v{}",
-            format!("{:?}", def.ty),
+            "  {field:<16} {:<10} {:<24} repo {:<4} v{}",
+            def.ty.to_string(),
+            def.ownership
+                .producer()
+                .map_or_else(|| "source".to_string(), |p| format!("derived by {p}")),
             def.declaring_repo.0,
             def.version
         );
@@ -631,28 +598,39 @@ fn save_impls(args: &Args, impls: &Implementations) -> Result<()> {
     std::fs::write(impls_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
 }
 
-/// Push a repo: ask each pipeline to describe itself, record the definitions in the log, and
-/// remember where the code lives.
+/// Push a repo: ask each script to describe itself, record its definitions in the log, and remember
+/// where the code lives.
+///
+/// **Definitions and producers land in one def layer.** A producer and the field it writes must
+/// arrive together or not at all: after §8, a producer cannot write anything unless its output field
+/// is declared, and half a push would leave a pipeline that is registered and legally mute.
 async fn repo_push(args: &Args, dir: &str) -> Result<()> {
     let dir = PathBuf::from(dir);
     let repo = read_repo_id(&dir)?;
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
 
-    let mut pipelines: Vec<PathBuf> = std::fs::read_dir(dir.join("pipelines"))
+    let mut scripts: Vec<PathBuf> = std::fs::read_dir(dir.join("pipelines"))
         .map_err(|err| BorgError::Storage(format!("{}/pipelines: {err}", dir.display())))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.is_file())
         .collect();
-    pipelines.sort();
+    scripts.sort();
+
+    // Everything the repo describes, gathered before anything is emitted: a `derived_by` may name a
+    // producer implemented by a different script in the same repo, so ownership can only be resolved
+    // once the whole repo has spoken.
+    let mut described = Vec::new();
+    for command in scripts {
+        // The script is the source of truth for what it implements, so a producer definition cannot
+        // exist without the code that satisfies it.
+        described.push((command.clone(), borg_exec_process::describe(&command)?));
+    }
 
     let mut impls = load_impls(args);
     let mut events = Vec::new();
-    for command in pipelines {
-        // The script is the source of truth for what it implements, so a producer definition cannot
-        // exist without the code that satisfies it.
-        let described = borg_exec_process::describe(&command)?;
-        for spec in described.producers {
+    for (command, description) in &described {
+        for spec in &description.producers {
             let id = ProducerId(spec.id());
             events.push(DefEvent::PushProducer(borg_core::ProducerDef {
                 id,
@@ -669,6 +647,40 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                 command: command.canonicalize().unwrap_or_else(|_| command.clone()),
             });
             println!("{} -> {id}", spec.name);
+        }
+    }
+
+    let known: Vec<&str> = described
+        .iter()
+        .flat_map(|(_, d)| d.producers.iter().map(|p| p.name.as_str()))
+        .collect();
+    for (_, description) in &described {
+        for spec in &description.structs {
+            for field in &spec.fields {
+                let owner = match &field.derived_by {
+                    // A field owned by a producer this repo does not implement would be a field
+                    // nothing can ever write. Caught here rather than at the first write attempt.
+                    Some(name) if !known.contains(&name.as_str()) => {
+                        return Err(BorgError::Storage(format!(
+                            "{}.{} is declared derived by `{name}`, which this repo does not \
+                             implement (it implements: {})",
+                            spec.name,
+                            field.name,
+                            known.join(", ")
+                        )));
+                    }
+                    Some(name) => Some(ProducerId(borg_protocol::producer_id(name))),
+                    None => None,
+                };
+                events.push(DefEvent::DeclareField {
+                    struct_name: spec.name.as_str().into(),
+                    field: field.name.as_str().into(),
+                    ty: value_type(&field.ty),
+                    repo,
+                    ownership: ownership(owner),
+                });
+                println!("{}.{} {}", spec.name, field.name, field.ty);
+            }
         }
     }
 

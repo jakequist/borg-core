@@ -8,7 +8,7 @@ use crate::bigint;
 use crate::cell::{BufferId, CellKey, CellRef};
 use crate::ids::{AllocatorId, BranchId};
 use crate::pid::{Pid, PidKind};
-use crate::value::{Value, ValueInput};
+use crate::value::{Value, ValueInput, ValueType};
 use std::fmt::{self, Write as _};
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +150,92 @@ fn pid(
     })
 }
 
+/// Parse a value **against the type its field is declared to hold**. SPEC.md §3.4, §5.1.
+///
+/// This is what a write site uses, because a write site knows the declared type — and knowing it
+/// removes every ambiguity [`value`] has to guess at. A field declared `String` takes `true`, `42`,
+/// `0x` and `@jake` as those literal characters; a field declared `Int` refuses `acme` instead of
+/// quietly storing it as a string that looks almost right.
+///
+/// Two forms stay reserved for every type:
+///
+/// * `~` is a tombstone, because deletion must be expressible on every field (§8.1).
+/// * `@…` on a reference-typed field is a reference, and a malformed one is an error.
+///
+/// The untyped types (`Any`, `AnyNumber`, `AnyObject`, `AnyArray`) have nothing to direct parsing
+/// with, so they fall back to [`value`]'s syntax guess — which is also what a `describe` payload and
+/// an error message use, since neither has a declared type in hand.
+pub fn value_as(
+    ty: &ValueType,
+    input: &str,
+    branch: BranchId,
+    allocator: AllocatorId,
+) -> Result<ValueInput, ParseError> {
+    if input == "~" {
+        return Ok(Value::Tombstone.into());
+    }
+    let wrong = |expected: &str| {
+        err(
+            "value",
+            input,
+            format!("a field declared {ty} takes {expected}"),
+        )
+    };
+
+    match ty {
+        // No sigils, no keywords, no numeric forms: the whole input is the string. This is the
+        // reservation §3.4 documented as temporary, lifted.
+        ValueType::String => Ok(ValueInput::string(input)),
+        ValueType::Int => input
+            .parse::<i64>()
+            .map(|n| Value::Int(n).into())
+            .map_err(|_| {
+                if is_integer_literal(input) {
+                    err(
+                        "value",
+                        input,
+                        "too large for Int — declare the field BigInt to store it",
+                    )
+                } else {
+                    wrong("a whole number, like `42`")
+                }
+            }),
+        ValueType::Double => input
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| Value::Double(n).into())
+            .ok_or_else(|| wrong("a decimal number, like `1.5`")),
+        ValueType::Bool => match input {
+            "true" => Ok(Value::Bool(true).into()),
+            "false" => Ok(Value::Bool(false).into()),
+            _ => Err(wrong("`true` or `false`")),
+        },
+        ValueType::Binary => input
+            .strip_prefix("0x")
+            .and_then(unhex)
+            .map(ValueInput::binary)
+            .ok_or_else(|| wrong("`0x` and an even-length run of hex digits")),
+        // The trailing `n` is what tells an untyped parse a BigInt from an Int; against a declared
+        // BigInt it carries no information, so it is optional and both spellings mean the same.
+        ValueType::BigInt => bigint::encode(input.strip_suffix('n').unwrap_or(input))
+            .map(|bytes| ValueInput::Content {
+                kind: PidKind::BigInt,
+                bytes,
+            })
+            .ok_or_else(|| wrong("decimal digits, like `-129` or `-129n`")),
+        ValueType::Object(_) | ValueType::List(_) => {
+            let Some(target) = input.strip_prefix('@') else {
+                return Err(wrong("a reference, like `@o-1234abcd`"));
+            };
+            reference(target, input, branch, allocator)
+        }
+        ValueType::Any | ValueType::AnyNumber | ValueType::AnyObject | ValueType::AnyArray => {
+            value(input, branch, allocator)
+        }
+    }
+}
+
 /// Parse a value in the CLI's shorthand. SPEC.md §3.4.
 ///
 /// ```text
@@ -169,17 +255,15 @@ fn pid(
 /// Quoting was the alternative and it is worse — a shell worker is the target audience (§17.4), and
 /// a form needing quotes is one that will eventually be typed unquoted.
 ///
-/// ## The ambiguity, stated plainly
+/// ## This is the *untyped* parse, and it guesses
 ///
-/// The forms above win, so the *strings* spelling them are unwritable today: `true` is a `Bool`, so
-/// no string field can hold the text "true"; `42` is an `Int`; `0xff` is `Binary`; `@nonsense` is a
-/// String only because it failed to parse as a PID, which turns a typo'd reference into data.
+/// The forms above win, so the strings spelling them are not strings here: `true` is a `Bool`, `42`
+/// an `Int`, `0xff` `Binary`, and `@nonsense` an error rather than data that looks almost right.
 ///
-/// This is not a hole to paper over — it is what untyped parsing costs. Milestone B makes parsing
-/// **type-directed** against the field's declared type, at which point `Company.name` being declared
-/// `String` means `true` is the four-character string and nothing else, and a malformed `@…` against
-/// a reference field is an error rather than a silent string. Until then the shorthand guesses, and
-/// this doc is the record of what it guesses.
+/// That is what parsing without a declared type costs, and it is why the **write path does not use
+/// this function**. A write knows the field's declared type and calls [`value_as`], where a `String`
+/// field reads `true` as four characters. What remains here is every surface with no declared type
+/// to consult: a `describe` payload, an error message, an `Any`-typed field.
 ///
 /// The result is a [`ValueInput`] rather than a [`Value`] because content-addressed kinds have no
 /// identity until they are interned (§3.1) — see that type.
@@ -203,19 +287,7 @@ pub fn value(
     // parsing relaxes this: once the field's declared type says `String`, `@jake` is simply that
     // string (ROADMAP, milestone B).
     if let Some(target) = input.strip_prefix('@') {
-        // A reference *is* a PID — the struct name adds nothing the PID does not already carry, so
-        // a bare one is accepted and is what comes back out.
-        if let Ok(pid) = target.parse::<Pid>() {
-            return Ok(Value::Ref(pid).into());
-        }
-        if let Ok(cell) = cell_ref(target, branch, allocator) {
-            return Ok(Value::Ref(*cell.pid()).into());
-        }
-        return Err(err(
-            "value",
-            input,
-            "`@` introduces a reference, and this is neither a PID nor a cell address",
-        ));
+        return reference(target, input, branch, allocator);
     }
     if let Some(rest) = input.strip_prefix("0x") {
         return unhex(rest).map(ValueInput::binary).ok_or_else(|| {
@@ -251,6 +323,29 @@ pub fn value(
         return Ok(Value::Double(n).into());
     }
     Ok(ValueInput::string(input))
+}
+
+/// The body of an `@…`: a bare PID, or a cell address named through one.
+///
+/// A reference *is* a PID — the struct name adds nothing the PID does not already carry, so a bare
+/// one is accepted and is what comes back out.
+fn reference(
+    target: &str,
+    input: &str,
+    branch: BranchId,
+    allocator: AllocatorId,
+) -> Result<ValueInput, ParseError> {
+    if let Ok(pid) = target.parse::<Pid>() {
+        return Ok(Value::Ref(pid).into());
+    }
+    if let Ok(cell) = cell_ref(target, branch, allocator) {
+        return Ok(Value::Ref(*cell.pid()).into());
+    }
+    Err(err(
+        "value",
+        input,
+        "`@` introduces a reference, and this is neither a PID nor a cell address",
+    ))
 }
 
 /// Digits with an optional sign, and nothing else — no point, no exponent.
@@ -523,8 +618,84 @@ mod tests {
         }
     }
 
-    /// The documented ambiguity, asserted rather than described: the older forms win, so their
-    /// spellings are not strings. Milestone B's type-directed parsing is what resolves this.
+    /// The reservation §3.4 documented as temporary, lifted: against a declared `String` there are
+    /// no reserved spellings left, because there is nothing left to disambiguate.
+    #[test]
+    fn a_declared_string_field_takes_every_form_literally() {
+        for input in [
+            "true",
+            "42",
+            "1.5",
+            "0x",
+            "0xdeadbeef",
+            "7n",
+            "@jake",
+            "@o-04068",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(
+                value_as(&ValueType::String, input, B, A).unwrap(),
+                ValueInput::string(input),
+                "a String field should read {input} as itself"
+            );
+        }
+    }
+
+    /// The other half of the same claim: a declared type refuses what it cannot hold, instead of
+    /// silently storing a string that looks almost right.
+    #[test]
+    fn a_declared_type_rejects_a_value_it_cannot_hold() {
+        for (ty, input) in [
+            (ValueType::Int, "acme"),
+            (ValueType::Int, "1.5"),
+            (ValueType::Int, "99999999999999999999999"),
+            (ValueType::Double, "acme"),
+            (ValueType::Double, "nan"),
+            (ValueType::Bool, "yes"),
+            (ValueType::Binary, "deadbeef"),
+            (ValueType::BigInt, "acme"),
+            (ValueType::Object("Company".into()), "acme"),
+        ] {
+            let error = value_as(&ty, input, B, A).unwrap_err();
+            assert!(
+                error.to_string().contains(input) && error.to_string().contains(&ty.to_string()),
+                "rejecting {input} as {ty} should name both: {error}"
+            );
+        }
+    }
+
+    /// A tombstone is *explicitly removed*, not a value of some shape — so it satisfies every
+    /// declared type, or `borg delete` would only work on `Any` fields (§8.1).
+    #[test]
+    fn a_tombstone_is_accepted_by_every_declared_type() {
+        for ty in [
+            ValueType::Int,
+            ValueType::String,
+            ValueType::Bool,
+            ValueType::Object("Company".into()),
+        ] {
+            assert_eq!(
+                value_as(&ty, "~", B, A).unwrap().immediate(),
+                Some(Value::Tombstone),
+                "{ty} should accept a tombstone"
+            );
+            assert!(ty.accepts(&Value::Tombstone));
+        }
+    }
+
+    /// Against a declared BigInt the trailing `n` carries no information — it exists to tell an
+    /// *untyped* parse a BigInt from an Int — so both spellings mean the same value.
+    #[test]
+    fn a_declared_bigint_takes_its_digits_with_or_without_the_suffix() {
+        assert_eq!(
+            value_as(&ValueType::BigInt, "-129", B, A).unwrap(),
+            value_as(&ValueType::BigInt, "-129n", B, A).unwrap()
+        );
+    }
+
+    /// The documented ambiguity, asserted rather than described: in the *untyped* parse the older
+    /// forms win, so their spellings are not strings. This is the function the write path no longer
+    /// uses.
     #[test]
     fn a_form_that_already_means_something_is_not_a_string() {
         for input in ["42", "1.5", "true", "false", "~", "0xff", "7n"] {

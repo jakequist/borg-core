@@ -1,0 +1,9 @@
+{
+  "repo": 1,
+  "events": [
+    { "DeclareField": { "struct_name": "Company", "field": "name",      "ty": "String" } },
+    { "DeclareField": { "struct_name": "Company", "field": "headcount", "ty": "Int"    } },
+    { "DeclareField": { "struct_name": "Company", "field": "is_investible",
+                        "ty": "Bool", "derived_by": 7 } }
+  ]
+}

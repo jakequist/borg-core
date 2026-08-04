@@ -246,6 +246,39 @@ pub enum Origin {
     Derived,
 }
 
+/// Who is attempting a write. SPEC.md §8.
+///
+/// Every cell write names one of these, and it is checked against the field's declared
+/// [`Ownership`](crate::def::Ownership): a client may not write a derived field, and a producer may
+/// write only the fields it owns. `Origin` is what the resulting record *records* — the two are
+/// deliberately different types, because a producer running an `up` migration writes a field whose
+/// declared ownership is `Source` (§9.3), and the record it leaves is still derived.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Writer {
+    /// An external client: the CLI today, an SDK later.
+    Client,
+    Producer(ProducerId),
+}
+
+impl Writer {
+    /// What a record written by this writer says about where its value came from.
+    pub const fn origin(&self) -> Origin {
+        match self {
+            Self::Client => Origin::Source,
+            Self::Producer(_) => Origin::Derived,
+        }
+    }
+}
+
+impl fmt::Display for Writer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Client => f.write_str("a client"),
+            Self::Producer(id) => write!(f, "producer {id}"),
+        }
+    }
+}
+
 /// What is physically stored for a cell. SPEC.md §4.3.
 ///
 /// Source cells carry only the first three fields. The heavy metadata — watermark, read-set,

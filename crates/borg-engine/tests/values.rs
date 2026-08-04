@@ -6,13 +6,13 @@
 //! business, and these tests are what keep it that way.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId, LayerKind,
-    Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value, ValueInput,
-    parse,
+    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId,
+    Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    ValueInput, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex, Values,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, Values, WriteSession,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -40,6 +40,7 @@ struct Harness {
     storage: Arc<MemoryStorage>,
     branches: Arc<BranchManager>,
     layers: Arc<LayerManager>,
+    defs: Arc<DefRegistry>,
     engine: Arc<DerivationEngine>,
     values: Values,
 }
@@ -53,13 +54,14 @@ impl Harness {
             Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
+        let defs = Arc::new(DefRegistry::new(layers.clone(), storage.clone()));
         let engine = Arc::new(DerivationEngine::new(
             storage.clone(),
             layers.clone(),
             Arc::new(MemoryDependencyIndex::new()),
             Arc::new(executor),
             Arc::new(FrontierTracker::new()),
-            Arc::new(DefRegistry::new(layers.clone(), storage.clone())),
+            defs.clone(),
             branches.clone(),
         ));
         engine.register(ProducerDef {
@@ -74,56 +76,28 @@ impl Harness {
             storage,
             branches,
             layers,
+            defs,
             engine,
         }
     }
 
-    /// Write source cells the way a client does: text in, interning done for it.
+    /// Write source cells the way a client does: text in, parsed against the declared type,
+    /// interned, and the implied existence cell written — all inside the session.
     async fn set(&self, writes: &[(CellRef, &str)]) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(BRANCH, LayerKind::Value, LayerAuthor::Source)
-            .await?;
-        // Writing a property implies the object exists, as `borg set` does: producers map over the
-        // `ObjectBuffer`, so an object that never appears there is invisible to every pipeline.
-        let mut seen = Vec::new();
-        for (cell, _) in writes {
-            let existence = CellRef::existence_of(cell);
-            if existence != *cell && !seen.contains(&existence) {
-                seen.push(existence.clone());
-                layer
-                    .put(
-                        &existence,
-                        CellRecord {
-                            value: Value::Bool(true),
-                            version: V1,
-                            written_at: layer.id(),
-                            origin: Origin::Source,
-                            derivation: None,
-                        },
-                    )
-                    .await?;
-            }
-        }
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            BRANCH,
+            None,
+            V1,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for (cell, text) in writes {
-            let value = self
-                .values
-                .intern(parse::value(text, BRANCH, borg_core::AllocatorId(0))?)
-                .await?;
-            layer
-                .put(
-                    cell,
-                    CellRecord {
-                        value,
-                        version: V1,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set_text(cell, text).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     async fn record(&self, cell: &CellRef) -> Option<CellRecord> {
@@ -163,7 +137,29 @@ fn shouting_producer() -> NativeExecutor {
 
 async fn harness() -> Harness {
     let harness = Harness::new(shouting_producer());
-    harness.branches.create_root(None).await.unwrap();
+    let branch = harness.branches.create_root(None).await.unwrap();
+    let declare = |field: &str, ty: ValueType, ownership: Ownership| DefEvent::DeclareField {
+        struct_name: "Company".into(),
+        field: field.into(),
+        ty,
+        repo: RepoId(1),
+        ownership,
+    };
+    // One field per content-addressed kind, plus the producer's output. Declaring the types is what
+    // lets `set` below parse text against them rather than guessing (SPEC.md §3.4).
+    harness
+        .defs
+        .push(
+            branch,
+            vec![
+                declare("website", ValueType::String, Ownership::Source),
+                declare("logo", ValueType::Binary, Ownership::Source),
+                declare("valuation", ValueType::BigInt, Ownership::Source),
+                declare("slogan", ValueType::String, Ownership::Derived(SHOUT)),
+            ],
+        )
+        .await
+        .unwrap();
     harness
 }
 

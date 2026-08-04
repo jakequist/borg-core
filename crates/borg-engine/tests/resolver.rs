@@ -4,13 +4,13 @@
 //! via `explain` — where it came from.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Freshness,
-    FreshnessRequirement, LayerAuthor, LayerId, LayerKind, Origin, Pid, PidKind, ProducerDef,
-    ProducerId, ProducerKind, RepoId, Result, Value, ValueType,
+    BranchId, BufferId, CellRef, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
+    LayerAuthor, LayerId, Origin, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind,
+    RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, Resolver, WriteSession,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -39,6 +39,16 @@ fn prop(pid: Pid, field: &str) -> CellRef {
     CellRef::prop("Company".into(), field.into(), pid)
 }
 
+fn declare(field: &str, ty: ValueType, ownership: Ownership) -> DefEvent {
+    DefEvent::DeclareField {
+        struct_name: "Company".into(),
+        field: field.into(),
+        ty,
+        repo: RepoId(1),
+        ownership,
+    }
+}
+
 struct Harness {
     layers: Arc<LayerManager>,
     engine: Arc<DerivationEngine>,
@@ -47,7 +57,7 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    async fn new() -> Result<Self> {
         let storage = Arc::new(MemoryStorage::new());
         let index = Arc::new(MemoryDependencyIndex::new());
         let layers = Arc::new(LayerManager::new(
@@ -88,12 +98,24 @@ impl Harness {
             declaring_repo: RepoId(1),
         });
 
-        Self {
+        // Nothing may be written until it is declared (SPEC.md §8), and `is_investible` names the
+        // one producer allowed to write it.
+        defs.push(
+            BRANCH,
+            vec![
+                declare("website", ValueType::Int, Ownership::Source),
+                declare("name", ValueType::Int, Ownership::Source),
+                declare("is_investible", ValueType::Bool, Ownership::Derived(SCORE)),
+            ],
+        )
+        .await?;
+
+        Ok(Self {
             layers,
             engine,
             resolver: Resolver::new(storage, index, defs.clone(), branches.clone()),
             defs,
-        }
+        })
     }
 
     async fn push_at(
@@ -101,25 +123,20 @@ impl Harness {
         version: ClientVersion,
         writes: Vec<(CellRef, Value)>,
     ) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(BRANCH, LayerKind::Value, LayerAuthor::Source)
-            .await?;
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            BRANCH,
+            None,
+            version,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for (cell, value) in writes {
-            layer
-                .put(
-                    &cell,
-                    CellRecord {
-                        value,
-                        version,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     async fn push(&self, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
@@ -133,7 +150,7 @@ impl Harness {
 
 #[tokio::test]
 async fn source_and_derived_cells_report_different_provenance() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await?;
     let acme = company(100);
     h.push(vec![
         (existence(acme), Value::Bool(true)),
@@ -180,7 +197,7 @@ async fn source_and_derived_cells_report_different_provenance() -> Result<()> {
 
 #[tokio::test]
 async fn validation_distinguishes_a_moved_dependency_from_an_unrelated_write() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await?;
     let acme = company(200);
     h.push(vec![
         (existence(acme), Value::Bool(true)),
@@ -245,7 +262,7 @@ async fn validation_distinguishes_a_moved_dependency_from_an_unrelated_write() -
 
 #[tokio::test]
 async fn explain_walks_the_dependency_index_backwards() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await?;
     let acme = company(300);
     h.push(vec![
         (existence(acme), Value::Bool(true)),
@@ -278,7 +295,7 @@ async fn explain_walks_the_dependency_index_backwards() -> Result<()> {
 #[tokio::test]
 async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind() -> Result<()> {
     const UP: ProducerId = ProducerId(50);
-    let h = Harness::new();
+    let h = Harness::new().await?;
 
     // The field exists, and is then mutated with an `up` migration. Both def layers are real, so
     // their ids *are* the two def-versions (SPEC.md §5.3).
@@ -286,18 +303,13 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
         .defs
         .push(
             BRANCH,
-            vec![DefEvent::DeclareField {
-                struct_name: "Company".into(),
-                field: "website".into(),
-                ty: ValueType::Int,
-                repo: RepoId(1),
-            }],
+            vec![declare("score", ValueType::Int, Ownership::Source)],
         )
         .await?;
     let acme = company(400);
     h.push_at(
         ClientVersion(declared),
-        vec![(prop(acme, "website"), Value::Int(9))],
+        vec![(prop(acme, "score"), Value::Int(9))],
     )
     .await?;
     let mutated = h
@@ -306,8 +318,8 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
             BRANCH,
             vec![DefEvent::MutateField {
                 struct_name: "Company".into(),
-                field: "website".into(),
-                ty: ValueType::String,
+                field: "score".into(),
+                ty: ValueType::Double,
                 repo: RepoId(1),
                 up: UP,
                 down: None,
@@ -320,7 +332,7 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
         .resolver
         .resolve(
             BRANCH,
-            &prop(acme, "website"),
+            &prop(acme, "score"),
             Some(h.head()),
             ClientVersion(mutated),
             FreshnessRequirement::Validated,
@@ -339,7 +351,7 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
         .resolver
         .resolve(
             BRANCH,
-            &prop(acme, "website"),
+            &prop(acme, "score"),
             Some(h.head()),
             ClientVersion(declared),
             FreshnessRequirement::Validated,
@@ -352,18 +364,13 @@ async fn a_reader_on_an_unmaterialized_version_is_told_the_migration_is_behind()
 
 #[tokio::test]
 async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await?;
 
     let declared = h
         .defs
         .push(
             BRANCH,
-            vec![DefEvent::DeclareField {
-                struct_name: "Company".into(),
-                field: "website".into(),
-                ty: ValueType::Int,
-                repo: RepoId(1),
-            }],
+            vec![declare("rating", ValueType::Int, Ownership::Source)],
         )
         .await?;
     // Mutated with an `up` but deliberately no `down`.
@@ -373,8 +380,8 @@ async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() 
             BRANCH,
             vec![DefEvent::MutateField {
                 struct_name: "Company".into(),
-                field: "website".into(),
-                ty: ValueType::String,
+                field: "rating".into(),
+                ty: ValueType::Double,
                 repo: RepoId(1),
                 up: ProducerId(50),
                 down: None,
@@ -386,7 +393,7 @@ async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() 
     // Written by a client on the new version.
     h.push_at(
         ClientVersion(mutated),
-        vec![(prop(acme, "website"), Value::Int(9))],
+        vec![(prop(acme, "rating"), Value::Double(9.0))],
     )
     .await?;
 
@@ -394,7 +401,7 @@ async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() 
         .resolver
         .resolve(
             BRANCH,
-            &prop(acme, "website"),
+            &prop(acme, "rating"),
             Some(h.head()),
             ClientVersion(declared),
             FreshnessRequirement::Validated,

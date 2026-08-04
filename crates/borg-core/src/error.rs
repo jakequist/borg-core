@@ -3,7 +3,7 @@
 //! Most interesting failures in Borg are only detectable at runtime — cycles, throwing migrations,
 //! field-ownership violations. They attach to the *producer*, not the branch (SPEC.md §14).
 
-use crate::cell::{CellAt, CellRef};
+use crate::cell::CellRef;
 use crate::ids::{BranchId, LayerId, ProducerId};
 use crate::value::ObjectTypeName;
 
@@ -34,15 +34,14 @@ pub enum BorgError {
         field: String,
     },
 
-    // --- Runtime producer failures. These poison the producer, never the branch. ---
-    /// SPEC.md §8: every field has exactly one writer.
-    #[error("producer {attempted:?} wrote {cell:?}, which is owned by producer {owner:?}")]
-    FieldOwnershipViolation {
-        cell: CellAt,
-        owner: Option<ProducerId>,
-        attempted: ProducerId,
-    },
+    /// A write that the definitions in force do not permit. SPEC.md §5.1, §8.
+    ///
+    /// Boxed because these carry a lot of context on purpose — a rejected write should tell you
+    /// what to do next — and every other variant would otherwise pay for it in size.
+    #[error(transparent)]
+    WriteRejected(#[from] Box<WriteRejection>),
 
+    // --- Runtime producer failures. These poison the producer, never the branch. ---
     /// A producer transitively depends on a field it writes. Under a stateless scheduler this
     /// livelocks rather than re-entering, so it is caught by a re-run counter (SPEC.md §16.5).
     #[error("producer {producer:?} is cycling: invocation re-ran {runs} times at a fixed head")]
@@ -99,6 +98,54 @@ pub enum BorgError {
 
     #[error("execution: {0}")]
     Execution(String),
+}
+
+/// Why a write was refused. SPEC.md §5.1, §8.
+///
+/// Every cell write is checked against the definitions in force on its branch, and these are the
+/// four ways it can fail. They are worded to be read by whoever typed the write: each one names the
+/// cell, what the schema says, and — where there is one — the fix.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteRejection {
+    /// Nothing has declared a field on this struct, so the struct does not exist (SPEC.md §5.2).
+    #[error("`{cell}`: no struct named `{struct_name}` is declared on this branch")]
+    UndeclaredStruct {
+        cell: CellRef,
+        struct_name: ObjectTypeName,
+    },
+
+    #[error(
+        "`{cell}`: `{struct_name}` has no field `{field}` declared on this branch — it has: {known}"
+    )]
+    UndeclaredField {
+        cell: CellRef,
+        struct_name: ObjectTypeName,
+        field: String,
+        /// The fields that *are* declared. A rejection naming the alternatives turns a typo into a
+        /// one-line fix rather than a second command.
+        known: String,
+    },
+
+    #[error("`{cell}` is declared {expected}, and `{actual}` is not a {expected}")]
+    TypeMismatch {
+        cell: CellRef,
+        expected: crate::value::ValueType,
+        actual: String,
+    },
+
+    /// Every field has exactly one writer, and the declaration says which (SPEC.md §8).
+    #[error("{attempted} may not write `{cell}`: it is declared {ownership}")]
+    OwnershipViolation {
+        cell: CellRef,
+        ownership: crate::def::Ownership,
+        attempted: crate::cell::Writer,
+    },
+}
+
+impl From<WriteRejection> for BorgError {
+    fn from(rejection: WriteRejection) -> Self {
+        Self::WriteRejected(Box::new(rejection))
+    }
 }
 
 /// Why a merge was rejected. SPEC.md §13.

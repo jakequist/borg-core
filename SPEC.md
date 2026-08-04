@@ -151,15 +151,23 @@ acme.ai                String — anything that matched none of the above
 **A bare word is a string.** No quoting, because a shell worker is the target audience and a form
 that needs quotes is one that will eventually be typed unquoted.
 
-**But `@` and `0x` are reserved sigils.** Having introduced one, a malformed remainder is an *error*,
-not a string. A mistyped reference quietly becoming data that looks almost right is the worst
-available outcome — nothing complains and the value is wrong. For the same reason an integer literal
-too large for `Int` is an error naming `n`, rather than silently landing in `Double` as a number
-nobody typed.
+**Parsing is type-directed.** The table above is what a value means when nothing knows what it is
+*for*. A write does know: it names a cell, the cell names a field, and the field declares a type
+(§5.1). So the write path parses **against** the declared type, and the table's ambiguities do not
+arise there:
 
-The cost is that a string genuinely beginning with `@` cannot be written yet. That is a symptom of
-parsing without knowing the target type; once parsing is **type-directed** against the declared
-field, a `String` field simply takes `@jake` as those five characters and the reservation lifts.
+- A field declared `String` takes `true`, `42`, `0x`, `7n` and `@jake` as exactly those characters.
+- A field declared `Int` refuses `acme` rather than storing a string that looks almost right, and
+  names `BigInt` when the digits are too large for an `Int`.
+- A field declared `Object` or a list type refuses anything that is not a reference, so a mistyped
+  `@…` is an error rather than data.
+- `~` stays reserved on every field whatever its type: deletion has to be expressible (§8.1).
+
+The untyped parse survives for the surfaces that genuinely have no declared type in hand — a
+`describe` payload, an error message, a field declared `Any` — and it keeps the reservations that
+come with guessing: `@` and `0x` are sigils there, so a malformed remainder is an *error* rather than
+a string, because a mistyped reference quietly becoming data that looks almost right is the worst
+available outcome.
 
 **Interning is invisible.** A `String`, `Binary` or `BigInt` written in this form is interned by the
 engine, and a cell holding a reference to a *content-addressed* PID renders back as its content — so
@@ -168,12 +176,10 @@ resolve it. A reference to an *allocated* PID still renders as `@o-…`, because
 behind it to render. Clients therefore never learn that interning exists, in the same way they never
 learn that a provider batches writes (§17.1): a runtime concern, not a user concern.
 
-> **The known ambiguity.** The forms above win, so their spellings are not strings: a string field
-> cannot yet hold the text `true`, `42`, `0xff` or `7n`, and a malformed `@…` becomes a string rather
-> than an error. This is what parsing without a declared type costs, and it is recorded rather than
-> hidden. **Type-directed parsing resolves it**: once a write is validated against its `FieldDef`
-> (§5.1), a field declared `String` reads `true` as four characters and a field declared `Object`
-> rejects a malformed reference outright.
+> **What the ambiguity costs, and where.** In the untyped parse the forms above win, so their
+> spellings are not strings: `true` is a `Bool`, `42` an `Int`, `0xff` `Binary`, `7n` a `BigInt`.
+> That is the price of guessing, and it is confined to the surfaces that must guess. It does not
+> reach stored data, because no write goes through them.
 
 ---
 
@@ -306,10 +312,20 @@ live in the same buffer.
 
 ```
 ObjectDef  { name, fields: { name -> FieldDef } }
-FieldDef   { name, type, declaringRepo, origin: Source | Derived, version: LayerId }
-           // note: no `writer` — discovered ownership lives in the dependency index (§8)
+FieldDef   { name, type, declaringRepo, ownership, version: LayerId }
+Ownership  = Source | Derived(ProducerId)
 ListDef    { elementType }
 ```
+
+**`ownership` is one enum, not an origin beside an optional writer.** Every field has exactly one
+writer (§8), so a pair of loose fields would make "derived but unowned" spellable. The `Origin` a
+*record* carries (§4.3) is derived from it — with one deliberate difference: an `up` migration is a
+producer writing a field declared `Source`, and the record it leaves is still derived (§9.3).
+
+**Definitions are load-bearing, not descriptive.** Every cell write is validated against the def-view
+of its branch before it lands: unknown struct rejected, unknown field rejected, wrong type rejected,
+and a writer the declaration does not name rejected. §8 states the rule; this is where the shape it
+reads from lives.
 
 `SetDef` and `MapDef` are deferred alongside their value types.
 
@@ -337,6 +353,9 @@ Consequences:
   on it.
 - A repo may mutate or delete only the fields it declared.
 - Two repos declaring the same field name on the same struct is a **hard error** at push time.
+- The *same* repo redeclaring the *same* shape is a repeat, not a conflict, and is a no-op. A repo
+  emits its whole schema on every push (§17.4), so a push that only worked once would be a push
+  nobody trusts. Changing a declared field still requires `MutateField` and a migration (§6.1).
 - There is no repo dependency DAG. Declaration order does not matter.
 
 ### 5.3 Def-versions
@@ -392,6 +411,10 @@ has no `down` migration and will break the N clients currently on versions X and
 **DefEvents** mutate definitions:
 `CreateObjectDef`, `MutateObjectDef`, `DeleteObjectDef`, `DeclareField`, `MutateField`,
 `DeleteField`, `PushProducer`.
+
+`DeclareField` carries the field's `ownership` (§5.1, §8) along with its type and declaring repo.
+That is what makes a derived field declarable at all: without it every field would be implicitly
+`Source`, and no producer could legally write anything.
 
 Every `DefEvent` that alters the shape of existing data **must** supply a migration (§9.3).
 
@@ -528,14 +551,50 @@ lineage, and the system's job is to be honest about both rather than to pretend.
 **Origin is a property of the `(struct, field)` pair, not of the object.** A single `Company` may
 carry source cells (`name`, `website`) and derived cells (`is_investible`) side by side.
 
-**Every field has exactly one writer.** In v1 this is discovered at runtime and enforced by throwing
-on violation.
+**Every field has exactly one writer, and the declaration says which.** `FieldDef.ownership` (§5.1)
+is either `Source` — written by clients — or `Derived(ProducerId)`, naming the one producer that
+computes it. It is one enum rather than an origin beside an optional writer, because "derived but
+unowned" and "source but owned by P1" are not states the system has an answer for.
 
-**Discovered ownership lives in the dependency index, never in the def.** Defs are mutated by
-DefEvents, which live in def-layers; discovery happens during derivation, which emits value layers.
-Recording an owner into the def would therefore mean the derivation engine emitting def-mutations —
-violating the value-xor-def rule (§6.2) and letting a producer's first run silently rewrite the
-schema. Ownership is discovered state, and belongs with the other discovered state.
+**Ownership is declared, not discovered.** An earlier version of this section had ownership
+discovered at runtime — whoever wrote a cell first owned it — on the grounds that recording an owner
+into the def would mean the derivation engine emitting def-mutations, violating the value-xor-def
+rule (§6.2). That reasoning still holds and is why the engine still never writes a def. What changed
+is that the *author* declares ownership up front, which the engine merely reads:
+
+- A violation is caught on the **first** wrong write, rather than on a second producer's collision
+  with a first that already succeeded.
+- Which producer ends up owning a contested field stops depending on scheduling order.
+- It is forced anyway. Once a write must name a declared field, a producer's output field must be
+  declared too, and the only thing that knows a producer's output field exists is the repo
+  implementing it (§9.2, §17.4).
+
+### 8.0 Every write is validated
+
+A cell write — from a client, from a producer, from anywhere — is checked against the def-view of its
+branch (§5.1, §7.2) before it lands. Four questions, in the order a human would ask them:
+
+1. **Is the struct declared?** A struct exists because someone declared a field on it (§5.2), so an
+   unknown name is not an empty struct — it is a typo.
+2. **Is the field declared?**
+3. **Does ownership permit this writer?** A client may not write a `Derived` field; a producer may
+   write only fields it owns. The one exception is a **migration**, which writes another field's
+   cells at a newer def-version because that is its entire job (§9.3): the declaration it is checked
+   against is the one naming it as `up` or `down`.
+4. **Does the value fit the declared `ValueType`?** A tombstone satisfies every type — it means
+   *explicitly removed* (§8.1), and deletion has to be expressible on every field.
+
+Because the check is against the branch's def-view, **a definition that has not merged is not merely
+invisible to the parent — it is unusable there.** Those are the same fact.
+
+Two limits, stated rather than hidden:
+
+- **A reference is checked for kind, not for struct.** A `Ref` carries a PID, and a PID records a
+  kind, not which struct the object belongs to (§3.1). So a field declared `Object(Company)` is
+  checked for "is this an object at all" and no further.
+- **Lists and the untyped containers are unchecked.** There is no `ListDef` event in §6.1 and no way
+  to declare one, so requiring a declaration would make them unwritable rather than validated. They
+  become checkable in the change that gives them something to check against.
 
 ### 8.1 Tombstones
 
@@ -627,6 +686,11 @@ The recorded read-set is `{(company, website), (company, founders), (founder_i, 
 **Pushing new pipeline source is a `DefEvent`** that moves the producer's ClientVersion and
 invalidates all of its prior output, triggering a full recompute across its source buffer.
 
+**A pipeline's output field must be declared, and its repo is what declares it.** A producer write is
+validated like any other (§8), so a pipeline whose output field nobody declared cannot write at all.
+The repo therefore emits its struct definitions alongside its producers, and both land in one def
+layer (§17.4).
+
 **Definition and implementation are separate.** The log records only the *definition* — `ProducerId`,
 source buffer, ClientVersion. The `ExecutionProvider` (§17) resolves that ID to an *implementation*.
 In v1 that resolution is a static registry of Rust functions compiled into the binary; later it is a
@@ -678,8 +742,10 @@ them on `CellRef` would make a migration, which reads `C@v1` and writes `C@v9`, 
 output as a change to its own input and poison itself as a cycle. It also means a pipeline reading
 `C@v1` is correctly left alone when a migration materializes `C@v9`.
 
-**Field ownership is per version.** The same cell at v1 and at v9 is legitimately written by
-different producers — a client and the migration carrying its value forward.
+**Ownership spans versions, and the migration exception is what makes that work.** The same cell at
+v1 and at v9 is legitimately written by different actors — a client and the migration carrying its
+value forward — so a migration is checked against the declaration naming it as `up`/`down` rather
+than against the field's ordinary writer (§8).
 
 **Capture is automatic and requires no declaration.** Every cell access a producer makes goes through
 `ProducerCtx` (§17), so the engine observes reads and writes exactly, with nothing for an author to
@@ -960,8 +1026,9 @@ and v1 has no network layer — building one competes directly with building the
 When SDKs arrive they will come with a socket/network layer, and the generation contract is:
 
 - Generated from the registry's defs at a chosen layer; that layer becomes the client's ClientVersion.
-- All fields emitted as writable; ownership violations throw at runtime. Static read-only marking of
-  derived fields is deferred further still.
+- Derived fields are known statically now that ownership is declared (§8), so a generator can mark
+  them read-only. v1 emits everything as writable and lets the runtime rejection do the work; the
+  static marking is deferred with the SDKs themselves.
 - Reads return the provenance envelope of §10.4.
 - TypeScript first, then Python, Rust, Go.
 
@@ -989,6 +1056,13 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
   ┌─ DEFINITION ──────────────────────────────────────────┐
   │  DefRegistry     defs, def-versions, ClientVersion,   │
   │                  live-version set                     │
+  └───────────────────────────────────────────────────────┘
+
+  ┌─ WRITE ───────────────────────────────────────────────┐
+  │  WriteSession    one open layer + the branch's        │
+  │                  def-view, bound together. Every      │
+  │                  write — client or producer — goes    │
+  │                  through it and is validated (§8).    │
   └───────────────────────────────────────────────────────┘
 
   ┌─ DERIVATION (the cycle) ──────────────────────────────┐
@@ -1235,7 +1309,8 @@ pub trait ExecutionProvider {
 #[async_trait]
 pub trait ProducerCtx {
     async fn get(&mut self, cell: CellRef) -> Result<Option<Value>>;  // recorded
-    async fn set(&mut self, cell: CellRef, v: Value) -> Result<()>;   // ownership-checked
+    async fn set(&mut self, cell: CellRef, v: Value) -> Result<()>;   // validated against the defs
+    async fn set_text(&mut self, cell: CellRef, t: &str) -> Result<()>; // parsed against the defs
 }
 ```
 
@@ -1261,6 +1336,35 @@ with the `@s-…` that is physically stored, and a `Set` carrying `"acme.ai"` is
 interns it before the write lands. A worker therefore never makes a second round trip to resolve or
 create a string, and never has to know that content addressing exists (§3.4). Anything else would put
 an extra round trip on the hottest path in the protocol in exchange for exposing a storage detail.
+
+**A worker's writes are text, and the engine parses them against the declared type.** A `Set` carries
+the text, not a parsed value, because only the engine knows what the field is declared to hold
+(§3.4). Parsing worker-side would be parsing without a declared type, which would leave `true`
+unstorable in a `String` field over the wire while the CLI stored it fine — two dialects for one
+value model.
+
+**A repo describes its definitions as well as its producers.** `describe` runs once at push time and
+returns both, and `borg repo push` folds all of it into **one def layer**: a producer and the field
+it writes land together or not at all. This is not tidiness. A producer cannot write anything unless
+its output field is declared (§8), and the repo implementing the producer is the only thing that
+knows the field exists. It is also the DSL story — a Python repo defines structs through an SDK and
+its runtime emits this shape, making `defs/*.json` one way of producing it rather than a parallel
+path.
+
+The payload is shaped so a shell script can produce it with one `jq -n`:
+
+```json
+{ "structs": [ { "name": "Company", "fields": [
+      { "name": "website",       "type": "String" },
+      { "name": "is_investible", "type": "Bool", "derived_by": "invest" } ] } ],
+  "producers": [ { "name": "invest", "source": "Company" } ] }
+```
+
+`derived_by` names a producer **by name**, not by id: a repo knows what it calls its pipelines and
+should not have to compute the hash the engine turns that into. A `derived_by` naming a producer the
+repo does not implement is a push-time error, because it would declare a field nothing can ever
+write. Both lists default to empty — a repo of pure schema and a repo of pure code are both
+legitimate.
 
 **`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting

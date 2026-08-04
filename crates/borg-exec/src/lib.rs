@@ -40,9 +40,19 @@ pub trait ProducerCtx: Send {
     /// sees the target view (SPEC.md §9.3).
     async fn get_at(&mut self, cell: &CellRef, version: ClientVersion) -> Result<Option<Value>>;
 
-    /// Write a cell. Checked against field ownership: every field has exactly one writer, and a
-    /// violation poisons this producer rather than the branch (SPEC.md §8, §14).
+    /// Write a cell. Validated against the branch's definitions: the field must be declared, the
+    /// value must fit its declared type, and the field must be one this producer *owns* — ownership
+    /// is declared, not discovered (SPEC.md §5.1, §8). A violation poisons this producer rather than
+    /// the branch (SPEC.md §14).
     async fn set(&mut self, cell: &CellRef, value: Value) -> Result<()>;
+
+    /// Write a cell from its text form, parsed against the field's **declared type** (SPEC.md §3.4).
+    ///
+    /// Exists because a worker speaking the wire protocol sends text (§17.4) and only the engine
+    /// knows the declared type. Parsing worker-side would be parsing without one — which is exactly
+    /// the guessing that type-directed parsing removes, and would make `true` unstorable in a
+    /// `String` field over the wire while the CLI stored it fine.
+    async fn set_text(&mut self, cell: &CellRef, text: &str) -> Result<()>;
 
     /// Turn a parsed value into a storable one, interning `String`, `Binary` and `BigInt` content.
     ///

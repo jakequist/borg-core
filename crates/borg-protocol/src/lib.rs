@@ -123,14 +123,59 @@ pub enum FromWorker {
     Error { message: String },
 }
 
-/// What a worker reports when asked to `describe` itself.
+/// What a repo reports when asked to `describe` itself.
 ///
-/// This runs once at push time and is what the engine turns into `PushProducer` def events — so a
-/// producer's *definition* comes from the same artifact as its implementation, and you cannot
-/// register one whose code does not exist (SPEC.md §9.2).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// This runs once at push time and is what `borg repo push` turns into **one def layer** — so a
+/// producer's definition, and the declaration of the field it writes, come from the same artifact as
+/// its implementation and land together or not at all (SPEC.md §5.2, §9.2).
+///
+/// **Structs are here because they have to be.** Once a write is validated against the def-view
+/// (§8), a producer cannot write anything unless its output field is declared, and the repo
+/// implementing the producer is the only thing that knows what that field is. `defs/*.json` becomes
+/// one way of producing this rather than a parallel path — and a Python repo defining structs
+/// through an SDK emits exactly the same shape from its runtime.
+///
+/// Both lists default to empty: a repo of pure schema and a repo of pure code are both legitimate,
+/// and neither should have to write `"structs": []` to say so.
+///
+/// ```json
+/// { "structs": [ { "name": "Company", "fields": [
+///       { "name": "website",       "type": "String" },
+///       { "name": "is_investible", "type": "Bool", "derived_by": "invest" } ] } ],
+///   "producers": [ { "name": "invest", "source": "Company" } ] }
+/// ```
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Description {
+    #[serde(default)]
+    pub structs: Vec<StructSpec>,
+    #[serde(default)]
     pub producers: Vec<ProducerSpec>,
+}
+
+/// A struct's fields, as one repo declares them. The namespace is flat and there is no `extends`:
+/// two repos naming the same struct simply merge (SPEC.md §5.2).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StructSpec {
+    pub name: String,
+    pub fields: Vec<FieldSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FieldSpec {
+    pub name: String,
+    /// `Int`, `Bool`, `Double`, `String`, `Binary`, `BigInt`, `Any`, or a struct name.
+    ///
+    /// Spelled `type` on the wire even though that is a Rust keyword: a repo author writing this by
+    /// hand in `jq` should not have to know what Rust reserves.
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// The producer that writes this field, named as this repo names it. Absent means source data,
+    /// written by clients (SPEC.md §8).
+    ///
+    /// A **name**, not an id: a repo knows what it calls its pipelines and should not have to
+    /// compute the hash the engine turns that into.
+    #[serde(default)]
+    pub derived_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,20 +188,29 @@ pub struct ProducerSpec {
 }
 
 impl ProducerSpec {
-    /// A stable id for a producer name.
+    /// A stable id for this producer.
     ///
     /// Derived rather than assigned so that pushing the same repo twice is idempotent, and so two
     /// stores of the same repo agree on ids without coordinating.
     pub fn id(&self) -> u64 {
-        // FNV-1a. Small, stable, and dependency-free; nothing here needs cryptographic strength.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in self.name.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        // Keep it away from the small ids a human might type into a def file.
-        hash | (1 << 32)
+        producer_id(&self.name)
     }
+}
+
+/// The id a producer name hashes to. SPEC.md §9.2.
+///
+/// A free function as well as a method because a `derived_by` names a producer by name, and
+/// resolving it must produce the *same* id the producer's own definition gets — one hash, one
+/// place, no chance of the field pointing at an owner that does not exist.
+pub fn producer_id(name: &str) -> u64 {
+    // FNV-1a. Small, stable, and dependency-free; nothing here needs cryptographic strength.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    // Keep it away from the small ids a human might type into a def file.
+    hash | (1 << 32)
 }
 
 #[derive(Debug, thiserror::Error)]

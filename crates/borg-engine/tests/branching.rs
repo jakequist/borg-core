@@ -4,14 +4,17 @@
 //! `fork` and `merge` mean and the code is made to agree.
 
 use borg_core::{
-    BranchId, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId, LayerKind, MergeMode,
-    Origin, Pid, PidKind, Result, Value,
+    BranchId, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId, MergeMode, Ownership, Pid,
+    PidKind, ProducerId, RepoId, Result, Value, ValueType, Writer,
 };
-use borg_engine::{BranchManager, CellTouchIndex, InProcessSequencer, LayerManager};
+use borg_engine::{
+    BranchManager, CellTouchIndex, DefRegistry, InProcessSequencer, LayerManager, WriteSession,
+};
 use borg_storage::{MemoryStorage, StorageProvider};
 use std::sync::Arc;
 
 const V1: ClientVersion = ClientVersion(LayerId(1));
+const SCORE: ProducerId = ProducerId(1);
 
 fn company(branch: BranchId, n: u64) -> Pid {
     Pid::Allocated {
@@ -34,6 +37,7 @@ struct Harness {
     storage: Arc<MemoryStorage>,
     layers: Arc<LayerManager>,
     branches: Arc<BranchManager>,
+    defs: Arc<DefRegistry>,
 }
 
 impl Harness {
@@ -45,33 +49,55 @@ impl Harness {
             Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
+        let defs = Arc::new(DefRegistry::new(layers.clone(), storage.clone()));
         Self {
             storage,
             layers,
             branches,
+            defs,
         }
     }
 
-    async fn push(&self, branch: BranchId, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(branch, LayerKind::Value, LayerAuthor::Source)
+    /// A root branch with a schema on it. Data cannot be written before its definitions exist
+    /// (SPEC.md §8), so every test starts here rather than with a bare `create_root`.
+    async fn root(&self, name: Option<&str>) -> Result<BranchId> {
+        let branch = self.branches.create_root(name.map(str::to_string)).await?;
+        let declare = |field: &str, ty: ValueType, ownership: Ownership| DefEvent::DeclareField {
+            struct_name: "Company".into(),
+            field: field.into(),
+            ty,
+            repo: RepoId(1),
+            ownership,
+        };
+        self.defs
+            .push(
+                branch,
+                vec![
+                    declare("name", ValueType::Int, Ownership::Source),
+                    declare("is_investible", ValueType::Bool, Ownership::Derived(SCORE)),
+                ],
+            )
             .await?;
+        Ok(branch)
+    }
+
+    async fn session(&self, branch: BranchId, writer: Writer) -> Result<WriteSession> {
+        let author = match writer {
+            Writer::Client => LayerAuthor::Source,
+            Writer::Producer(producer) => LayerAuthor::Derived {
+                producer,
+                reflects: self.layers.head(branch).unwrap_or(LayerId(0)),
+            },
+        };
+        WriteSession::open(&self.layers, &self.defs, branch, None, V1, writer, author).await
+    }
+
+    async fn push(&self, branch: BranchId, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
+        let mut session = self.session(branch, Writer::Client).await?;
         for (cell, value) in writes {
-            layer
-                .put(
-                    &cell,
-                    CellRecord {
-                        value,
-                        version: V1,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     /// Read through the branch's full ancestry, at its head.
@@ -102,7 +128,7 @@ impl Harness {
 #[tokio::test]
 async fn a_fork_inherits_its_parents_data_without_copying_it() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(Some("main".into())).await?;
+    let main = h.root(Some("main")).await?;
     let acme = company(main, 1);
 
     let before_fork = h
@@ -131,7 +157,7 @@ async fn a_fork_inherits_its_parents_data_without_copying_it() -> Result<()> {
 #[tokio::test]
 async fn a_child_shadows_its_parent_without_mutating_it() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(Some("main".into())).await?;
+    let main = h.root(Some("main")).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -158,7 +184,7 @@ async fn a_child_shadows_its_parent_without_mutating_it() -> Result<()> {
 #[tokio::test]
 async fn a_write_after_the_fork_point_is_invisible_to_the_child() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -181,7 +207,7 @@ async fn a_write_after_the_fork_point_is_invisible_to_the_child() -> Result<()> 
 #[tokio::test]
 async fn a_tombstone_on_a_child_hides_an_inherited_value() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -208,7 +234,7 @@ async fn a_tombstone_on_a_child_hides_an_inherited_value() -> Result<()> {
 #[tokio::test]
 async fn time_travel_reaches_back_across_the_fork_point() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root(None).await?;
     let acme = company(main, 1);
 
     let first = h
@@ -236,7 +262,7 @@ async fn time_travel_reaches_back_across_the_fork_point() -> Result<()> {
 #[tokio::test]
 async fn merging_replays_the_childs_source_layers_onto_the_parent() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -274,7 +300,7 @@ async fn merging_replays_the_childs_source_layers_onto_the_parent() -> Result<()
 #[tokio::test]
 async fn merge_is_rejected_when_the_parent_deleted_what_the_child_wrote() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -305,7 +331,7 @@ async fn merge_is_rejected_when_the_parent_deleted_what_the_child_wrote() -> Res
 #[tokio::test]
 async fn merge_skips_derived_layers() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -316,31 +342,13 @@ async fn merge_skips_derived_layers() -> Result<()> {
     h.push(feature, vec![(prop(acme, "name"), Value::Int(2))])
         .await?;
 
-    // A derived layer on the child, as the derivation engine would produce.
-    let mut derived = h
-        .layers
-        .open(
-            feature,
-            LayerKind::Value,
-            LayerAuthor::Derived {
-                producer: borg_core::ProducerId(1),
-                reflects: fork_point,
-            },
-        )
-        .await?;
+    // A derived layer on the child, as the derivation engine would produce — written by the
+    // producer the def declares as `is_investible`'s owner.
+    let mut derived = h.session(feature, Writer::Producer(SCORE)).await?;
     derived
-        .put(
-            &prop(acme, "is_investible"),
-            CellRecord {
-                value: Value::Bool(true),
-                version: V1,
-                written_at: derived.id(),
-                origin: Origin::Derived,
-                derivation: None,
-            },
-        )
+        .set(&prop(acme, "is_investible"), Value::Bool(true))
         .await?;
-    h.layers.commit(derived).await?;
+    derived.commit().await?;
 
     let replayed = h.branches.merge(feature, MergeMode::DefAndData).await?;
     assert_eq!(

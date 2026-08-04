@@ -4,8 +4,8 @@
 //! are mutations on a branch, forkable and mergeable like any other.
 
 use borg_core::{
-    BranchId, DefEvent, FieldName, LayerId, MergeMode, ObjectTypeName, ProducerId, RepoId, Result,
-    ValueType,
+    BranchId, DefEvent, FieldName, LayerId, MergeMode, ObjectTypeName, Ownership, ProducerId,
+    RepoId, Result, ValueType,
 };
 use borg_engine::{BranchManager, CellTouchIndex, DefRegistry, InProcessSequencer, LayerManager};
 use borg_storage::MemoryStorage;
@@ -60,6 +60,7 @@ fn declare(repo: RepoId, struct_name: &str, field: &str, ty: ValueType) -> DefEv
         field: field.into(),
         ty,
         repo,
+        ownership: Ownership::Source,
     }
 }
 
@@ -199,6 +200,69 @@ async fn a_def_pushed_on_a_child_is_invisible_to_the_parent() -> Result<()> {
         h.field_type(main, "Company", "website").await?,
         None,
         "and the parent does not — a schema change is branch-scoped like any other mutation"
+    );
+    Ok(())
+}
+
+/// A fork of a fork. **Nothing else in the codebase exercises a branch chain deeper than one
+/// fork** — `read_path` walks arbitrary depth and this is what says so.
+///
+/// The grandchild sees the whole ancestry, and what it declares is invisible *upwards* in both
+/// directions: not to its parent, and not to its grandparent.
+#[tokio::test]
+async fn a_fork_of_a_fork_sees_its_whole_ancestry_and_leaks_nothing_back() -> Result<()> {
+    let h = Harness::new();
+    let main = h.branches.create_root(None).await?;
+    let root_layer = h
+        .push(
+            main,
+            vec![declare(SALES, "Company", "name", ValueType::String)],
+        )
+        .await?;
+
+    let feature = h.branches.fork(main, root_layer, None).await?;
+    let feature_layer = h
+        .push(
+            feature,
+            vec![declare(SALES, "Company", "website", ValueType::String)],
+        )
+        .await?;
+
+    let experiment = h.branches.fork(feature, feature_layer, None).await?;
+    h.push(
+        experiment,
+        vec![declare(SALES, "Company", "founded", ValueType::Int)],
+    )
+    .await?;
+
+    // Downwards: everything an ancestor declared is in force.
+    for field in ["name", "website", "founded"] {
+        assert!(
+            h.field_type(experiment, "Company", field).await?.is_some(),
+            "a fork of a fork resolves `{field}` through two fork points"
+        );
+    }
+    assert_eq!(
+        h.field_type(feature, "Company", "name").await?,
+        Some(ValueType::String),
+        "and the middle branch still sees the root's"
+    );
+
+    // Upwards: nothing.
+    assert_eq!(
+        h.field_type(feature, "Company", "founded").await?,
+        None,
+        "the grandchild's field is invisible to its parent"
+    );
+    assert_eq!(
+        h.field_type(main, "Company", "founded").await?,
+        None,
+        "and to its grandparent"
+    );
+    assert_eq!(
+        h.field_type(main, "Company", "website").await?,
+        None,
+        "as is the middle branch's own"
     );
     Ok(())
 }

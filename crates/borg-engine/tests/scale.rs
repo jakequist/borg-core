@@ -11,12 +11,13 @@
 //!   cargo test --release -p borg-engine --test scale -- --ignored --nocapture
 
 use borg_core::{
-    AllocatorId, BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId,
-    LayerKind, Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId,
+    Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, WriteSession,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -111,6 +112,7 @@ struct Harness {
     layers: Arc<LayerManager>,
     engine: Arc<DerivationEngine>,
     branch: BranchId,
+    defs: Arc<DefRegistry>,
 }
 
 impl Harness {
@@ -132,7 +134,7 @@ impl Harness {
             Arc::new(MemoryDependencyIndex::new()),
             executor,
             Arc::new(FrontierTracker::new()),
-            defs,
+            defs.clone(),
             branches.clone(),
         ));
         engine.register(ProducerDef {
@@ -144,34 +146,67 @@ impl Harness {
         });
 
         let branch = branches.create_root(Some("main".into())).await.unwrap();
+        defs.push(branch, schema()).await.unwrap();
         Self {
             layers,
             engine,
             branch,
+            defs,
         }
     }
 
     async fn push(&self, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(self.branch, LayerKind::Value, LayerAuthor::Source)
-            .await?;
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            self.branch,
+            None,
+            V1,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for (cell, value) in writes {
-            layer
-                .put(
-                    &cell,
-                    CellRecord {
-                        value,
-                        version: V1,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
+}
+
+/// The four structs this fixture writes, declared before any of it is written (SPEC.md §8).
+fn schema() -> Vec<DefEvent> {
+    let declare = |struct_name: &str, field: &str, ty: ValueType, ownership: Ownership| {
+        DefEvent::DeclareField {
+            struct_name: struct_name.into(),
+            field: field.into(),
+            ty,
+            repo: RepoId(1),
+            ownership,
+        }
+    };
+    let list_of = |name: &str| ValueType::List(Box::new(ValueType::Object(name.into())));
+    vec![
+        declare("Company", "founders", list_of("Founder"), Ownership::Source),
+        declare(
+            "Company",
+            "is_investible",
+            ValueType::Bool,
+            Ownership::Derived(SCORE),
+        ),
+        declare(
+            "Founder",
+            "educations",
+            list_of("Education"),
+            Ownership::Source,
+        ),
+        declare(
+            "Education",
+            "school",
+            ValueType::Object("School".into()),
+            Ownership::Source,
+        ),
+        declare("School", "is_top_ten", ValueType::Bool, Ownership::Source),
+    ]
 }
 
 /// `n` companies, every one of them four hops from the same school.

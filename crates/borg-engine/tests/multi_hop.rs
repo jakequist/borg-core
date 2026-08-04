@@ -11,13 +11,13 @@
 //! tracking either survives this or the design does not work.
 
 use borg_core::{
-    AllocatorId, BranchId, BufferId, CellRecord, CellRef, ClientVersion, LayerAuthor, LayerId,
-    LayerKind, ObjectTypeName, Origin, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId,
-    Result, Value,
+    AllocatorId, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerAuthor,
+    LayerId, ObjectTypeName, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind,
+    RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
-    InProcessSequencer, LayerManager, MemoryDependencyIndex,
+    InProcessSequencer, LayerManager, MemoryDependencyIndex, WriteSession,
 };
 use borg_exec::ProducerCtx;
 use borg_exec_native::NativeExecutor;
@@ -137,6 +137,7 @@ struct Harness {
     engine: Arc<DerivationEngine>,
     storage: Arc<MemoryStorage>,
     branch: BranchId,
+    defs: Arc<DefRegistry>,
 }
 
 impl Harness {
@@ -160,7 +161,7 @@ impl Harness {
             index,
             executor,
             Arc::new(FrontierTracker::new()),
-            defs,
+            defs.clone(),
             branches.clone(),
         ));
         engine.register(ProducerDef {
@@ -172,35 +173,34 @@ impl Harness {
         });
 
         let branch = branches.create_root(Some("main".into())).await.unwrap();
+        // Four structs, declared before anything is written to them (SPEC.md §8). The list-typed
+        // fields are what the hops travel along.
+        defs.push(branch, schema()).await.unwrap();
         Self {
             layers,
             branches,
             engine,
             storage,
             branch,
+            defs,
         }
     }
 
     async fn push(&self, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(self.branch, LayerKind::Value, LayerAuthor::Source)
-            .await?;
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            self.branch,
+            None,
+            V1,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for (cell, value) in writes {
-            layer
-                .put(
-                    &cell,
-                    CellRecord {
-                        value,
-                        version: V1,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     async fn read(&self, cell: &CellRef) -> Result<Option<CellRecord>> {
@@ -214,6 +214,42 @@ impl Harness {
             .await?
             .map(|r| r.value))
     }
+}
+
+fn schema() -> Vec<DefEvent> {
+    let declare = |struct_name: &str, field: &str, ty: ValueType, ownership: Ownership| {
+        DefEvent::DeclareField {
+            struct_name: struct_name.into(),
+            field: field.into(),
+            ty,
+            repo: RepoId(1),
+            ownership,
+        }
+    };
+    let list_of = |name: &str| ValueType::List(Box::new(ValueType::Object(name.into())));
+    vec![
+        declare("Company", "website", ValueType::Int, Ownership::Source),
+        declare("Company", "founders", list_of("Founder"), Ownership::Source),
+        declare(
+            "Company",
+            "is_investible",
+            ValueType::Bool,
+            Ownership::Derived(SCORE),
+        ),
+        declare(
+            "Founder",
+            "educations",
+            list_of("Education"),
+            Ownership::Source,
+        ),
+        declare(
+            "Education",
+            "school",
+            ValueType::Object("School".into()),
+            Ownership::Source,
+        ),
+        declare("School", "is_top_ten", ValueType::Bool, Ownership::Source),
+    ]
 }
 
 /// One founder, one education, at the given school.

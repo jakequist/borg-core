@@ -8,15 +8,15 @@
 //! the branch head, rather than queued, which bounds memory and makes crash recovery free.
 
 use crate::index::{DependencyIndexProvider, Invocation};
-use crate::log::{LayerHandle, LayerManager};
+use crate::log::LayerManager;
 use crate::resolve::FrontierTracker;
 use crate::seams::WorkGap;
 use crate::values::Values;
+use crate::write::WriteSession;
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, BranchId, CellAt, CellRecord, CellRef, ClientVersion, Derivation, LayerAuthor,
-    LayerId, LayerKind, Origin, Pid, ProducerDef, ProducerId, ProducerKind, ReadPath, Result,
-    Value, ValueInput,
+    BorgError, BranchId, CellAt, CellRef, ClientVersion, Derivation, LayerAuthor, LayerId, Pid,
+    ProducerDef, ProducerId, ProducerKind, ReadPath, Result, Value, ValueInput, Writer,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_storage::StorageProvider;
@@ -37,8 +37,6 @@ struct RecordingCtx<'a> {
     /// Interning and content resolution, shared with every other surface that accepts or emits
     /// value text — see `crate::values` for why they are one implementation and not two.
     values: &'a Values,
-    index: &'a dyn DependencyIndexProvider,
-    branch: BranchId,
     /// This round's ancestry, resolved once rather than per read.
     path: ReadPath,
     /// The source layer this run is bringing the world up to. This is the *label* on the output, not
@@ -50,7 +48,10 @@ struct RecordingCtx<'a> {
     /// The def-view this producer's code was authored against. Reads resolve here and writes are
     /// labelled with it.
     version: ClientVersion,
-    layer: &'a mut LayerHandle,
+    /// Output goes through the same validated write path as everything else, so a producer writing
+    /// a field it does not own is rejected against the *declaration* rather than against whatever
+    /// happened to write there first (SPEC.md §8).
+    session: WriteSession,
     read_set: Vec<CellAt>,
     write_set: Vec<CellAt>,
 }
@@ -77,34 +78,38 @@ impl ProducerCtx for RecordingCtx<'_> {
     }
 
     async fn set(&mut self, cell: &CellRef, value: Value) -> Result<()> {
-        // Every field has exactly one writer, discovered at runtime (SPEC.md §8). Ownership is per
-        // *version*: the same cell at v1 and at v9 is legitimately written by different producers —
-        // a client and the migration that carries its value forward.
+        let derivation = Derivation {
+            producer: self.producer,
+            fresh_as_of: self.reflects,
+            read_set: self.read_set.clone(),
+        };
+        self.session.set_derived(cell, value, derivation).await?;
+        // Recorded only after the write is accepted: a rejected write is not output, and claiming
+        // it in the index would leave the producer owning a cell it never produced.
         let written = CellAt::new(cell.clone(), self.version);
-        if let Some(owner) = self.index.writer_of(self.branch, &written)?
-            && owner != self.producer
-        {
-            return Err(BorgError::FieldOwnershipViolation {
-                cell: written,
-                owner: Some(owner),
-                attempted: self.producer,
-            });
-        }
         if !self.write_set.contains(&written) {
             self.write_set.push(written);
         }
-        let record = CellRecord {
-            value,
-            version: self.version,
-            written_at: self.layer.id(),
-            origin: Origin::Derived,
-            derivation: Some(Derivation {
-                producer: self.producer,
-                fresh_as_of: self.reflects,
-                read_set: self.read_set.clone(),
-            }),
+        Ok(())
+    }
+
+    async fn set_text(&mut self, cell: &CellRef, text: &str) -> Result<()> {
+        let derivation = Derivation {
+            producer: self.producer,
+            fresh_as_of: self.reflects,
+            read_set: self.read_set.clone(),
         };
-        self.layer.put(cell, record).await
+        // The session parses against the field's declared type, so a worker sending `true` into a
+        // `String` field writes four characters and one sending `acme` into an `Int` field is told
+        // so — the same rule the CLI gets, from the same place (§3.4).
+        self.session
+            .set_text_derived(cell, text, derivation)
+            .await?;
+        let written = CellAt::new(cell.clone(), self.version);
+        if !self.write_set.contains(&written) {
+            self.write_set.push(written);
+        }
+        Ok(())
     }
 
     async fn intern(&mut self, input: ValueInput) -> Result<Value> {
@@ -368,18 +373,6 @@ impl DerivationEngine {
         reflects: LayerId,
         read_at: LayerId,
     ) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(
-                branch,
-                LayerKind::Value,
-                LayerAuthor::Derived {
-                    producer: def.id,
-                    reflects,
-                },
-            )
-            .await?;
-
         // A migration's ClientVersion is the def-layer that introduced its target: it reads the
         // world at the target view and writes the target version. Its own source cell is the one
         // exception, reached through `ProducerCtx::get_at` (SPEC.md §9.3).
@@ -387,6 +380,23 @@ impl DerivationEngine {
             ProducerKind::Migration { to, .. } => ClientVersion(to),
             ProducerKind::Pipeline => ClientVersion(def.version),
         };
+        // This round's ceiling — the source layer plus every derived layer already committed as a
+        // consequence of it — bounds both the def-view the writes are checked against and the
+        // ancestry the reads resolve through. Distinct from `reflects` on purpose (SPEC.md §16.5).
+        let session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            branch,
+            Some(read_at),
+            version,
+            Writer::Producer(def.id),
+            LayerAuthor::Derived {
+                producer: def.id,
+                reflects,
+            },
+        )
+        .await?;
+
         let producer_ref = ProducerRef {
             id: def.id,
             version,
@@ -394,22 +404,17 @@ impl DerivationEngine {
         let mut ctx = RecordingCtx {
             storage: self.storage.as_ref(),
             values: &self.values,
-            index: self.index.as_ref(),
-            branch,
-            // This round's ceiling — the source layer plus every derived layer already committed as
-            // a consequence of it — resolved through the branch's ancestry once, rather than per
-            // read. Distinct from `reflects` on purpose (SPEC.md §16.5).
             path: self.branches.read_path(branch, Some(read_at))?,
             reflects,
             producer: def.id,
             version,
-            layer: &mut layer,
+            session,
             read_set: Vec::new(),
             write_set: Vec::new(),
         };
 
         let outcome = self.executor.run(&producer_ref, input, &mut ctx).await;
-        let (read_set, write_set) = (ctx.read_set, ctx.write_set);
+        let (read_set, write_set, session) = (ctx.read_set, ctx.write_set, ctx.session);
 
         match outcome {
             Ok(()) => {
@@ -419,11 +424,11 @@ impl DerivationEngine {
                 };
                 self.index
                     .record(branch, &invocation, &read_set, &write_set)?;
-                self.layers.commit(layer).await
+                session.commit().await
             }
             Err(err) => {
                 // The layer never becomes visible, so a failed run leaves no trace.
-                self.layers.abort(layer).await?;
+                session.abort().await?;
                 Err(err)
             }
         }

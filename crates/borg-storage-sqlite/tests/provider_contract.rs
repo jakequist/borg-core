@@ -275,6 +275,7 @@ async fn def_events_round_trip_in_order() -> Result<()> {
                 field: field.into(),
                 ty: ValueType::String,
                 repo: RepoId(1),
+                ownership: borg_core::Ownership::Source,
             })
             .await?;
     }

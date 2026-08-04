@@ -9,6 +9,17 @@ borg repo push "$HERE"/../030-shell-pipeline/repo
 assert_contains "$(borg producer list)" "invest" \
     "the script described itself, and the server recorded a producer definition"
 
+# …and its definitions came from the same `describe`, in the same def layer. The repo is the only
+# thing that knows `is_investible` exists, so after B it is the only thing that *can* declare it.
+schema="$(borg def show Company)"
+assert_contains "$schema" "website" "the repo's struct definitions landed with its producer"
+assert_contains "$schema" "derived by P" \
+    "and the derived field names the producer that owns it, resolved from the name in describe"
+
+# The other side of declared ownership: a client cannot write a field a producer owns.
+assert_rejected "may not write" "a client may not write a derived field" \
+    -- borg set 'Company#1.is_investible' true
+
 # The spec's own motivating example: `company.website.ends_with('.ai')`, plus a headcount threshold.
 # The script reads a string and a number, and never learns that one of them is interned.
 borg set 'Company#1.website' acme.ai

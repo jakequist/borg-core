@@ -5,14 +5,17 @@
 //! the merge-conflict detector.
 
 use borg_core::{
-    BranchId, CellRecord, CellRef, ClientVersion, Guard, LayerAuthor, LayerId, LayerKind,
-    MergeMode, Origin, Pid, PidKind, ProducerId, Result, Value,
+    BranchId, CellRef, ClientVersion, DefEvent, Guard, LayerAuthor, LayerId, MergeMode, Ownership,
+    Pid, PidKind, ProducerId, RepoId, Result, Value, ValueType, Writer,
 };
-use borg_engine::{BranchManager, CellTouchIndex, InProcessSequencer, LayerManager};
+use borg_engine::{
+    BranchManager, CellTouchIndex, DefRegistry, InProcessSequencer, LayerManager, WriteSession,
+};
 use borg_storage::{MemoryStorage, StorageProvider};
 use std::sync::Arc;
 
 const V1: ClientVersion = ClientVersion(LayerId(1));
+const SCORE: ProducerId = ProducerId(1);
 
 fn company(branch: BranchId, n: u64) -> Pid {
     Pid::Allocated {
@@ -31,6 +34,7 @@ struct Harness {
     storage: Arc<MemoryStorage>,
     layers: Arc<LayerManager>,
     branches: Arc<BranchManager>,
+    defs: Arc<DefRegistry>,
 }
 
 impl Harness {
@@ -42,11 +46,37 @@ impl Harness {
             Arc::new(CellTouchIndex::new()),
         ));
         let branches = Arc::new(BranchManager::new(layers.clone()));
+        let defs = Arc::new(DefRegistry::new(layers.clone(), storage.clone()));
         Self {
             storage,
             layers,
             branches,
+            defs,
         }
+    }
+
+    /// A root branch with a schema on it. `is_rich` is declared derived so that a guard can be
+    /// tried against a genuinely derived cell (SPEC.md §12).
+    async fn root(&self) -> Result<BranchId> {
+        let branch = self.branches.create_root(None).await?;
+        let declare = |field: &str, ty: ValueType, ownership: Ownership| DefEvent::DeclareField {
+            struct_name: "Company".into(),
+            field: field.into(),
+            ty,
+            repo: RepoId(1),
+            ownership,
+        };
+        self.defs
+            .push(
+                branch,
+                vec![
+                    declare("balance", ValueType::Int, Ownership::Source),
+                    declare("name", ValueType::Int, Ownership::Source),
+                    declare("is_rich", ValueType::Bool, Ownership::Derived(SCORE)),
+                ],
+            )
+            .await?;
+        Ok(branch)
     }
 
     async fn push(&self, branch: BranchId, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
@@ -60,28 +90,23 @@ impl Harness {
         writes: Vec<(CellRef, Value)>,
         guards: Vec<Guard>,
     ) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(branch, LayerKind::Value, LayerAuthor::Source)
-            .await?;
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            branch,
+            None,
+            V1,
+            Writer::Client,
+            LayerAuthor::Source,
+        )
+        .await?;
         for guard in guards {
-            layer.guard(guard);
+            session.guard(guard);
         }
         for (cell, value) in writes {
-            layer
-                .put(
-                    &cell,
-                    CellRecord {
-                        value,
-                        version: V1,
-                        written_at: layer.id(),
-                        origin: Origin::Source,
-                        derivation: None,
-                    },
-                )
-                .await?;
+            session.set(&cell, value).await?;
         }
-        self.layers.commit(layer).await
+        session.commit().await
     }
 
     /// Commit a derived cell, so guards can be tried against one.
@@ -91,30 +116,21 @@ impl Harness {
         cell: &CellRef,
         value: Value,
     ) -> Result<LayerId> {
-        let mut layer = self
-            .layers
-            .open(
-                branch,
-                LayerKind::Value,
-                LayerAuthor::Derived {
-                    producer: ProducerId(1),
-                    reflects: LayerId(1),
-                },
-            )
-            .await?;
-        layer
-            .put(
-                cell,
-                CellRecord {
-                    value,
-                    version: V1,
-                    written_at: layer.id(),
-                    origin: Origin::Derived,
-                    derivation: None,
-                },
-            )
-            .await?;
-        self.layers.commit(layer).await
+        let mut session = WriteSession::open(
+            &self.layers,
+            &self.defs,
+            branch,
+            None,
+            V1,
+            Writer::Producer(SCORE),
+            LayerAuthor::Derived {
+                producer: SCORE,
+                reflects: LayerId(1),
+            },
+        )
+        .await?;
+        session.set(cell, value).await?;
+        session.commit().await
     }
 
     async fn read(&self, branch: BranchId, cell: &CellRef) -> Result<Option<Value>> {
@@ -130,7 +146,7 @@ impl Harness {
 #[tokio::test]
 async fn a_transaction_commits_when_its_guard_holds() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let base = h
@@ -158,7 +174,7 @@ async fn a_transaction_commits_when_its_guard_holds() -> Result<()> {
 #[tokio::test]
 async fn a_transaction_is_rejected_when_a_guarded_cell_moved() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let base = h
@@ -191,7 +207,7 @@ async fn a_transaction_is_rejected_when_a_guarded_cell_moved() -> Result<()> {
 #[tokio::test]
 async fn a_guard_ignores_cells_it_does_not_name() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let base = h
@@ -222,7 +238,7 @@ async fn a_guard_ignores_cells_it_does_not_name() -> Result<()> {
 #[tokio::test]
 async fn a_guard_on_a_derived_cell_is_rejected() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let base = h
@@ -255,7 +271,7 @@ async fn a_guard_on_a_derived_cell_is_rejected() -> Result<()> {
 #[tokio::test]
 async fn a_childs_guard_re_evaluated_against_the_parent_detects_a_merge_conflict() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -295,7 +311,7 @@ async fn a_childs_guard_re_evaluated_against_the_parent_detects_a_merge_conflict
 #[tokio::test]
 async fn an_unguarded_merge_is_last_write_wins() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -322,7 +338,7 @@ async fn an_unguarded_merge_is_last_write_wins() -> Result<()> {
 #[tokio::test]
 async fn a_guard_the_parent_did_not_disturb_still_merges() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None).await?;
+    let main = h.root().await?;
     let acme = company(main, 1);
 
     let fork_point = h

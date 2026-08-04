@@ -207,11 +207,12 @@ impl ExecutionProvider for ProcessExecutor {
                     };
                     worker.send(&ToWorker::Value(text))?;
                 }
+                // The text goes across untouched: parsing it needs the field's declared type, which
+                // lives on the other side of `ctx` (§3.4). Guessing here would give a worker a
+                // different value model from the CLI's for the same text.
                 FromWorker::Set { cell, value } => {
                     let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
-                    let input = parse::value(&value, self.branch, AllocatorId(0))?;
-                    let value = ctx.intern(input).await?;
-                    ctx.set(&cell, value).await?;
+                    ctx.set_text(&cell, &value).await?;
                     worker.send(&ToWorker::Ok {})?;
                 }
                 FromWorker::Done {} => return Ok(()),

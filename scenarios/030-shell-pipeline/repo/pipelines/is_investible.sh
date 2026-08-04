@@ -7,11 +7,28 @@
 # Note that stdout carries the protocol. Anything printed for a human goes to stderr.
 set -euo pipefail
 
-# `describe` runs once at push time: the script declares what it implements and what it maps over,
-# and the server turns that into a PushProducer def event. A producer definition therefore cannot
-# exist without the code that satisfies it.
+# `describe` runs once at push time. The repo declares **both halves of its contribution**: the
+# structs it defines, and the producers it implements. `borg repo push` folds all of it into one def
+# layer, so a producer and the field it writes land together or not at all.
+#
+# This is not tidiness. Every write is validated against the definitions in force (§5.1, §8), so this
+# pipeline could not write `is_investible` at all unless something declared it — and the repo
+# implementing the pipeline is the only thing that knows the field exists. `derived_by` names the
+# producer *by name*; the engine resolves it to the same id it gives the producer itself.
+#
+# Note there is no client library here either: this is `jq -n`.
 if [ "${1:-}" = "describe" ]; then
-    jq -nc '{producers: [{name: "invest", source: "Company"}]}'
+    jq -nc '{
+      structs: [
+        { name: "Company", fields: [
+            { name: "website",       type: "String" },
+            { name: "headcount",     type: "Int" },
+            { name: "employees",     type: "Int" },
+            { name: "is_investible", type: "Bool", derived_by: "invest" }
+        ]}
+      ],
+      producers: [ { name: "invest", source: "Company" } ]
+    }'
     exit 0
 fi
 

@@ -1,0 +1,6 @@
+{
+  "repo": 1,
+  "events": [
+    { "DeclareField": { "struct_name": "Company", "field": "founded", "ty": "Int" } }
+  ]
+}
