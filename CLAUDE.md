@@ -10,14 +10,15 @@ describes, **update the spec in the same change**. A spec that lags the code is 
 ## Commands
 
 ```
-just check      # fmt, clippy -D warnings, all Rust tests, all scenarios — the definition of done
-just test       # Rust tests only
-just scenarios  # end-to-end CLI scenarios only
-just fmt
+./check.sh                  # fmt, clippy -D warnings, all Rust tests, all scenarios
+cargo test --workspace      # Rust tests only
+bash scenarios/run-all.sh   # end-to-end CLI scenarios only (needs `cargo build -p borg-cli` first)
+cargo fmt
 ```
 
-`just check` must pass before any work is reported complete. Not "the tests I added pass" — all of
-it.
+**`./check.sh` must pass before any work is reported complete.** Not "the tests I added pass" — all
+of it. A `justfile` mirrors these steps for anyone who has `just`, but `check.sh` is the one that
+always works and the one to call.
 
 ## Layout
 
