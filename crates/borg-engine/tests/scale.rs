@@ -114,7 +114,7 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let storage = Arc::new(MemoryStorage::new());
         let layers = Arc::new(LayerManager::new(
             storage.clone(),
@@ -143,7 +143,7 @@ impl Harness {
             declaring_repo: RepoId(1),
         });
 
-        let branch = branches.create_root(Some("main".into()));
+        let branch = branches.create_root(Some("main".into())).await.unwrap();
         Self {
             layers,
             engine,
@@ -201,7 +201,7 @@ fn fixture(n: u64) -> Vec<(CellRef, Value)> {
 
 /// Build `n` companies, derive them, then flip the one shared school and re-derive.
 async fn measure(n: u64) -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await;
 
     let writes = fixture(n);
     let cells = writes.len();

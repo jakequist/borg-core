@@ -102,7 +102,7 @@ impl Harness {
 #[tokio::test]
 async fn a_fork_inherits_its_parents_data_without_copying_it() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(Some("main".into()));
+    let main = h.branches.create_root(Some("main".into())).await?;
     let acme = company(main, 1);
 
     let before_fork = h
@@ -115,7 +115,10 @@ async fn a_fork_inherits_its_parents_data_without_copying_it() -> Result<()> {
         )
         .await?;
 
-    let feature = h.branches.fork(main, before_fork, Some("feature".into()))?;
+    let feature = h
+        .branches
+        .fork(main, before_fork, Some("feature".into()))
+        .await?;
 
     assert_eq!(
         h.read(feature, &prop(acme, "name")).await?,
@@ -128,13 +131,13 @@ async fn a_fork_inherits_its_parents_data_without_copying_it() -> Result<()> {
 #[tokio::test]
 async fn a_child_shadows_its_parent_without_mutating_it() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(Some("main".into()));
+    let main = h.branches.create_root(Some("main".into())).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(prop(acme, "name"), Value::Int(1))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     h.push(feature, vec![(prop(acme, "name"), Value::Int(2))])
         .await?;
@@ -155,13 +158,13 @@ async fn a_child_shadows_its_parent_without_mutating_it() -> Result<()> {
 #[tokio::test]
 async fn a_write_after_the_fork_point_is_invisible_to_the_child() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(prop(acme, "name"), Value::Int(1))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     // The parent moves on. The child forked from an earlier point and must not see it.
     h.push(main, vec![(prop(acme, "name"), Value::Int(99))])
@@ -178,13 +181,13 @@ async fn a_write_after_the_fork_point_is_invisible_to_the_child() -> Result<()> 
 #[tokio::test]
 async fn a_tombstone_on_a_child_hides_an_inherited_value() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(prop(acme, "name"), Value::Int(1))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     h.push(feature, vec![(prop(acme, "name"), Value::Tombstone)])
         .await?;
@@ -205,7 +208,7 @@ async fn a_tombstone_on_a_child_hides_an_inherited_value() -> Result<()> {
 #[tokio::test]
 async fn time_travel_reaches_back_across_the_fork_point() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let first = h
@@ -214,7 +217,7 @@ async fn time_travel_reaches_back_across_the_fork_point() -> Result<()> {
     let second = h
         .push(main, vec![(prop(acme, "name"), Value::Int(2))])
         .await?;
-    let feature = h.branches.fork(main, second, None)?;
+    let feature = h.branches.fork(main, second, None).await?;
     h.push(feature, vec![(prop(acme, "name"), Value::Int(3))])
         .await?;
 
@@ -233,7 +236,7 @@ async fn time_travel_reaches_back_across_the_fork_point() -> Result<()> {
 #[tokio::test]
 async fn merging_replays_the_childs_source_layers_onto_the_parent() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -245,7 +248,7 @@ async fn merging_replays_the_childs_source_layers_onto_the_parent() -> Result<()
             ],
         )
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
     h.push(feature, vec![(prop(acme, "name"), Value::Int(2))])
         .await?;
 
@@ -271,13 +274,13 @@ async fn merging_replays_the_childs_source_layers_onto_the_parent() -> Result<()
 #[tokio::test]
 async fn merge_is_rejected_when_the_parent_deleted_what_the_child_wrote() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(existence(acme), Value::Bool(true))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     // The child edits an object the parent then deletes.
     h.push(feature, vec![(prop(acme, "name"), Value::Int(2))])
@@ -302,13 +305,13 @@ async fn merge_is_rejected_when_the_parent_deleted_what_the_child_wrote() -> Res
 #[tokio::test]
 async fn merge_skips_derived_layers() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(existence(acme), Value::Bool(true))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     h.push(feature, vec![(prop(acme, "name"), Value::Int(2))])
         .await?;

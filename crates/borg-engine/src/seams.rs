@@ -85,8 +85,14 @@ pub struct InProcessSequencer {
 
 impl InProcessSequencer {
     pub fn new() -> Self {
+        Self::resuming_after(LayerId(0))
+    }
+
+    /// Continue after the highest layer a store already holds. Layer ids are registry-unique, so
+    /// restarting the count would collide with history.
+    pub fn resuming_after(highest: LayerId) -> Self {
         Self {
-            next: std::sync::atomic::AtomicU64::new(1),
+            next: std::sync::atomic::AtomicU64::new(highest.0 + 1),
         }
     }
 }

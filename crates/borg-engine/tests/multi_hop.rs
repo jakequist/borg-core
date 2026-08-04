@@ -140,7 +140,7 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let storage = Arc::new(MemoryStorage::new());
         let index = Arc::new(MemoryDependencyIndex::new());
         let layers = Arc::new(LayerManager::new(
@@ -171,7 +171,7 @@ impl Harness {
             declaring_repo: RepoId(1),
         });
 
-        let branch = branches.create_root(Some("main".into()));
+        let branch = branches.create_root(Some("main".into())).await.unwrap();
         Self {
             layers,
             branches,
@@ -250,7 +250,7 @@ fn company_with(c: u64, reach: i64, f: u64) -> Vec<(CellRef, Value)> {
 
 #[tokio::test]
 async fn a_multi_hop_pipeline_captures_every_cell_it_traversed() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.push(vec![(
         prop("School", school(1), "is_top_ten"),
         Value::Bool(true),
@@ -291,7 +291,7 @@ async fn a_multi_hop_pipeline_captures_every_cell_it_traversed() -> Result<()> {
 
 #[tokio::test]
 async fn flipping_a_shared_upstream_recomputes_exactly_its_dependents() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.push(vec![
         (prop("School", school(1), "is_top_ten"), Value::Bool(true)),
         (prop("School", school(2), "is_top_ten"), Value::Bool(true)),
@@ -335,7 +335,7 @@ async fn flipping_a_shared_upstream_recomputes_exactly_its_dependents() -> Resul
 
 #[tokio::test]
 async fn appending_to_a_traversed_list_recomputes_the_iterator() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.push(vec![
         (prop("School", school(1), "is_top_ten"), Value::Bool(true)),
         (prop("School", school(2), "is_top_ten"), Value::Bool(true)),
@@ -366,7 +366,7 @@ async fn appending_to_a_traversed_list_recomputes_the_iterator() -> Result<()> {
 
 #[tokio::test]
 async fn an_untraversed_element_changing_recomputes_nothing() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.push(vec![(
         prop("School", school(1), "is_top_ten"),
         Value::Bool(true),
@@ -405,7 +405,7 @@ async fn an_untraversed_element_changing_recomputes_nothing() -> Result<()> {
 
 #[tokio::test]
 async fn a_hop_through_a_missing_link_still_recomputes_when_the_link_appears() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await;
     // A company whose founder has no education yet: the hop runs out partway.
     h.push(vec![
         (exists("Company", company(1)), Value::Bool(true)),
@@ -448,7 +448,7 @@ async fn a_hop_through_a_missing_link_still_recomputes_when_the_link_appears() -
 /// so the intermediate structs must never spawn invocations of their own.
 #[tokio::test]
 async fn intermediate_objects_do_not_become_pipeline_inputs() -> Result<()> {
-    let h = Harness::new();
+    let h = Harness::new().await;
     h.push(vec![(
         prop("School", school(1), "is_top_ten"),
         Value::Bool(true),

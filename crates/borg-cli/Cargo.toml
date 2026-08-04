@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The crate is borg-cli; the binary users type is `borg`.
+[[bin]]
+name = "borg"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -13,4 +18,6 @@ borg-core.workspace = true
 borg-engine.workspace = true
 borg-storage-sqlite.workspace = true
 borg-exec-native.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde.workspace = true
+serde_json.workspace = true

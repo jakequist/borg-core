@@ -11,7 +11,8 @@ pub use memory::MemoryStorage;
 
 use async_trait::async_trait;
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerId, ReadPath, Result,
+    Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Layer, LayerId,
+    ReadPath, Result,
 };
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
@@ -80,6 +81,23 @@ pub trait StorageProvider: Send + Sync {
     async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>>;
 
     async fn open_layer(&self, branch: BranchId, id: LayerId) -> Result<Box<dyn OpenLayer>>;
+
+    // --- Log structure ---
+    //
+    // Layers and branches are the shape of the log, not derived from it, so they have to be durable
+    // in their own right. Everything else the engine holds in memory — the dependency index, the
+    // touch index, watermarks — is a *cache* that can be rebuilt by replaying committed layers, so
+    // none of it appears here.
+
+    /// Record or update a layer's metadata.
+    async fn put_layer_meta(&self, layer: &Layer) -> Result<()>;
+
+    /// Every layer known to the store, in no particular order.
+    async fn read_layers(&self) -> Result<Vec<Layer>>;
+
+    async fn put_branch(&self, branch: &Branch) -> Result<()>;
+
+    async fn read_branches(&self) -> Result<Vec<Branch>>;
 
     /// Make a sealed layer visible. *This edge is what triggers dependent producers.*
     async fn commit_layer(&self, layer: SealedLayer) -> Result<()>;

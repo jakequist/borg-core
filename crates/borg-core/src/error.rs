@@ -87,6 +87,9 @@ pub enum BorgError {
     #[error("storage: {0}")]
     Storage(String),
 
+    #[error(transparent)]
+    Parse(#[from] crate::parse::ParseError),
+
     #[error("execution: {0}")]
     Execution(String),
 }

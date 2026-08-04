@@ -134,7 +134,7 @@ impl Harness {
 #[tokio::test]
 async fn the_derivation_cycle_runs_unchanged_on_sqlite() -> Result<()> {
     let h = Harness::new()?;
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     h.push(
@@ -169,7 +169,7 @@ async fn the_derivation_cycle_runs_unchanged_on_sqlite() -> Result<()> {
 #[tokio::test]
 async fn branching_and_merge_run_unchanged_on_sqlite() -> Result<()> {
     let h = Harness::new()?;
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
@@ -183,7 +183,7 @@ async fn branching_and_merge_run_unchanged_on_sqlite() -> Result<()> {
         .await?;
     h.engine.catch_up(main).await?;
 
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
     assert_eq!(
         h.read(feature, &prop(acme, "website")).await?,
         Some(Value::Int(9)),
@@ -216,7 +216,7 @@ async fn branching_and_merge_run_unchanged_on_sqlite() -> Result<()> {
 #[tokio::test]
 async fn def_events_and_provenance_survive_a_real_store() -> Result<()> {
     let h = Harness::new()?;
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
 
     h.defs
         .push(

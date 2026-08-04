@@ -10,8 +10,8 @@
 use crate::{CellStream, OpenLayer, SealedLayer, StorageProvider};
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerId, ReadPath,
-    Result,
+    BorgError, Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Layer,
+    LayerId, ReadPath, Result,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,8 @@ struct Inner {
     layer_contents: HashMap<LayerId, Vec<(CellRef, CellRecord)>>,
     /// A committed def layer's events.
     def_contents: HashMap<LayerId, Vec<DefEvent>>,
+    layer_meta: HashMap<LayerId, Layer>,
+    branches: HashMap<BranchId, Branch>,
 }
 
 struct StagedLayer {
@@ -183,6 +185,46 @@ impl StorageProvider for MemoryStorage {
             .map(Ok)
             .collect();
         Ok(Box::pin(futures_util::stream::iter(rows)))
+    }
+
+    async fn put_layer_meta(&self, layer: &Layer) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .layer_meta
+            .insert(layer.id, layer.clone());
+        Ok(())
+    }
+
+    async fn read_layers(&self) -> Result<Vec<Layer>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .layer_meta
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn put_branch(&self, branch: &Branch) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .branches
+            .insert(branch.id, branch.clone());
+        Ok(())
+    }
+
+    async fn read_branches(&self) -> Result<Vec<Branch>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .branches
+            .values()
+            .cloned()
+            .collect())
     }
 
     async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>> {

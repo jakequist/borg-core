@@ -27,6 +27,8 @@ dependencies = [
  "borg-engine",
  "borg-exec-native",
  "borg-storage-sqlite",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

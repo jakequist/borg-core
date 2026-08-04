@@ -90,6 +90,28 @@ impl LayerManager {
             .insert(branch.id, branch);
     }
 
+    /// Reinstate a layer read back from storage, without re-running the state machine.
+    pub fn restore(&self, layer: Layer) {
+        let mut state = self.state.lock().unwrap();
+        if layer.state == LayerState::Committed {
+            let head = state.heads.entry(layer.branch).or_insert(layer.id);
+            if layer.id.0 > head.0 {
+                *head = layer.id;
+            }
+        }
+        state.layers.insert(layer.id, layer);
+    }
+
+    pub fn branches(&self) -> Vec<Branch> {
+        self.state
+            .lock()
+            .unwrap()
+            .branches
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn branch(&self, id: BranchId) -> Option<Branch> {
         self.state.lock().unwrap().branches.get(&id).cloned()
     }
@@ -245,6 +267,11 @@ impl LayerManager {
         }
 
         let sealed = open.seal().await?;
+        // Metadata is written before the commit flips visibility, so a layer can never become
+        // visible without the log knowing what kind of thing it is.
+        let mut durable = layer.clone();
+        durable.state = LayerState::Committed;
+        self.storage.put_layer_meta(&durable).await?;
         self.storage.commit_layer(sealed).await?;
         self.transition(layer.id, LayerState::Sealed, LayerState::Committed)?;
         self.state

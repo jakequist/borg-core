@@ -34,8 +34,8 @@
 
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Derivation,
-    LayerId, Origin, ReadPath, Result, Value,
+    BorgError, Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent,
+    Derivation, Layer, LayerId, Origin, ReadPath, Result, Value,
 };
 use borg_storage::{CellStream, OpenLayer, SealedLayer, StorageProvider};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -58,7 +58,15 @@ PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS layers (
     id     INTEGER PRIMARY KEY,
     branch INTEGER NOT NULL,
-    state  INTEGER NOT NULL
+    state  INTEGER NOT NULL,
+    -- Kind, author and guards are the log's shape rather than its contents, and are stored whole
+    -- rather than picked apart into columns nothing queries on.
+    meta   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS branches (
+    id     INTEGER PRIMARY KEY,
+    branch TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS cells (
@@ -468,6 +476,80 @@ impl StorageProvider for SqliteStorage {
         .await?;
 
         Ok(Box::pin(futures_util::stream::iter(rows)))
+    }
+
+    async fn put_layer_meta(&self, layer: &Layer) -> Result<()> {
+        let id = layer.id.0 as i64;
+        let branch = layer.branch.0 as i64;
+        let meta = encode(layer)?;
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "INSERT INTO layers (id, branch, state, meta) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET meta = excluded.meta",
+                params![id, branch, OPEN, meta],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn read_layers(&self) -> Result<Vec<Layer>> {
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare("SELECT meta, state FROM layers WHERE meta IS NOT NULL ORDER BY id")
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql)?;
+            let mut layers = Vec::new();
+            for row in rows {
+                let (meta, state) = row.map_err(sql)?;
+                let mut layer: Layer = decode(&meta)?;
+                // The `state` column is authoritative: commit updates it without rewriting `meta`,
+                // because a commit must stay O(1).
+                layer.state = match state {
+                    COMMITTED => borg_core::LayerState::Committed,
+                    SEALED => borg_core::LayerState::Sealed,
+                    _ => borg_core::LayerState::Open,
+                };
+                layers.push(layer);
+            }
+            Ok(layers)
+        })
+        .await
+    }
+
+    async fn put_branch(&self, branch: &Branch) -> Result<()> {
+        let id = branch.id.0 as i64;
+        let encoded = encode(branch)?;
+        with_conn(&self.conn, move |conn| {
+            conn.execute(
+                "INSERT INTO branches (id, branch) VALUES (?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET branch = excluded.branch",
+                params![id, encoded],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn read_branches(&self) -> Result<Vec<Branch>> {
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn.prepare("SELECT branch FROM branches").map_err(sql)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sql)?;
+            let mut branches = Vec::new();
+            for row in rows {
+                branches.push(decode::<Branch>(&row.map_err(sql)?)?);
+            }
+            Ok(branches)
+        })
+        .await
     }
 
     async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>> {

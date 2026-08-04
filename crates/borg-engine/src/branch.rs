@@ -25,27 +25,65 @@ pub struct BranchManager {
 
 impl BranchManager {
     pub fn new(layers: Arc<LayerManager>) -> Self {
+        Self::resuming(layers, 1)
+    }
+
+    /// Resume id allocation after reopening a store, so a second process cannot mint a branch id
+    /// that already exists.
+    pub fn resuming(layers: Arc<LayerManager>, next_id: u64) -> Self {
         let storage = layers.storage();
+        let next = layers
+            .branches()
+            .iter()
+            .map(|b| b.id.0 + 1)
+            .chain(std::iter::once(next_id))
+            .max()
+            .unwrap_or(1);
         Self {
             layers,
             storage,
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(next),
         }
     }
 
+    /// Branches with no origin — the roots of the tree.
+    pub fn roots(&self) -> Vec<BranchId> {
+        self.layers
+            .branches()
+            .into_iter()
+            .filter(|b| b.origin.is_none())
+            .map(|b| b.id)
+            .collect()
+    }
+
+    pub fn all(&self) -> Vec<Branch> {
+        self.layers.branches()
+    }
+
+    async fn persist(&self, branch: &Branch) -> Result<()> {
+        self.layers.register_branch(branch.clone());
+        self.storage.put_branch(branch).await
+    }
+
     /// The root of the tree: a branch with no origin.
-    pub fn create_root(&self, name: Option<String>) -> BranchId {
+    pub async fn create_root(&self, name: Option<String>) -> Result<BranchId> {
         let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.layers.register_branch(Branch {
+        self.persist(&Branch {
             id,
             name,
             origin: None,
-        });
-        id
+        })
+        .await?;
+        Ok(id)
     }
 
     /// Fork at a layer. O(1) — nothing is copied.
-    pub fn fork(&self, parent: BranchId, at: LayerId, name: Option<String>) -> Result<BranchId> {
+    pub async fn fork(
+        &self,
+        parent: BranchId,
+        at: LayerId,
+        name: Option<String>,
+    ) -> Result<BranchId> {
         let layer = self
             .layers
             .layer(at)
@@ -57,11 +95,12 @@ impl BranchManager {
             });
         }
         let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.layers.register_branch(Branch {
+        self.persist(&Branch {
             id,
             name,
             origin: Some(at),
-        });
+        })
+        .await?;
         Ok(id)
     }
 

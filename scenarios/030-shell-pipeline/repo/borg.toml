@@ -1,0 +1,8 @@
+# A repo is a directory. `borg repo push` reads this, asks each pipeline to describe itself, and
+# emits the resulting def events.
+[repo]
+id = 1
+name = "investing"
+
+[[pipelines]]
+command = "pipelines/is_investible.sh"

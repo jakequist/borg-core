@@ -130,7 +130,7 @@ impl Harness {
 #[tokio::test]
 async fn a_transaction_commits_when_its_guard_holds() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let base = h
@@ -158,7 +158,7 @@ async fn a_transaction_commits_when_its_guard_holds() -> Result<()> {
 #[tokio::test]
 async fn a_transaction_is_rejected_when_a_guarded_cell_moved() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let base = h
@@ -191,7 +191,7 @@ async fn a_transaction_is_rejected_when_a_guarded_cell_moved() -> Result<()> {
 #[tokio::test]
 async fn a_guard_ignores_cells_it_does_not_name() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let base = h
@@ -222,7 +222,7 @@ async fn a_guard_ignores_cells_it_does_not_name() -> Result<()> {
 #[tokio::test]
 async fn a_guard_on_a_derived_cell_is_rejected() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let base = h
@@ -255,13 +255,13 @@ async fn a_guard_on_a_derived_cell_is_rejected() -> Result<()> {
 #[tokio::test]
 async fn a_childs_guard_re_evaluated_against_the_parent_detects_a_merge_conflict() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(prop(acme, "balance"), Value::Int(100))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     // On the child, the guard holds: nothing on the child touched `balance` since the fork.
     h.push_guarded(
@@ -295,13 +295,13 @@ async fn a_childs_guard_re_evaluated_against_the_parent_detects_a_merge_conflict
 #[tokio::test]
 async fn an_unguarded_merge_is_last_write_wins() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(prop(acme, "balance"), Value::Int(100))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     h.push(feature, vec![(prop(acme, "balance"), Value::Int(90))])
         .await?;
@@ -322,13 +322,13 @@ async fn an_unguarded_merge_is_last_write_wins() -> Result<()> {
 #[tokio::test]
 async fn a_guard_the_parent_did_not_disturb_still_merges() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let acme = company(main, 1);
 
     let fork_point = h
         .push(main, vec![(prop(acme, "balance"), Value::Int(100))])
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     h.push_guarded(
         feature,

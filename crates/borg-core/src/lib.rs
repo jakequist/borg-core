@@ -11,6 +11,7 @@ pub mod error;
 pub mod freshness;
 pub mod ids;
 pub mod layer;
+pub mod parse;
 pub mod pid;
 pub mod value;
 
@@ -20,5 +21,6 @@ pub use error::{BorgError, MergeRejection, Result};
 pub use freshness::{Freshness, FreshnessRequirement, Resolved, Watermark};
 pub use ids::{AllocatorId, BranchId, ClientVersion, LayerId, ProducerId, RepoId};
 pub use layer::{Branch, Guard, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
+pub use parse::ParseError;
 pub use pid::{Pid, PidAllocator, PidKind};
 pub use value::{ObjectTypeName, Value, ValueType};

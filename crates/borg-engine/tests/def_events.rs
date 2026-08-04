@@ -66,7 +66,7 @@ fn declare(repo: RepoId, struct_name: &str, field: &str, ty: ValueType) -> DefEv
 #[tokio::test]
 async fn a_declared_field_becomes_visible_in_the_def() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
 
     h.push(
         main,
@@ -84,7 +84,7 @@ async fn a_declared_field_becomes_visible_in_the_def() -> Result<()> {
 #[tokio::test]
 async fn two_repos_extend_one_struct_with_no_explicit_extends() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
 
     h.push(
         main,
@@ -114,7 +114,7 @@ async fn two_repos_extend_one_struct_with_no_explicit_extends() -> Result<()> {
 #[tokio::test]
 async fn two_repos_declaring_the_same_field_is_a_hard_error() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
 
     h.push(
         main,
@@ -143,7 +143,7 @@ async fn two_repos_declaring_the_same_field_is_a_hard_error() -> Result<()> {
 #[tokio::test]
 async fn a_repo_may_not_mutate_a_field_it_did_not_declare() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
 
     h.push(
         main,
@@ -175,14 +175,14 @@ async fn a_repo_may_not_mutate_a_field_it_did_not_declare() -> Result<()> {
 #[tokio::test]
 async fn a_def_pushed_on_a_child_is_invisible_to_the_parent() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let fork_point = h
         .push(
             main,
             vec![declare(SALES, "Company", "name", ValueType::String)],
         )
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     h.push(
         feature,
@@ -206,14 +206,14 @@ async fn a_def_pushed_on_a_child_is_invisible_to_the_parent() -> Result<()> {
 #[tokio::test]
 async fn a_def_only_merge_lands_the_childs_defs_on_the_parent() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let fork_point = h
         .push(
             main,
             vec![declare(SALES, "Company", "name", ValueType::String)],
         )
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     h.push(
         feature,
@@ -234,14 +234,14 @@ async fn a_def_only_merge_lands_the_childs_defs_on_the_parent() -> Result<()> {
 #[tokio::test]
 async fn merge_is_rejected_when_both_branches_moved_the_same_def() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     let fork_point = h
         .push(
             main,
             vec![declare(SALES, "Company", "score", ValueType::Int)],
         )
         .await?;
-    let feature = h.branches.fork(main, fork_point, None)?;
+    let feature = h.branches.fork(main, fork_point, None).await?;
 
     // Both sides change the same field's type.
     h.push(
@@ -286,7 +286,7 @@ async fn merge_is_rejected_when_both_branches_moved_the_same_def() -> Result<()>
 #[tokio::test]
 async fn a_def_mutation_records_a_migration_step() -> Result<()> {
     let h = Harness::new();
-    let main = h.branches.create_root(None);
+    let main = h.branches.create_root(None).await?;
     h.push(
         main,
         vec![declare(SALES, "Company", "score", ValueType::Int)],
