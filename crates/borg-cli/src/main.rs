@@ -18,13 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(0);
-/// Everything the CLI writes is authored against the store's initial def-view. Real clients carry
-/// the layer their generated code was built from (§5.4); the CLI has no generated code yet.
-const CLIENT_VERSION: ClientVersion = ClientVersion(LayerId(1));
 
 struct Args {
     store: PathBuf,
     branch: Option<String>,
+    /// `--client-version`. See [`client_version`].
+    version: Option<LayerId>,
     value_only: bool,
     count_only: bool,
     rest: Vec<String>,
@@ -47,6 +46,7 @@ borg — an event-sourced data backend
 
   borg def push <file.json>            push definition mutations
   borg def show <Struct>               show a struct's definition
+  borg def version                     the branch's current def-version
 
   borg repo push <dir>                 push a repo: defs and pipelines
   borg producer list                   registered producers
@@ -68,11 +68,18 @@ Every write is checked against the definitions on the branch: the struct must be
 field must be declared, the value must fit, and a field declared derived may be written only by
 the producer that owns it. Declare a schema with `borg def push` or `borg repo push` first.
 
+Every actor carries a ClientVersion — the def-layer its view was built from (§5.4). borg's is the
+branch's current def-version, as printed by `borg def version`: the CLI has no generated code, so
+each invocation is authored against the schema as it stands. `--client-version` pins an older one,
+which is how you act as a client written before a schema change: it writes the old shape and reads
+values back through the migrations that lead to its version.
+
 Options:
-  --store <path>   store file (default ./borg.db)
-  --branch <name>  branch to operate on (default: the root branch)
-  --value          print only the value
-  --count          print only a count"
+  --store <path>            store file (default ./borg.db)
+  --branch <name>           branch to operate on (default: the root branch)
+  --client-version <layer>  act as a client authored against this def-layer
+  --value                   print only the value
+  --count                   print only a count"
     );
     std::process::exit(2)
 }
@@ -81,6 +88,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         store: PathBuf::from("borg.db"),
         branch: None,
+        version: None,
         value_only: false,
         count_only: false,
         rest: Vec::new(),
@@ -90,6 +98,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--store" => args.store = raw.next().unwrap_or_else(|| usage()).into(),
             "--branch" => args.branch = raw.next(),
+            "--client-version" => args.version = raw.next().as_deref().map(layer_id),
             "--value" => args.value_only = true,
             "--count" => args.count_only = true,
             "-h" | "--help" => usage(),
@@ -126,6 +135,39 @@ fn allocation_branch(registry: &Registry) -> Result<BranchId> {
         .ok_or_else(|| BorgError::Storage("store has no branches — run `borg init`".into()))
 }
 
+/// A layer id as written by `borg layer head` — `L7` — or bare.
+fn layer_id(text: &str) -> LayerId {
+    LayerId(
+        text.trim_start_matches('L')
+            .parse::<u64>()
+            .unwrap_or_else(|_| usage()),
+    )
+}
+
+/// The ClientVersion this invocation acts at. SPEC.md §5.4.
+///
+/// **The branch's current def-version, unless pinned.** Every actor that executes code carries the
+/// def-layer its code was authored against; the CLI has no generated code, so each invocation is
+/// authored *now*, against the schema as it stands — a client that regenerates itself every time it
+/// runs. Nothing is recorded beside the store, because there would be nothing true to record: a
+/// remembered version would go stale the moment someone else pushed a def, and one recorded per
+/// branch would still be wrong for a branch it was never synced on.
+///
+/// `--client-version` is how an *older* client is spelled, and it has to exist: §5.4's whole claim
+/// is that a v1 client keeps reading and writing after the schema moves to v5, and until generated
+/// SDKs arrive (§18) there is otherwise no way to have a v1 client at all.
+async fn client_version(
+    registry: &Registry,
+    args: &Args,
+    branch: BranchId,
+) -> Result<ClientVersion> {
+    if let Some(pinned) = args.version {
+        return Ok(ClientVersion(pinned));
+    }
+    let path = registry.branches.read_path(branch, None)?;
+    Ok(ClientVersion(registry.defs.head(&path)))
+}
+
 /// Resolve `--branch`, falling back to the root. This selects the *timeline*, which is a separate
 /// question from which object a shorthand names.
 fn branch_of(registry: &Registry, name: Option<&str>) -> Result<BranchId> {
@@ -158,6 +200,7 @@ async fn run(args: Args) -> Result<()> {
         ("branch", ["merge", child, tail @ ..]) => branch_merge(&args, child, tail).await,
         ("def", ["push", file]) => def_push(&args, file).await,
         ("def", ["show", name]) => def_show(&args, name).await,
+        ("def", ["version"]) => def_version(&args).await,
         ("layer", ["list"]) => layer_list(&args).await,
         ("layer", ["head"]) => layer_head(&args).await,
         ("repo", ["push", dir]) => repo_push(&args, dir).await,
@@ -192,8 +235,9 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
 
+    let version = client_version(&registry, args, branch).await?;
     let mut session = registry
-        .begin_write(branch, CLIENT_VERSION, Writer::Client)
+        .begin_write(branch, version, Writer::Client)
         .await?;
     if let Err(rejection) = session.set_text(&cell, value).await {
         // A rejected write leaves no trace, so the layer it would have landed in never commits.
@@ -215,7 +259,7 @@ async fn get(args: &Args, cell: &str) -> Result<()> {
             branch,
             &cell,
             None,
-            CLIENT_VERSION,
+            client_version(&registry, args, branch).await?,
             FreshnessRequirement::Validated,
         )
         .await?;
@@ -280,9 +324,10 @@ async fn explain(args: &Args, cell: &str) -> Result<()> {
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
 
+    let version = client_version(&registry, args, branch).await?;
     let Some(lineage) = registry
         .resolver
-        .explain(branch, &cell, None, CLIENT_VERSION)
+        .explain(branch, &cell, None, version)
         .await?
     else {
         println!("{cell}: nothing stored");
@@ -492,6 +537,16 @@ async fn def_show(args: &Args, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The def-version in force on this branch — the ClientVersion a client generated right now would
+/// carry (SPEC.md §5.3, §5.4). A def-version *is* a layer id; there is no separate scheme.
+async fn def_version(args: &Args) -> Result<()> {
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let path = registry.branches.read_path(branch, None)?;
+    println!("{}", registry.defs.head(&path));
+    Ok(())
+}
+
 async fn layer_list(args: &Args) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
@@ -636,50 +691,130 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                 id,
                 kind: borg_core::ProducerKind::Pipeline,
                 source: borg_core::BufferId::Object(spec.source.as_str().into()),
-                version: LayerId(1),
+                version: LayerId(0),
                 declaring_repo: repo,
             }));
-            impls.producers.retain(|p| p.id != id.0);
-            impls.producers.push(Implementation {
-                id: id.0,
-                name: spec.name.clone(),
-                source: spec.source.clone(),
-                command: command.canonicalize().unwrap_or_else(|_| command.clone()),
-            });
+            remember(&mut impls, id, &spec.name, &spec.source, command);
             println!("{} -> {id}", spec.name);
         }
     }
 
     let known: Vec<&str> = described
         .iter()
-        .flat_map(|(_, d)| d.producers.iter().map(|p| p.name.as_str()))
+        .flat_map(|(_, d)| {
+            let pipelines = d.producers.iter().map(|p| p.name.as_str());
+            pipelines.chain(d.migrations.iter().map(|m| m.name.as_str()))
+        })
         .collect();
+    let resolve = |owner: &str, what: &str| -> Result<ProducerId> {
+        if known.contains(&owner) {
+            return Ok(ProducerId(borg_protocol::producer_id(owner)));
+        }
+        Err(BorgError::Storage(format!(
+            "{what} names `{owner}`, which this repo does not implement (it implements: {})",
+            known.join(", ")
+        )))
+    };
+
+    // The definitions this push is a *diff against*. A repo emits its whole schema every time
+    // (§5.2), so what it means by a field depends on what is already declared: nothing yet is a
+    // declaration, a different type is a mutation, the same type is a repeat.
+    let path = registry.branches.read_path(branch, None)?;
+    let view = registry.defs.view(&path).await?;
+
     for (_, description) in &described {
         for spec in &description.structs {
+            let struct_name: ObjectTypeName = spec.name.as_str().into();
             for field in &spec.fields {
-                let owner = match &field.derived_by {
-                    // A field owned by a producer this repo does not implement would be a field
-                    // nothing can ever write. Caught here rather than at the first write attempt.
-                    Some(name) if !known.contains(&name.as_str()) => {
-                        return Err(BorgError::Storage(format!(
-                            "{}.{} is declared derived by `{name}`, which this repo does not \
-                             implement (it implements: {})",
-                            spec.name,
-                            field.name,
-                            known.join(", ")
-                        )));
+                let ty = value_type(&field.ty);
+                let what = format!("{}.{}", spec.name, field.name);
+
+                // A migration's definition names the field buffer it maps over (§9.3) and its
+                // direction; which two versions it bridges is folded from the `MutateField` below,
+                // on whichever branch that event ends up on.
+                let source = borg_core::BufferId::ObjectProp(
+                    struct_name.clone(),
+                    field.name.as_str().into(),
+                );
+                let mut migration =
+                    |name: &Option<String>, direction| -> Result<Option<ProducerId>> {
+                        let Some(name) = name else { return Ok(None) };
+                        let id = resolve(name, &what)?;
+                        events.push(DefEvent::PushProducer(borg_core::ProducerDef {
+                            id,
+                            kind: borg_core::ProducerKind::Migration { direction },
+                            source: source.clone(),
+                            version: LayerId(0),
+                            declaring_repo: repo,
+                        }));
+                        let command = described
+                            .iter()
+                            .find(|(_, d)| d.migrations.iter().any(|m| m.name == *name))
+                            .map(|(command, _)| command.clone())
+                            .expect("resolve() accepted the name, so some script described it");
+                        remember(&mut impls, id, name, &spec.name, &command);
+                        Ok(Some(id))
+                    };
+                let up = migration(&field.up, borg_core::MigrationDirection::Up)?;
+                let down = migration(&field.down, borg_core::MigrationDirection::Down)?;
+
+                let name: borg_core::FieldName = field.name.as_str().into();
+                let declared = view
+                    .object(&struct_name)
+                    .and_then(|object| object.fields.get(&name));
+                match declared {
+                    // The type moved. §6.1 says that needs migrations, and the field is where they
+                    // are named — a repo cannot say "mutate from String" because it does not know
+                    // what it is mutating from, and on another branch the answer differs.
+                    Some(existing) if existing.ty != ty => {
+                        let Some(up) = up else {
+                            return Err(BorgError::Storage(format!(
+                                "{what} changes from {} to {ty}, which needs an `up` migration to \
+                                 carry the existing values forward",
+                                existing.ty
+                            )));
+                        };
+                        events.push(DefEvent::MutateField {
+                            struct_name: struct_name.clone(),
+                            field: field.name.as_str().into(),
+                            ty,
+                            repo,
+                            up,
+                            down,
+                        });
+                        println!("{what} {} -> {}", existing.ty, field.ty);
                     }
-                    Some(name) => Some(ProducerId(borg_protocol::producer_id(name))),
-                    None => None,
-                };
-                events.push(DefEvent::DeclareField {
-                    struct_name: spec.name.as_str().into(),
-                    field: field.name.as_str().into(),
-                    ty: value_type(&field.ty),
-                    repo,
-                    ownership: ownership(owner),
-                });
-                println!("{}.{} {}", spec.name, field.name, field.ty);
+                    _ => {
+                        let owner = match &field.derived_by {
+                            // A field owned by a producer this repo does not implement would be a
+                            // field nothing can ever write. Caught here rather than at the first
+                            // write attempt.
+                            Some(name) => Some(resolve(name, &what)?),
+                            None => None,
+                        };
+                        events.push(DefEvent::DeclareField {
+                            struct_name: struct_name.clone(),
+                            field: field.name.as_str().into(),
+                            ty,
+                            repo,
+                            ownership: ownership(owner),
+                        });
+                        println!("{what} {}", field.ty);
+                    }
+                }
+            }
+        }
+    }
+
+    // A migration nothing names bridges nothing. It would be registered, implemented and never
+    // reachable, which is worth a push-time error rather than a puzzle later.
+    for (_, description) in &described {
+        for spec in &description.migrations {
+            if !impls.producers.iter().any(|p| p.name == spec.name) {
+                return Err(BorgError::Storage(format!(
+                    "`{}` is implemented but no field names it as its `up` or `down`",
+                    spec.name
+                )));
             }
         }
     }
@@ -688,6 +823,23 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
         registry.defs.push(branch, events).await?;
     }
     save_impls(args, &impls)
+}
+
+/// Record where a producer's code lives. Producer ids are stable across pushes, so this replaces
+/// rather than accumulates.
+fn remember(impls: &mut Implementations, id: ProducerId, name: &str, source: &str, command: &Path) {
+    impls.producers.retain(|p| p.id != id.0);
+    impls.producers.push(Implementation {
+        id: id.0,
+        name: name.to_string(),
+        // The struct a worker is invoked over. A migration maps over one of its *fields* (§9.3), but
+        // what it is handed is still the entity — `Company:o-1234abcd`, to which it appends the
+        // field name — so the struct is what this needs to render.
+        source: source.to_string(),
+        command: command
+            .canonicalize()
+            .unwrap_or_else(|_| command.to_path_buf()),
+    });
 }
 
 /// Read the repo id out of `borg.toml`.

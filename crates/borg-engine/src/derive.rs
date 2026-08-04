@@ -7,6 +7,7 @@
 //! The scheduler is **stateless**. Work is derived from the gap between a producer's watermark and
 //! the branch head, rather than queued, which bounds memory and makes crash recovery free.
 
+use crate::defs::DefView;
 use crate::index::{DependencyIndexProvider, Invocation};
 use crate::log::LayerManager;
 use crate::resolve::FrontierTracker;
@@ -16,7 +17,7 @@ use crate::write::WriteSession;
 use async_trait::async_trait;
 use borg_core::{
     BorgError, BranchId, CellAt, CellRef, ClientVersion, Derivation, LayerAuthor, LayerId, Pid,
-    ProducerDef, ProducerId, ProducerKind, ReadPath, Result, Value, ValueInput, Writer,
+    ProducerDef, ProducerId, ReadPath, Result, Value, ValueInput, Writer,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_storage::StorageProvider;
@@ -46,8 +47,12 @@ struct RecordingCtx<'a> {
     reflects: LayerId,
     producer: ProducerId,
     /// The def-view this producer's code was authored against. Reads resolve here and writes are
-    /// labelled with it.
+    /// labelled with it. For a migration it is the version it *produces*: a migration is the lens
+    /// for its output version and sees the rest of the world as a client on that version does.
     version: ClientVersion,
+    /// The version this producer takes its input at. Equal to `version` for a pipeline; for a
+    /// migration it is the other end of the step it bridges (SPEC.md §9.3).
+    input_version: ClientVersion,
     /// Output goes through the same validated write path as everything else, so a producer writing
     /// a field it does not own is rejected against the *declaration* rather than against whatever
     /// happened to write there first (SPEC.md §8).
@@ -75,6 +80,11 @@ impl ProducerCtx for RecordingCtx<'_> {
         }
         let record = self.storage.get_cell(&self.path, cell, version).await?;
         Ok(record.map(|r| r.value))
+    }
+
+    async fn get_input(&mut self, cell: &CellRef) -> Result<Option<Value>> {
+        let version = self.input_version;
+        self.get_at(cell, version).await
     }
 
     async fn set(&mut self, cell: &CellRef, value: Value) -> Result<()> {
@@ -231,6 +241,13 @@ impl DerivationEngine {
     /// layer. The watermark advances only once this settles — which is precisely what makes the
     /// watermark mean *"replay the world at this layer and you get exactly this."*
     async fn settle(&self, branch: BranchId, source_layer: LayerId) -> Result<usize> {
+        // Folded once per round. Definitions cannot move inside one: a layer holds value events xor
+        // def events (§6.2) and derivation only ever commits value layers.
+        let defs = self
+            .defs
+            .view(&self.branches.read_path(branch, None)?)
+            .await?;
+
         let mut executed = 0;
         let mut frontier_of_change = vec![source_layer];
         // Everything committed so far as a consequence of this source layer. Producers read here, so
@@ -240,6 +257,8 @@ impl DerivationEngine {
         // Scoped to this round: a cycle is an invocation that keeps re-running while the branch head
         // is otherwise fixed (SPEC.md §16.5).
         let mut reruns: HashMap<Invocation, u32> = HashMap::new();
+        // Producers already given their whole source buffer as work in this round — see `backfill`.
+        let mut seeded: std::collections::HashSet<ProducerId> = std::collections::HashSet::new();
 
         while let Some(layer) = frontier_of_change.pop() {
             let cells = self.cells_of(layer).await?;
@@ -254,11 +273,27 @@ impl DerivationEngine {
                 if self.frontier.watermark(branch, def.id).0 >= source_layer.0 {
                     continue;
                 }
-                // Migrations materialize only for versions that have live clients (SPEC.md §5.5).
-                if !self.is_materialized_version(&def) {
+                // A migration whose step this branch does not record has nothing to bridge here —
+                // running it would write at whatever version its own definition happened to mention,
+                // which is precisely the coupling `migration_role` exists to remove.
+                if matches!(def.kind, borg_core::ProducerKind::Migration { .. })
+                    && defs.migration_role(&def).is_none()
+                {
                     continue;
                 }
-                for invocation in self.invalidated_by(branch, &cells, &def)? {
+                // Migrations materialize only for versions that have live clients (SPEC.md §5.5).
+                if !self.is_materialized_version(&defs, &def) {
+                    continue;
+                }
+                let mut work = self.invalidated_by(branch, &cells, &def, &defs)?;
+                if seeded.insert(def.id) {
+                    for invocation in self.backfill(branch, &def, &defs, ceiling).await? {
+                        if !work.contains(&invocation) {
+                            work.push(invocation);
+                        }
+                    }
+                }
+                for invocation in work {
                     let runs = reruns.entry(invocation.clone()).or_insert(0);
                     *runs += 1;
                     if *runs > CYCLE_RERUN_LIMIT {
@@ -274,7 +309,7 @@ impl DerivationEngine {
                     }
 
                     match self
-                        .run(branch, &def, invocation.input, source_layer, ceiling)
+                        .run(branch, &def, &defs, invocation.input, source_layer, ceiling)
                         .await
                     {
                         Ok(derived) => {
@@ -313,12 +348,72 @@ impl DerivationEngine {
     }
 
     /// Whether this producer's output is worth materializing. SPEC.md §5.5.
-    fn is_materialized_version(&self, def: &ProducerDef) -> bool {
-        let ProducerKind::Migration { to, .. } = def.kind else {
+    fn is_materialized_version(&self, defs: &DefView, def: &ProducerDef) -> bool {
+        let Some(role) = defs.migration_role(def) else {
             return true;
         };
         let live = self.defs.live_versions();
-        live.is_empty() || live.contains(&ClientVersion(to))
+        live.is_empty() || live.contains(&role.output)
+    }
+
+    /// The whole of a producer's source buffer, as work, for a producer that has never run here.
+    ///
+    /// A committed layer is the changeset (§9.6), which answers "what moved" perfectly and "what was
+    /// already there" not at all. That gap opens the moment a producer is *newer than the data*:
+    /// a migration pushed on a fork owes the parent's inherited values, and none of those values
+    /// were written in a layer belonging to this branch. §9.6 reserves buffer enumeration for exactly
+    /// this — discovering entities the layer stream cannot mention.
+    ///
+    /// Bounded by the round's ceiling and read through the branch's ancestry, so a fork enumerates
+    /// what it can see rather than what it wrote.
+    ///
+    /// A migration's source is not a buffer but **one version of one field** (§9.3), and a buffer
+    /// scan cannot express that, so the candidates are filtered afterwards. Both halves of the filter
+    /// matter. Requiring a value at the input version keeps a migration from being invoked over
+    /// entities it has nothing to say about; requiring that value not to have come from the other
+    /// half of its own step is what makes the round *order-independent* — `up` and `down` seed in
+    /// whichever order the engine happens to walk its producers, and `down` backfilling over the
+    /// value `up` had just derived would overwrite the source value `up` derived it from.
+    async fn backfill(
+        &self,
+        branch: BranchId,
+        def: &ProducerDef,
+        defs: &DefView,
+        ceiling: LayerId,
+    ) -> Result<Vec<Invocation>> {
+        if self.frontier.watermark(branch, def.id) != LayerId(0) {
+            return Ok(Vec::new());
+        }
+        let role = defs.migration_role(def);
+        let path = self.branches.read_path(branch, Some(ceiling))?;
+        let mut stream = self.storage.scan_buffer(&path, &def.source).await?;
+        let mut candidates = Vec::new();
+        while let Some(row) = stream.next().await {
+            let (cell, _) = row?;
+            if !candidates.contains(&cell) {
+                candidates.push(cell);
+            }
+        }
+
+        let mut found = Vec::new();
+        for cell in candidates {
+            if let Some(role) = &role {
+                let record = self.storage.get_cell(&path, &cell, role.input).await?;
+                let usable = record.is_some_and(|record| {
+                    record
+                        .derivation
+                        .is_none_or(|by| !role.step.contains(&by.producer))
+                });
+                if !usable {
+                    continue;
+                }
+            }
+            found.push(Invocation {
+                producer: def.id,
+                input: *cell.pid(),
+            });
+        }
+        Ok(found)
     }
 
     fn producer_defs(&self) -> Vec<ProducerDef> {
@@ -331,11 +426,29 @@ impl DerivationEngine {
         branch: BranchId,
         cells: &[(CellAt, Option<ProducerId>)],
         def: &ProducerDef,
+        defs: &DefView,
     ) -> Result<Vec<Invocation>> {
-        // (a) cell writes -> existing invocations that read those cells go dirty. Deliberately *not*
-        // filtered by author: a producer disturbing a cell it reads is exactly a cycle, and must be
-        // caught rather than hidden.
-        let written: Vec<CellAt> = cells.iter().map(|(cell, _)| cell.clone()).collect();
+        let role = defs.migration_role(def);
+        // **A migration is not triggered by the other half of its own step.** `up` and `down` are two
+        // projections of one value: each writes into the buffer the other reads from, at exactly the
+        // version the other reads it at, so left unfiltered they chase each other until the cycle
+        // detector fires (§16.6) on a configuration that is not a cycle but the normal case. This
+        // covers a producer's own output too, which is the same statement with a one-element step.
+        //
+        // It filters *both* trigger paths, including the read-set one. §9.3's rule that the read-set
+        // trigger is never filtered by author exists so that a producer disturbing a cell it reads is
+        // caught; a migration re-expressing its own input in the other direction is not that.
+        let peer = |by: &Option<ProducerId>| match (by, &role) {
+            (Some(by), Some(role)) => role.step.contains(by),
+            _ => false,
+        };
+
+        // (a) cell writes -> existing invocations that read those cells go dirty.
+        let written: Vec<CellAt> = cells
+            .iter()
+            .filter(|(_, by)| !peer(by))
+            .map(|(cell, _)| cell.clone())
+            .collect();
         // A set, because a large source layer can name a large number of new entities and a
         // membership scan per candidate would be quadratic in the layer's size.
         let mut invocations: std::collections::HashSet<Invocation> = self
@@ -347,19 +460,23 @@ impl DerivationEngine {
 
         // (b) writes into this producer's source buffer -> new invocations.
         //
-        // Skipping this producer's own output matters: a migration writes `C@v9` into the very
-        // buffer it consumes `C@v1` from, and would otherwise re-trigger itself forever. Its own
-        // output appearing in its source buffer is not a new entity.
+        // For a migration the buffer is not enough: it consumes one *version* of a field and
+        // produces another, so a write at any other version — including the one it writes — is
+        // somebody else's business (§9.3).
         for (cell, by) in cells {
-            if *by == Some(def.id) {
+            if peer(by) || *by == Some(def.id) {
                 continue;
             }
-            if cell.cell.buffer == def.source {
-                invocations.insert(Invocation {
-                    producer: def.id,
-                    input: *cell.cell.pid(),
-                });
+            if cell.cell.buffer != def.source {
+                continue;
             }
+            if role.as_ref().is_some_and(|role| cell.version != role.input) {
+                continue;
+            }
+            invocations.insert(Invocation {
+                producer: def.id,
+                input: *cell.cell.pid(),
+            });
         }
         Ok(invocations.into_iter().collect())
     }
@@ -369,20 +486,26 @@ impl DerivationEngine {
         &self,
         branch: BranchId,
         def: &ProducerDef,
+        defs: &DefView,
         input: Pid,
         reflects: LayerId,
         read_at: LayerId,
     ) -> Result<LayerId> {
-        // A migration's ClientVersion is the def-layer that introduced its target: it reads the
-        // world at the target view and writes the target version. Its own source cell is the one
-        // exception, reached through `ProducerCtx::get_at` (SPEC.md §9.3).
-        let version = match def.kind {
-            ProducerKind::Migration { to, .. } => ClientVersion(to),
-            ProducerKind::Pipeline => ClientVersion(def.version),
+        // A migration's ClientVersion is the version it produces: it reads the world at that view
+        // and writes that version. Its own source cell is the one exception, reached through
+        // `ProducerCtx::get_input` (SPEC.md §9.3). Which two versions those are is a fact about the
+        // branch's version chain, not about the producer's definition — see `migration_role`.
+        let (version, input_version) = match defs.migration_role(def) {
+            Some(role) => (role.output, role.input),
+            None => {
+                let version = ClientVersion(def.version);
+                (version, version)
+            }
         };
         // This round's ceiling — the source layer plus every derived layer already committed as a
-        // consequence of it — bounds both the def-view the writes are checked against and the
-        // ancestry the reads resolve through. Distinct from `reflects` on purpose (SPEC.md §16.5).
+        // consequence of it — bounds the ancestry the reads resolve through. Distinct from
+        // `reflects` on purpose (SPEC.md §16.5), and deliberately *not* applied to the def-view the
+        // writes are checked against: see `WriteSession`.
         let session = WriteSession::open(
             &self.layers,
             &self.defs,
@@ -408,6 +531,7 @@ impl DerivationEngine {
             reflects,
             producer: def.id,
             version,
+            input_version,
             session,
             read_set: Vec::new(),
             write_set: Vec::new(),

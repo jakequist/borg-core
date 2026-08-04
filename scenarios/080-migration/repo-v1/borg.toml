@@ -1,0 +1,5 @@
+# A repo of pure schema. §17.4 says both halves of a `describe` default to empty, so a repo that
+# contributes only definitions is as legitimate as one that contributes only code.
+[repo]
+id = 1
+name = "companies"

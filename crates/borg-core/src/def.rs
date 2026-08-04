@@ -87,6 +87,12 @@ pub struct ProducerDef {
     /// §4.2). v1 producers are per-entity maps: one invocation per entity (SPEC.md §9.2).
     pub source: BufferId,
     /// The def-view this producer's code was authored against. All of its reads resolve here.
+    ///
+    /// **Stamped by the fold, not by the author.** A producer's ClientVersion *is* the def-layer it
+    /// was pushed at (SPEC.md §9.2), and that layer id does not exist until the layer opens — nor is
+    /// it the same id after a merge replays the event onto another branch. Whatever an event carries
+    /// here is therefore overwritten by [`DefView`](crate::DefEvent) as it folds, and only migrations
+    /// ignore it entirely (see [`ProducerKind::Migration`]).
     pub version: LayerId,
     pub declaring_repo: RepoId,
 }
@@ -98,11 +104,15 @@ pub enum ProducerKind {
     Pipeline,
     /// Triggered by a def-mutation. Produces the same cell at a different def-version, as a set of
     /// per-output-field functions rather than a whole-object transform (SPEC.md §9.3).
-    Migration {
-        from: LayerId,
-        to: LayerId,
-        direction: MigrationDirection,
-    },
+    ///
+    /// **Which two versions it bridges is deliberately not recorded here.** It is a fact about the
+    /// field's version chain (SPEC.md §5.3), which is folded per branch from the `MutateField` that
+    /// named this producer as `up` or `down`. Baking the pair into the definition would freeze the
+    /// layer ids of the branch it was pushed on, and a def-only merge replays that event onto the
+    /// parent as a *different* layer — leaving a migration writing at a version no reader on that
+    /// branch will ever ask for. Direction is the one half the author declares; the log supplies the
+    /// rest.
+    Migration { direction: MigrationDirection },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

@@ -11,7 +11,8 @@ use crate::log::LayerManager;
 use borg_core::{
     BorgError, BranchId, BufferId, CellRef, ClientVersion, DefEvent, FieldDef, FieldName,
     LayerAuthor, LayerId, LayerKind, MigrationDirection, ObjectDef, ObjectTypeName, Ownership,
-    ProducerDef, ProducerId, ReadPath, Result, Value, ValueType, WriteRejection, Writer,
+    ProducerDef, ProducerId, ProducerKind, ReadPath, Result, Value, ValueType, WriteRejection,
+    Writer,
 };
 use borg_storage::StorageProvider;
 use std::collections::BTreeMap;
@@ -39,6 +40,24 @@ pub struct MigrationHop {
     pub to: ClientVersion,
 }
 
+/// One migration's place in a field's version chain, resolved from the definitions in force rather
+/// than read off its own definition. SPEC.md §5.3, §9.3.
+///
+/// A migration definition records only a direction; everything below is a fact about the branch, so
+/// the same producer replayed onto another branch by a def-only merge picks up that branch's layer
+/// ids instead of the ones it was pushed against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationRole {
+    /// The def-version it reads its input at — the older version for `up`, the newer for `down`.
+    pub input: ClientVersion,
+    /// The def-version it writes, which is also its own ClientVersion: a migration is the lens for
+    /// the version it produces, and sees the rest of the world the way a client on that version does.
+    pub output: ClientVersion,
+    /// Both halves of this step. Neither triggers the other — `up` and `down` are two projections of
+    /// one value, not two producers disturbing each other's inputs (SPEC.md §9.3).
+    pub step: Vec<ProducerId>,
+}
+
 /// The definitions in force at one point on one branch.
 #[derive(Default, Clone, Debug)]
 pub struct DefView {
@@ -64,6 +83,33 @@ impl DefView {
         self.objects.get(struct_name)?.fields.get(field)
     }
 
+    /// Where a migration sits in its field's version chain. SPEC.md §5.3, §9.3.
+    ///
+    /// `None` for a pipeline, and for a migration whose step this view does not know — which is what
+    /// a producer definition that reached a branch without the `MutateField` naming it looks like.
+    pub fn migration_role(&self, def: &ProducerDef) -> Option<MigrationRole> {
+        let ProducerKind::Migration { direction } = def.kind else {
+            return None;
+        };
+        let BufferId::ObjectProp(struct_name, field) = &def.source else {
+            return None;
+        };
+        let chain = self.chains.get(&(struct_name.clone(), field.clone()))?;
+        let step = chain.iter().find(|step| match direction {
+            MigrationDirection::Up => step.up == def.id,
+            MigrationDirection::Down => step.down == Some(def.id),
+        })?;
+        let (input, output) = match direction {
+            MigrationDirection::Up => (step.from, step.to),
+            MigrationDirection::Down => (step.to, step.from),
+        };
+        Some(MigrationRole {
+            input,
+            output,
+            step: [Some(step.up), step.down].into_iter().flatten().collect(),
+        })
+    }
+
     /// Validate one cell write against the definitions in force. SPEC.md §5.1, §8.
     ///
     /// This is the whole of what "definitions are load-bearing" means, and it lives on the def-view
@@ -73,7 +119,20 @@ impl DefView {
     /// Four things are checked, in the order a human would ask them: does the struct exist, does the
     /// field exist, may this writer write it, and will the value fit.
     ///
-    pub fn check_write(&self, cell: &CellRef, value: &Value, writer: Writer) -> Result<()> {
+    /// **`self` is the writer's view; `authority` is the branch's.** Shape is a ClientVersion
+    /// question — a v1 client stores v1-shaped values long after the schema moved, and a `down`
+    /// migration's whole output is old-shaped by construction (SPEC.md §5.4). Permission is not: who
+    /// may write a field, and which producers are its declared migrations, are facts the branch
+    /// holds, and a def-view old enough to predate a `MutateField` cannot know that the migration it
+    /// is about to reject was declared by that very event. Pass the same view twice where the writer
+    /// is current, which is the common case.
+    pub fn check_write(
+        &self,
+        cell: &CellRef,
+        value: &Value,
+        writer: Writer,
+        authority: &Self,
+    ) -> Result<()> {
         match &cell.buffer {
             BufferId::ObjectProp(struct_name, field) => {
                 let Some(object) = self.objects.get(struct_name) else {
@@ -97,7 +156,11 @@ impl DefView {
                     }
                     .into());
                 };
-                self.check_ownership(cell, struct_name, field, declared, writer)?;
+                // Ownership is asked of the branch, falling back to the writer's own view for a
+                // field the branch has since dropped: an old client is still entitled to the
+                // declaration it was written against.
+                let governing = authority.field(cell).unwrap_or(declared);
+                authority.check_ownership(cell, struct_name, field, governing, writer)?;
                 if !declared.ty.accepts(value) {
                     return Err(WriteRejection::TypeMismatch {
                         cell: cell.clone(),
@@ -295,7 +358,16 @@ impl DefView {
                 }
             }
             DefEvent::PushProducer(def) => {
-                self.producers.insert(def.id, def.clone());
+                // A producer's ClientVersion is the def-layer it was pushed at (SPEC.md §9.2), and
+                // only the fold knows which layer that is: the id does not exist when the event is
+                // built, and a def-only merge replays the event onto the parent as a different one.
+                self.producers.insert(
+                    def.id,
+                    ProducerDef {
+                        version: at,
+                        ..def.clone()
+                    },
+                );
             }
         }
         Ok(())
@@ -403,10 +475,32 @@ impl DefRegistry {
         found
     }
 
+    /// The def-version in force at the end of a path — the highest def-layer along it.
+    ///
+    /// This is what a client with no generated code carries as its ClientVersion: the schema as it
+    /// stands (SPEC.md §5.4). `LayerId(0)` when nothing has been declared, which is a view in which
+    /// no write is legal — correctly, since no field exists to write.
+    pub fn head(&self, path: &ReadPath) -> LayerId {
+        self.def_layers(path).last().copied().unwrap_or(LayerId(0))
+    }
+
     /// Fold the def-event stream along a path into the definitions in force there.
     pub async fn view(&self, path: &ReadPath) -> Result<DefView> {
+        self.view_at(path, LayerId(u64::MAX)).await
+    }
+
+    /// Fold the same stream, stopping at a def-version. SPEC.md §5.4.
+    ///
+    /// This is the view an actor at that ClientVersion has of the world, and the one its writes are
+    /// shaped against. Bounding by layer id rather than by re-deriving a path keeps it total: a
+    /// version reached on some other branch simply contributes nothing here, rather than producing a
+    /// path that means something else.
+    pub async fn view_at(&self, path: &ReadPath, ceiling: LayerId) -> Result<DefView> {
         let mut view = DefView::default();
         for layer in self.def_layers(path) {
+            if layer.0 > ceiling.0 {
+                break;
+            }
             for event in self.storage.read_def_layer(layer).await? {
                 view.apply(&event, layer)?;
             }

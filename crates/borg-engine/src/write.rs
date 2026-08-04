@@ -20,14 +20,27 @@
 //! when the session opens, rather than per write: a schema change committed halfway through a client
 //! transaction must not change what the second half of that transaction is allowed to say.
 //!
-//! ## Which def-view
+//! ## Which def-view — two of them, deliberately
 //!
-//! The definitions in force **on the branch**, not those at the writer's `ClientVersion`. §5.4 says
-//! writes are stored at their author's ClientVersion and never coerced, which argues for the latter
-//! — but in v1 every actor is authored against the store's initial view (there are no generated
-//! SDKs, §18) and validating against an empty view would reject everything. Once a real client
-//! carries a real ClientVersion (milestone C), this is the line that changes, and it changes here
-//! alone.
+//! A session folds the definitions **at the writer's ClientVersion** and the definitions **in force
+//! on the branch**, and asks each a different question (§5.4, §8.0).
+//!
+//! *Shape* — is the struct declared, is the field declared, does the value fit — is asked of the
+//! writer's own view. Writes are stored at their author's ClientVersion and never coerced, so a
+//! client authored before a schema change goes on writing the old shape, and a `down` migration's
+//! entire output is old-shaped by construction (§9.3). Checking either against the branch's current
+//! view would reject exactly the writes that backwards compatibility consists of.
+//!
+//! *Permission* — may this writer write this field at all — is asked of the branch. Ownership is a
+//! fact about the schema as it stands, and the migration exemption especially so: the declaration
+//! naming a producer as a field's `up` or `down` arrives with the `MutateField`, so a `down`
+//! migration's own view, which is by definition older than that event, cannot see it.
+//!
+//! Both are folded along the branch's **full** ancestry even when the session is bounded at a layer.
+//! The bound exists to pin *data* reads to a settling round's ceiling (§16.5); a layer holds value
+//! events xor def events (§6.2), so derivation never commits a def layer and the ceiling can only
+//! ever hide definitions the round predates — which is how a migration ends up checked against the
+//! very schema its own def-mutation introduced.
 
 use crate::defs::{DefRegistry, DefView};
 use crate::log::{LayerHandle, LayerManager};
@@ -50,9 +63,12 @@ pub struct WriteSession {
     layers: Arc<LayerManager>,
     storage: Arc<dyn StorageProvider>,
     values: Values,
+    /// The definitions the writer's own code was built against. Shape is checked here.
     defs: DefView,
-    /// The ancestry this session reads through — the same path the def-view was folded along, so
-    /// data and definitions are asked about one consistent world.
+    /// The definitions in force on the branch. Permission is checked here.
+    authority: DefView,
+    /// The ancestry this session's *data* reads resolve through, bounded by the round's ceiling
+    /// where there is one.
     path: ReadPath,
     version: ClientVersion,
     writer: Writer,
@@ -81,7 +97,9 @@ impl WriteSession {
         author: LayerAuthor,
     ) -> Result<Self> {
         let path = layers.read_path(branch, at)?;
-        let view = defs.view(&path).await?;
+        let def_path = layers.read_path(branch, None)?;
+        let authority = defs.view(&def_path).await?;
+        let view = defs.view_at(&def_path, version.0).await?;
         let handle = layers.open(branch, LayerKind::Value, author).await?;
         let storage = layers.storage();
         Ok(Self {
@@ -89,6 +107,7 @@ impl WriteSession {
             values: Values::new(Arc::clone(&storage)),
             storage,
             defs: view,
+            authority,
             path,
             version,
             writer,
@@ -159,7 +178,8 @@ impl WriteSession {
         value: Value,
         derivation: Option<Derivation>,
     ) -> Result<()> {
-        self.defs.check_write(cell, &value, self.writer)?;
+        self.defs
+            .check_write(cell, &value, self.writer, &self.authority)?;
         self.imply_existence(cell).await?;
         let record = CellRecord {
             value,

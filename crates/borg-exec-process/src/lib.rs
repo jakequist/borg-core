@@ -201,11 +201,15 @@ impl ExecutionProvider for ProcessExecutor {
                 // round trip to resolve it, and a worker writing `acme.ai` is finished (§3.4).
                 FromWorker::Get(cell) => {
                     let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
-                    let text = match ctx.get(&cell).await? {
-                        Some(value) => Some(ctx.render(&value).await?),
-                        None => None,
-                    };
-                    worker.send(&ToWorker::Value(text))?;
+                    let value = ctx.get(&cell).await?;
+                    worker.send(&ToWorker::Value(render(ctx, value).await?))?;
+                }
+                // The one message a migration needs and a pipeline never sends: the same cell at the
+                // version this producer reads from, whichever side of the step that is (§9.3).
+                FromWorker::GetInput(cell) => {
+                    let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
+                    let value = ctx.get_input(&cell).await?;
+                    worker.send(&ToWorker::Value(render(ctx, value).await?))?;
                 }
                 // The text goes across untouched: parsing it needs the field's declared type, which
                 // lives on the other side of `ctx` (§3.4). Guessing here would give a worker a
@@ -224,6 +228,17 @@ impl ExecutionProvider for ProcessExecutor {
                 }
             }
         }
+    }
+}
+
+/// A cell value as the text a worker reads. Interning stays the engine's business (§3.4).
+async fn render(
+    ctx: &mut dyn ProducerCtx,
+    value: Option<borg_core::Value>,
+) -> Result<Option<String>> {
+    match value {
+        Some(value) => Ok(Some(ctx.render(&value).await?)),
+        None => Ok(None),
     }
 }
 

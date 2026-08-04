@@ -1,0 +1,5 @@
+# The same repo, one schema version on. A repo may mutate only the fields it declared (§5.2), which
+# is why this carries the same id as repo-v1.
+[repo]
+id = 1
+name = "companies"

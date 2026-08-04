@@ -364,6 +364,12 @@ Consequences:
 definition. No separate versioning scheme exists. The def-version DAG is the branch/layer DAG
 restricted to def-layers.
 
+A field's chain of def-versions, and the migrations bridging each step, are therefore **folded per
+branch** from the `MutateField` events along a read path, exactly as the definitions themselves are.
+Nothing about which two versions a migration bridges is recorded in the migration's own definition:
+a def-only merge replays that `MutateField` onto the parent as a *different* layer, and the same
+producer must then bridge the parent's versions rather than the ones it was pushed against (§13).
+
 ### 5.4 ClientVersion
 
 **Every actor that executes code carries a ClientVersion**: a LayerId identifying the def-view its
@@ -372,15 +378,27 @@ code was authored against. All reads by that actor resolve at that def-view.
 | Actor | ClientVersion |
 |---|---|
 | External SDK | the layer its generated code was built from |
+| CLI | the branch's current def-version — it has no generated code, so it is authored anew each invocation |
 | Pipeline | the layer its repo's code was pushed at |
-| Migration `up_v1→v2` | the layer of the def-mutation that introduced v2 |
+| Migration `up_v1→v2` | v2 — the layer of the def-mutation that introduced it |
+| Migration `down_v2→v1` | v1 |
 
 This unifies clients, pipelines and migrations into one concept.
+
+A migration's ClientVersion is **the version it produces**, in both directions: it is the lens for
+that version, and sees the rest of the world as a client on that version does. The one cell it does
+*not* read there is the one it is translating, which it reads at the other end of its step (§9.3).
 
 **Writes are stored at the writing actor's ClientVersion and are never coerced or rewritten.** A v1
 client and a v5 client may read and write concurrently; the read path composes migrations in
 whichever direction is required. This is why `down` migrations matter — they are what keep old
 clients working.
+
+**And validated at it.** The shape a write must fit — is the struct declared, is the field declared,
+does the value fit its type — is asked of the writer's *own* def-view, not of the branch's (§8.0).
+Anything else would reject exactly the writes backwards compatibility consists of: a v1 client
+storing a v1-shaped value after the schema moved to v5, and a `down` migration whose entire output is
+old-shaped by construction.
 
 ### 5.5 The live-version set
 
@@ -392,6 +410,11 @@ The registry therefore tracks a **live-version set** — the ClientVersions that
 registered clients. The derivation engine materializes only for versions in that set; anything else
 is computed on demand via `freshness: 'current'` (§10.5). When the last client on a version
 disconnects, that version's derived layers become droppable.
+
+**An empty live-version set means "materialize everything."** Nothing registers a client in v1 —
+there are no generated SDKs (§18) and the CLI is a fresh actor per invocation — so the set is a
+filter that is switched off rather than one that excludes everybody. It is exercised, and its
+behaviour when non-empty is what the deferred reduction policies build on.
 
 **v1 eats the storage cost** in exchange for accuracy; reduction policies are deferred.
 
@@ -571,8 +594,8 @@ is that the *author* declares ownership up front, which the engine merely reads:
 
 ### 8.0 Every write is validated
 
-A cell write — from a client, from a producer, from anywhere — is checked against the def-view of its
-branch (§5.1, §7.2) before it lands. Four questions, in the order a human would ask them:
+A cell write — from a client, from a producer, from anywhere — is checked against the definitions
+(§5.1, §7.2) before it lands. Four questions, in the order a human would ask them:
 
 1. **Is the struct declared?** A struct exists because someone declared a field on it (§5.2), so an
    unknown name is not an empty struct — it is a typo.
@@ -584,7 +607,19 @@ branch (§5.1, §7.2) before it lands. Four questions, in the order a human woul
 4. **Does the value fit the declared `ValueType`?** A tombstone satisfies every type — it means
    *explicitly removed* (§8.1), and deletion has to be expressible on every field.
 
-Because the check is against the branch's def-view, **a definition that has not merged is not merely
+**Two of those questions are asked of two different def-views**, and the split is the whole of
+backwards compatibility:
+
+| Question | Asked of | Why |
+|---|---|---|
+| shape — 1, 2 and 4 | the writer's **ClientVersion** (§5.4) | writes are stored at their author's version and never coerced, so an old client goes on writing the old shape and a `down` migration writes nothing else |
+| permission — 3 | the **branch** | who may write a field is a fact about the schema as it stands, and a `down` migration's own view is by definition older than the `MutateField` that named it, so it cannot see its own appointment |
+
+Where the writer is current these are the same view, which is the common case. Where the branch has
+dropped a field the writer still knows about, permission falls back to the writer's own declaration:
+an old client is entitled to the schema it was written against.
+
+Because the branch is what grants permission, **a definition that has not merged is not merely
 invisible to the parent — it is unusable there.** Those are the same fact.
 
 Two limits, stated rather than hidden:
@@ -691,6 +726,10 @@ validated like any other (§8), so a pipeline whose output field nobody declared
 The repo therefore emits its struct definitions alongside its producers, and both land in one def
 layer (§17.4).
 
+A producer's ClientVersion **is** the def-layer it was pushed at, so it is folded rather than
+authored: the layer id does not exist when the event is built, and a merge replays that event onto
+another branch as a different layer. What the event carries is a placeholder.
+
 **Definition and implementation are separate.** The log records only the *definition* — `ProducerId`,
 source buffer, ClientVersion. The `ExecutionProvider` (§17) resolves that ID to an *implementation*.
 In v1 that resolution is a static registry of Rust functions compiled into the binary; later it is a
@@ -714,21 +753,54 @@ Migration reads resolve at the migration's own ClientVersion (§5.4). A migratio
 value of the type it is migrating recursively invokes itself on that value — which terminates on a
 DAG and trips the cycle detector otherwise.
 
-**A migration maps over the field's buffer**, not the struct's — it is defined per output field, and
-per-field buffers (§4.2) make that exactly expressible. A write at the source version is work for the
-migration in precisely the way a data write is work for a pipeline.
+**Its own input is the one exception, and it has a verb of its own.** `get_input` reads the cell
+being translated at the version the migration reads *from* — the older version for `up`, the newer
+for `down`. It is not `get` because `get` resolves at the migration's ClientVersion, which is the
+version it *writes*, so `up` would recurse straight into the value it is producing. It is not `get`
+with an explicit layer id either: a migration should not have to do arithmetic over def-versions to
+reach the one cell it exists to translate, and a worker that had to would not be writable in bash
+(§17.4).
 
-**A producer is never triggered by its own output.** A migration writes into the very buffer it
-consumes from, one version along, and would otherwise re-trigger itself forever. Its own output
-appearing in its source buffer is not a new entity. This applies only to the new-entity trigger —
-the read-set trigger is deliberately *not* filtered by author, because a producer disturbing a cell
-it reads is exactly a cycle and must be caught rather than hidden.
+**A migration's definition records a direction and nothing more.** Which two versions it bridges is
+read out of the field's version chain on the branch it is running on (§5.3), because that is where
+the answer differs — a def-only merge replays the `MutateField` that appointed it onto the parent as
+a different layer, and a migration carrying a hard-coded pair would go on writing a version no reader
+on that branch will ever ask for.
+
+**A migration maps over the field's buffer**, not the struct's — it is defined per output field, and
+per-field buffers (§4.2) make that exactly expressible. More precisely it maps over **one version**
+of that buffer: a write at the version it reads from is work for it in precisely the way a data write
+is work for a pipeline, and a write at any other version is somebody else's business.
+
+**A migration is never triggered by either half of its own step.** A migration writes into the very
+buffer it consumes from, one version along, and would otherwise re-trigger itself forever — and `up`
+and `down` for one step do it to each other, each writing exactly the version the other reads.
+Leaving that unfiltered would fire the cycle detector (§16.6) on the ordinary case rather than on a
+cycle. They are two projections of one value, not two producers disturbing each other's inputs.
+
+This is the one filter by author, and it covers **both** trigger paths, the read-set one included.
+The general rule that the read-set trigger is *not* filtered by author still holds and is what
+catches genuine cycles; a migration re-expressing its own input in the other direction is not one.
+
+**A migration owes the values that predate it**, which no layer stream mentions. A def-mutation
+normally lands long after the data, and on a fork the data was written on the parent — so nothing in
+any layer belonging to the migration's branch names it. A producer that has never run therefore takes
+its whole source buffer as work, enumerated directly (§9.6), filtered to entities holding a value at
+its input version that the other half of its step did not write. Without that filter the seeding
+order of `up` and `down` would decide whether `down` overwrote the source value `up` had just read
+from.
 
 **Optimization:** if a migration's recorded read-set contains only its own source cell, the system
 *infers* purity and caches the result permanently with no invalidation. Inferred, never declared.
 
 **v1 trusts `down`.** If the user supplies one, it is assumed correct. Probabilistic detection of
 lossy or partial `down` migrations is deferred.
+
+**Supplying no `down` is a decision with a stated consequence.** Values written after the change have
+no path back to the older versions, so a reader there is not behind — it is stuck. The read envelope
+reports `broken` (§10.4), which is the same answer a cycled producer gets and for the same reason:
+there is no honest value to serve, and serving the pre-change value instead would be silently wrong.
+Values written *before* the change are untouched at their own version and go on reading normally.
 
 ### 9.4 Dependency tracking
 
@@ -810,6 +882,12 @@ behind one seam.
 The engine internally enumerates a producer's source buffer in order to discover new entities. This
 is engine-internal; enumeration is **not** exposed as a user-facing query in v1.
 
+Enumeration is what a **producer newer than its data** needs, and it is the one thing the layer
+changeset cannot supply: the entities it owes were written before it existed, or on a branch it was
+forked from, and no layer belonging to its own branch names them. A producer that has never run on a
+branch therefore takes its whole source buffer, read through that branch's ancestry, and streams
+normally thereafter.
+
 A commit on branch B triggers producers on branch B only, since a layer belongs to exactly one
 branch.
 
@@ -880,6 +958,14 @@ type Cell<T> = {
 
 For source cells `writtenAt` and `freshAsOf` collapse — source data is written once and correct
 thereafter. The distinction only carries information for derived data.
+
+**A cell not materialized at the reader's def-version is one of three different facts**, and the
+state is what tells them apart. Never written at any version: `current`, with no value — the cell is
+simply absent. Written at some version the reader's can be reached from (§5.3): `stale`, because a
+migration owes it and has not run. Written only at versions with no path here: `broken` — which is
+what a def-push with no `down` does to the clients it left behind (§9.3). Migrations are eager
+producers (§9.1), so "not yet materialized" is lag like any other lag, and the inline alternative is
+`freshness: 'current'` (§10.5).
 
 Worked example, reading `company#100` at HEAD = L500:
 
@@ -974,6 +1060,12 @@ The user chooses **def-only** or **def+data**.
 
 **Def-only.** Replays DefEvents. If the parent moved the *same* def since the fork point, the merge
 is rejected — re-fork from head and redo. Different defs touched, no conflict.
+
+A `MutateField` and the migrations it appoints replay together, because they were pushed together
+into one layer (§17.4), and land on the parent as a new layer with a new id. The step they bridge is
+therefore *the parent's* — from whatever version the parent's copy of the field was at, to the merged
+layer — which is why a migration definition records no version pair of its own (§5.3). The parent's
+existing values then migrate exactly as the child's did, as ordinary derivation work.
 
 **Def+data.** Also replays ValueEvents. Each retains its authored ClientVersion, so the parent's
 readers migrate as needed; nothing is coerced.
@@ -1308,7 +1400,9 @@ pub trait ExecutionProvider {
 
 #[async_trait]
 pub trait ProducerCtx {
-    async fn get(&mut self, cell: CellRef) -> Result<Option<Value>>;  // recorded
+    async fn get(&mut self, cell: CellRef) -> Result<Option<Value>>;  // recorded, at my ClientVersion
+    async fn get_at(&mut self, cell: CellRef, v: ClientVersion) -> Result<Option<Value>>;
+    async fn get_input(&mut self, cell: CellRef) -> Result<Option<Value>>;  // §9.3
     async fn set(&mut self, cell: CellRef, v: Value) -> Result<()>;   // validated against the defs
     async fn set_text(&mut self, cell: CellRef, t: &str) -> Result<()>; // parsed against the defs
 }
@@ -1356,15 +1450,28 @@ The payload is shaped so a shell script can produce it with one `jq -n`:
 ```json
 { "structs": [ { "name": "Company", "fields": [
       { "name": "website",       "type": "String" },
+      { "name": "founded",       "type": "Int", "up": "founded_up", "down": "founded_down" },
       { "name": "is_investible", "type": "Bool", "derived_by": "invest" } ] } ],
-  "producers": [ { "name": "invest", "source": "Company" } ] }
+  "producers":  [ { "name": "invest",     "source": "Company" } ],
+  "migrations": [ { "name": "founded_up" }, { "name": "founded_down" } ] }
 ```
 
-`derived_by` names a producer **by name**, not by id: a repo knows what it calls its pipelines and
-should not have to compute the hash the engine turns that into. A `derived_by` naming a producer the
-repo does not implement is a push-time error, because it would declare a field nothing can ever
-write. Both lists default to empty — a repo of pure schema and a repo of pure code are both
-legitimate.
+`derived_by`, `up` and `down` name producers **by name**, not by id: a repo knows what it calls its
+own code and should not have to compute the hash the engine turns that into. A name the repo does not
+implement is a push-time error — a field nothing can ever write, or a migration nothing can ever run
+— and so is a migration no field names, which would be registered and unreachable. Every list
+defaults to empty: a repo of pure schema and a repo of pure code are both legitimate.
+
+**A schema change is a diff, not an instruction.** There is deliberately no way to say "mutate this
+field": a repo emits the shape it believes in now, and the push compares it with the definitions in
+force — a field nobody has declared becomes a `DeclareField`, one whose type has moved becomes a
+`MutateField` (§6.1), one that is unchanged is a repeat and a no-op. A repo cannot spell a mutation
+directly because it does not know what it is mutating *from*; the branch does, and on another branch
+the answer differs. That is also why the migrations are named on the field rather than beside the
+change: the field is the thing that persists across pushes.
+
+A migration spec carries only a name. Which field it bridges, and in which direction, comes from the
+field naming it as `up` or `down` — one source of truth, so the two cannot disagree.
 
 **`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting

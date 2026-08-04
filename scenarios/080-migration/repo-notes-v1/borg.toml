@@ -1,0 +1,5 @@
+# A second repo. The namespace is flat and repos never conflict (§5.2), so `Note` is entirely this
+# repo's business — including whether its schema changes leave old clients a way back.
+[repo]
+id = 2
+name = "notes"

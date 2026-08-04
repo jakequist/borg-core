@@ -89,12 +89,16 @@ impl Harness {
     }
 
     async fn session(&self, writer: Writer) -> Result<WriteSession> {
+        self.session_at(V1, writer).await
+    }
+
+    async fn session_at(&self, version: ClientVersion, writer: Writer) -> Result<WriteSession> {
         WriteSession::open(
             &self.layers,
             &self.defs,
             self.branch,
             None,
-            V1,
+            version,
             writer,
             LayerAuthor::Source,
         )
@@ -103,7 +107,18 @@ impl Harness {
 
     /// One client write, committed if it is accepted.
     async fn write(&self, cell: &CellRef, text: &str) -> Result<LayerId> {
-        let mut session = self.session(Writer::Client).await?;
+        self.write_as(V1, Writer::Client, cell, text).await
+    }
+
+    /// The same, by a named actor at a named ClientVersion.
+    async fn write_as(
+        &self,
+        version: ClientVersion,
+        writer: Writer,
+        cell: &CellRef,
+        text: &str,
+    ) -> Result<LayerId> {
+        let mut session = self.session_at(version, writer).await?;
         match session.set_text(cell, text).await {
             Ok(()) => session.commit().await,
             Err(rejection) => {
@@ -318,6 +333,103 @@ async fn a_rejected_write_leaves_no_layer_behind() -> Result<()> {
         h.layers.head(h.branch),
         before,
         "the branch head must not move for a write that was refused"
+    );
+    Ok(())
+}
+
+// --- Which def-view a write is checked against. SPEC.md §5.4, §8.0 -------------------------------
+//
+// Two views, two questions. *Shape* is asked of the writer's own ClientVersion, because writes are
+// stored at their author's version and never coerced; *permission* is asked of the branch, because
+// who may write a field is a fact about the schema as it stands.
+
+/// `headcount: Int` becomes `headcount: String`, with a migration. Returns the new def-version.
+async fn widen_headcount(h: &Harness, down: Option<ProducerId>) -> Result<ClientVersion> {
+    let layer = h
+        .defs
+        .push(
+            h.branch,
+            vec![DefEvent::MutateField {
+                struct_name: "Company".into(),
+                field: "headcount".into(),
+                ty: ValueType::String,
+                repo: REPO,
+                up: OTHER,
+                down,
+            }],
+        )
+        .await?;
+    Ok(ClientVersion(layer))
+}
+
+#[tokio::test]
+async fn an_old_client_goes_on_writing_the_shape_its_own_def_view_declares() -> Result<()> {
+    let h = Harness::new().await?;
+    let v2 = widen_headcount(&h, None).await?;
+
+    // This is the whole of backwards compatibility. The branch now says `headcount` is a String; a
+    // client authored against v1 still says Int, and its writes are shaped and stored that way.
+    h.write_as(V1, Writer::Client, &prop(company(1), "headcount"), "40")
+        .await?;
+    let stored = h
+        .layers
+        .storage()
+        .get_cell(
+            &h.layers.read_path(h.branch, None)?,
+            &prop(company(1), "headcount"),
+            V1,
+        )
+        .await?
+        .expect("just written");
+    assert_eq!(
+        stored.value,
+        Value::Int(40),
+        "an old client's write is parsed against the type *it* was written against"
+    );
+
+    // …and is held to it. Its view is old, not absent.
+    let error = h
+        .write_as(V1, Writer::Client, &prop(company(2), "headcount"), "acme")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Int"), "got {error}");
+
+    // The same text from a current client is a String, because that is what the branch now declares.
+    h.write_as(v2, Writer::Client, &prop(company(3), "headcount"), "acme")
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_down_migration_may_write_a_version_that_predates_its_own_declaration() -> Result<()> {
+    let h = Harness::new().await?;
+    widen_headcount(&h, Some(OTHER)).await?;
+
+    // `down` writes v1 cells, so it runs at v1 — a def-view folded *before* the `MutateField` that
+    // named it as this field's `down`. Asking that view for permission would have it reject the one
+    // producer the branch declared for the job.
+    h.write_as(
+        V1,
+        Writer::Producer(OTHER),
+        &prop(company(1), "headcount"),
+        "40",
+    )
+    .await?;
+
+    // The exemption is not a blanket one: it names this producer, for this field.
+    let error = rejection(
+        h.write_as(
+            V1,
+            Writer::Producer(INVEST),
+            &prop(company(1), "headcount"),
+            "40",
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert!(
+        matches!(error, WriteRejection::OwnershipViolation { .. }),
+        "got {error}"
     );
     Ok(())
 }

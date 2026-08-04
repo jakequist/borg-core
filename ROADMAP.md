@@ -20,8 +20,13 @@ anywhere — is validated against the def-view of its branch, ownership is decla
 discovered, value parsing is directed by the declared type, and a repo emits its own struct
 definitions alongside its producers.
 
-What remains before "Act 1 is the modern ORM" is true: migrations reachable end to end through the
-CLI (C), and derivation that runs without being asked (D).
+**Migrations run end to end.** A repo declares a field mutation and the scripts that bridge it; the
+def change and its migrations land in one layer; old data reads through the new lens on a fork while
+the parent is untouched; a def-only merge carries both and the parent's values follow; and a client
+authored against the old schema goes on reading and writing the old shape — or is told plainly that
+it is broken, when the push supplied no way back.
+
+What remains before "Act 1 is the modern ORM" is true: derivation that runs without being asked (D).
 
 ---
 
@@ -92,6 +97,15 @@ untouched, then def-only merge and watch the parent's values migrate.
 
 It is the most valuable demo in the project — the thing no other ORM does, that the whole system was
 designed around, and that we have never seen work.
+
+**Done.** `scenarios/080-migration` is the acceptance scenario, running end to end through the real
+binary, in both directions and with a no-`down` case that reports `broken`. Five decisions came out
+of it, below. The blocker was `WriteSession` validating against the branch rather than the writer —
+now split, shape at the ClientVersion and permission at the branch (§8.0). Clients got a real
+ClientVersion: the branch's def-version, with `--client-version` to act as an older one and
+`borg def version` to see it. `ProducerKind::Migration` lost its version pair, which is now folded
+per branch — the thing that makes a def-only merge of a migration work at all. §5.3, §5.4, §5.5,
+§8.0, §9.2, §9.3, §9.6, §10.4, §13, §17.3 and §17.4 are updated.
 
 ### D — background derivation, and concurrency
 
@@ -214,6 +228,75 @@ than with a second switch.
 derived data already reports `stale` with a watermark showing how far behind. No new vocabulary
 needed — a pause *is* lag, and the freshness envelope already describes lag.
 
+### A schema change is a diff, not an instruction
+
+`describe` has no "mutate this field" — a repo emits the shape it believes in now, and `borg repo
+push` compares it with the definitions in force. A field nobody declared becomes a `DeclareField`;
+one whose type moved becomes a `MutateField`; one that is unchanged is a repeat.
+
+A repo *cannot* express the mutation directly, because it does not know what it is mutating from: the
+branch does, and on another branch the answer differs. The same repo pushed on main and on a fork
+that already changed the field means two different things, and only the store can say which. It also
+follows from repos emitting their whole schema every push — the diff is where that idempotence and
+schema evolution meet, rather than two mechanisms sitting beside each other.
+
+The migrations are named on the *field* (`up`, `down`) rather than beside the change, because the
+field is what persists across pushes and the change does not.
+
+### A migration definition records a direction, not a version pair
+
+`ProducerKind::Migration` used to carry `from` and `to`. It cannot: a def-only merge replays the
+`MutateField` that appointed the migration onto the parent as a **different layer**, so the pair
+baked in on the fork names versions no reader on the parent will ever ask for — the headline scenario
+would produce a migration writing into nowhere.
+
+Which two versions a migration bridges is a fact about the branch's version chain (§5.3), folded from
+the `MutateField` alongside everything else. The author declares the one half that is genuinely
+theirs — which direction this code runs in — and the log supplies the rest. The same reasoning
+retired the authored `version` on every `ProducerDef`: a producer's ClientVersion *is* the def-layer
+it was pushed at, and that id does not exist until the layer opens.
+
+### Two def-views on the write path
+
+Shape is checked at the writer's ClientVersion; permission at the branch's (§8.0). Milestone B
+validated everything against the branch and recorded that as a known shortcut, and it defeats exactly
+the feature C exists to demonstrate: a client authored before a schema change writes the old shape by
+definition, and so does a `down` migration.
+
+The reverse split does not work either. Permission cannot be a ClientVersion question, because a
+`down` migration's own view is *older* than the `MutateField` that named it as the field's `down` —
+asked there, the branch's own appointed migration is an ownership violation.
+
+Where a writer is current the two views are the same object, which is the common case. Where the
+branch has since dropped a field the writer knows about, permission falls back to the writer's
+declaration: an old client is entitled to the schema it was written against.
+
+### The CLI's ClientVersion is the branch's def-version, and nothing is recorded
+
+Considered and rejected: a sidecar file beside the store, like the producer-implementation table. It
+looks symmetric and is not. An implementation table records something *true* — where code lives — and
+a remembered client version records something that was true once: it goes stale the moment anyone
+pushes a def, and a single value is wrong for any branch it was never synced on while a per-branch
+map is state nobody asked for.
+
+So the CLI is a client that regenerates itself on every invocation: its ClientVersion is the schema
+as it stands, which is exactly what a freshly generated SDK would carry. `--client-version` pins an
+older one, and has to exist — §5.4's whole claim is that a v1 client keeps working after the schema
+moves, and with no generated SDKs (§18) there is otherwise no way to *have* a v1 client to test it
+with. `borg def version` prints the default, which is what makes the concept visible at all.
+
+### `up` and `down` are two projections of one value
+
+Neither triggers the other, on either trigger path. Each writes exactly the version the other reads,
+so unfiltered they run until the cycle detector fires (§16.6) — on the ordinary configuration rather
+than on a cycle. This is the one filter by author, and §9.3's rule that the read-set trigger is *not*
+filtered by author still holds for everything else, which is what keeps genuine cycles catchable.
+
+The same fact bites in seeding: a producer that has never run takes its whole source buffer as work
+(§9.6), and `down` seeded after `up` had already derived the new version would migrate that back and
+overwrite the source value `up` read it from. Filtering the seed by the same step membership makes
+the round order-independent, which it has to be — nothing prescribes the order producers run in.
+
 ### Producer implementations resolve outside the log
 
 The log records that producer P exists; a sidecar table maps its id to a command. Writing a local
@@ -239,3 +322,7 @@ to, so rewriting it would make any property write look like a new entity.
 Paid off in B: branch visibility of definitions, including the write-rejection half
 (`scenarios/070-branch-visibility`), and second-order forks — a fork of a fork, in that scenario and
 in `def_events.rs`. Nothing had exercised a branch chain deeper than one fork before.
+
+Paid off in C: both migration directions and their non-interaction (`migration.rs`), a producer
+seeded over data that predates it, migration roles resolved from a folded chain, and the two-def-view
+write path (`write_validation.rs`). Nothing had run a `down` migration at all before.

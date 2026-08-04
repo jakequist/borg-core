@@ -92,9 +92,11 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - SQLite `Registry::open` rebuilds indexes by replaying the log — `O(log)` per CLI invocation.
 - Writes to list and untyped-container cells are **not** validated: there is no `ListDef` event to
   validate against, so requiring a declaration would make them unwritable (§8).
-- `WriteSession` validates against the def-view of the *branch*, not of the writer's ClientVersion.
-  §5.4 argues for the latter; v1 has no actor carrying a real ClientVersion, so it would reject
-  everything. Milestone C is where that changes.
+- Migrations run only when `borg derive` is called, like every other producer. A read at a version
+  nothing has materialized yet reports `stale`, honestly; it does not compute the hop inline. That is
+  `FreshnessRequirement::Current`, above.
+- Nothing registers a ClientVersion as live (§5.5), so the live-version set is empty and every
+  migration materializes. Real clients arrive with the network layer.
 - `Set`, `Map`, aggregation pipelines, mid-list insertion, container isolation and generated SDKs
   are all deferred (§18).
 

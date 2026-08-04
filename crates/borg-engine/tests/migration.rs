@@ -126,13 +126,13 @@ impl Harness {
 
 /// `up_v1→v9` for `Company.website`: reads its own source cell at v1 and writes v9.
 ///
-/// The `get_at` is the one place a migration departs from an ordinary producer. An ordinary `get`
+/// The `get_input` is the one place a migration departs from an ordinary producer. An ordinary `get`
 /// resolves at the migration's own ClientVersion — which *is* v9 — and would recurse straight into
 /// the value it is supposed to be producing (SPEC.md §9.3).
-fn website_up(from: ClientVersion) -> borg_exec_native::ProducerFn {
+fn website_up() -> borg_exec_native::ProducerFn {
     Arc::new(move |ctx: &mut dyn ProducerCtx, input: Pid| {
         Box::pin(async move {
-            let old = ctx.get_at(&prop(input, "website"), from).await?;
+            let old = ctx.get_input(&prop(input, "website")).await?;
             let migrated = match old {
                 Some(Value::Int(n)) => Value::Int(n * 10),
                 Some(other) => other,
@@ -143,18 +143,32 @@ fn website_up(from: ClientVersion) -> borg_exec_native::ProducerFn {
     })
 }
 
-fn migration_def(from: ClientVersion, to: ClientVersion) -> ProducerDef {
+/// The exact inverse, and it too reads its input with `get_input` — which for a `down` migration is
+/// the *newer* version. One verb, whichever way a migration runs.
+fn website_down() -> borg_exec_native::ProducerFn {
+    Arc::new(move |ctx: &mut dyn ProducerCtx, input: Pid| {
+        Box::pin(async move {
+            let new = ctx.get_input(&prop(input, "website")).await?;
+            let migrated = match new {
+                Some(Value::Int(n)) => Value::Int(n / 10),
+                Some(other) => other,
+                None => return Ok(()),
+            };
+            ctx.set(&prop(input, "website"), migrated).await
+        })
+    })
+}
+
+/// A migration definition records a direction and nothing more. Which two versions it bridges is
+/// folded from the `MutateField` that named it, per branch (SPEC.md §5.3).
+fn migration_def(id: ProducerId, direction: MigrationDirection) -> ProducerDef {
     ProducerDef {
-        id: UP,
-        kind: ProducerKind::Migration {
-            from: from.0,
-            to: to.0,
-            direction: MigrationDirection::Up,
-        },
+        id,
+        kind: ProducerKind::Migration { direction },
         // A migration maps over the *field's* buffer, not the struct's: it is defined per output
         // field (SPEC.md §9.3), and per-field buffers make that exactly expressible (SPEC.md §4.2).
         source: BufferId::ObjectProp("Company".into(), "website".into()),
-        version: to.0,
+        version: LayerId(0),
         declaring_repo: RepoId(1),
     }
 }
@@ -162,6 +176,13 @@ fn migration_def(from: ClientVersion, to: ClientVersion) -> ProducerDef {
 /// Declare `Company.website`, then mutate it — two def layers, whose ids *are* the two def-versions
 /// (SPEC.md §5.3). Returns them.
 async fn declare_then_mutate(h: &Harness) -> Result<(ClientVersion, ClientVersion)> {
+    declare_then_mutate_with(h, None).await
+}
+
+async fn declare_then_mutate_with(
+    h: &Harness,
+    down: Option<ProducerId>,
+) -> Result<(ClientVersion, ClientVersion)> {
     let declared = h
         .defs
         .push(
@@ -196,7 +217,7 @@ async fn declare_then_mutate(h: &Harness) -> Result<(ClientVersion, ClientVersio
                 ty: ValueType::Int,
                 repo: RepoId(1),
                 up: UP,
-                down: None,
+                down,
             }],
         )
         .await?;
@@ -207,8 +228,8 @@ async fn declare_then_mutate(h: &Harness) -> Result<(ClientVersion, ClientVersio
 async fn a_migration_materializes_the_new_version_without_disturbing_the_old() -> Result<()> {
     let h = Harness::new();
     let (v_from, v_to) = declare_then_mutate(&h).await?;
-    h.install(UP, website_up(v_from));
-    h.engine.register(migration_def(v_from, v_to));
+    h.install(UP, website_up());
+    h.engine.register(migration_def(UP, MigrationDirection::Up));
 
     let acme = company(100);
     let source = h
@@ -245,8 +266,8 @@ async fn a_migration_materializes_the_new_version_without_disturbing_the_old() -
 async fn a_later_write_at_the_old_version_re_runs_the_migration() -> Result<()> {
     let h = Harness::new();
     let (v_from, v_to) = declare_then_mutate(&h).await?;
-    h.install(UP, website_up(v_from));
-    h.engine.register(migration_def(v_from, v_to));
+    h.install(UP, website_up());
+    h.engine.register(migration_def(UP, MigrationDirection::Up));
 
     let acme = company(200);
     h.push(v_from, vec![(prop(acme, "website"), Value::Int(9))])
@@ -275,8 +296,8 @@ async fn a_later_write_at_the_old_version_re_runs_the_migration() -> Result<()> 
 #[tokio::test]
 async fn a_pipeline_at_the_old_version_is_untouched_by_the_migration() -> Result<()> {
     let h = Harness::new();
-    let (v_from, v_to) = declare_then_mutate(&h).await?;
-    h.install(UP, website_up(v_from));
+    let (v_from, _v_to) = declare_then_mutate(&h).await?;
+    h.install(UP, website_up());
     h.install(
         SCORE,
         Arc::new(|ctx: &mut dyn ProducerCtx, input: Pid| {
@@ -288,7 +309,7 @@ async fn a_pipeline_at_the_old_version_is_untouched_by_the_migration() -> Result
             })
         }),
     );
-    h.engine.register(migration_def(v_from, v_to));
+    h.engine.register(migration_def(UP, MigrationDirection::Up));
     h.engine.register(ProducerDef {
         id: SCORE,
         kind: ProducerKind::Pipeline,
@@ -327,8 +348,8 @@ async fn a_pipeline_at_the_old_version_is_untouched_by_the_migration() -> Result
 async fn a_migration_is_skipped_when_no_client_is_live_on_its_target() -> Result<()> {
     let h = Harness::new();
     let (v_from, v_to) = declare_then_mutate(&h).await?;
-    h.install(UP, website_up(v_from));
-    h.engine.register(migration_def(v_from, v_to));
+    h.install(UP, website_up());
+    h.engine.register(migration_def(UP, MigrationDirection::Up));
     // Only the old version has clients, so materializing the new one is wasted work (SPEC.md §5.5).
     h.defs.mark_live(v_from);
 
@@ -345,6 +366,168 @@ async fn a_migration_is_skipped_when_no_client_is_live_on_its_target() -> Result
     assert_eq!(
         h.read(&prop(acme, "website"), v_to).await?.state,
         Freshness::Stale
+    );
+    Ok(())
+}
+
+// --- Both directions. SPEC.md §5.4, §9.3 ---------------------------------------------------------
+
+const DOWN: ProducerId = ProducerId(51);
+
+/// Declare, mutate with both directions, and install and register both migrations.
+async fn both_directions(h: &Harness) -> Result<(ClientVersion, ClientVersion)> {
+    let versions = declare_then_mutate_with(h, Some(DOWN)).await?;
+    h.install(UP, website_up());
+    h.install(DOWN, website_down());
+    h.engine.register(migration_def(UP, MigrationDirection::Up));
+    h.engine
+        .register(migration_def(DOWN, MigrationDirection::Down));
+    Ok(versions)
+}
+
+#[tokio::test]
+async fn a_new_clients_write_reaches_an_old_client_through_the_down_migration() -> Result<()> {
+    let h = Harness::new();
+    let (v_from, v_to) = both_directions(&h).await?;
+
+    // Nobody on the old version ever wrote this cell, so without `down` there would be nothing at
+    // that version to read — which is exactly what §5.4 says `down` is for.
+    let acme = company(500);
+    h.push(v_to, vec![(prop(acme, "website"), Value::Int(90))])
+        .await?;
+    h.engine.catch_up(BRANCH).await?;
+
+    let old = h.read(&prop(acme, "website"), v_from).await?;
+    assert_eq!(
+        old.value,
+        Some(Value::Int(9)),
+        "an old client is served the new value through its own lens"
+    );
+    assert_eq!(
+        old.origin,
+        Origin::Derived,
+        "and told it is a computed view"
+    );
+    assert_eq!(old.by, Some(DOWN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn up_and_down_are_two_views_of_one_value_rather_than_a_cycle() -> Result<()> {
+    let h = Harness::new();
+    let (v_from, v_to) = both_directions(&h).await?;
+
+    let acme = company(600);
+    h.push(v_from, vec![(prop(acme, "website"), Value::Int(9))])
+        .await?;
+    h.engine.catch_up(BRANCH).await?;
+
+    // Each writes into the buffer the other reads from, at the version the other reads it at. Left
+    // to trigger each other they would run until the cycle detector fired on a configuration that is
+    // not a cycle but the ordinary case.
+    assert_eq!(
+        h.engine.catch_up(BRANCH).await?,
+        0,
+        "the two directions settle instead of chasing each other"
+    );
+    assert!(
+        h.engine.is_broken(BRANCH, UP).is_none() && h.engine.is_broken(BRANCH, DOWN).is_none(),
+        "and neither is poisoned as a cycle"
+    );
+
+    // The source value is still the source value: `down` must not overwrite what `up` read.
+    let original = h.read(&prop(acme, "website"), v_from).await?;
+    assert_eq!(original.value, Some(Value::Int(9)));
+    assert_eq!(
+        original.origin,
+        Origin::Source,
+        "a migration adds a version, it does not rewrite one"
+    );
+    assert_eq!(
+        h.read(&prop(acme, "website"), v_to).await?.value,
+        Some(Value::Int(90))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_migration_maps_over_data_that_predates_it() -> Result<()> {
+    let h = Harness::new();
+    // The def-mutation happens *after* the write, which is the normal order of events: nobody
+    // migrates a field before there is anything in it. None of that data was written in a layer the
+    // migration's own branch will ever stream, so the layer changeset cannot mention it (§9.6).
+    let declared = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::DeclareField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::Int,
+                repo: RepoId(1),
+                ownership: Ownership::Source,
+            }],
+        )
+        .await?;
+    let v_from = ClientVersion(declared);
+
+    let acme = company(700);
+    h.push(v_from, vec![(prop(acme, "website"), Value::Int(9))])
+        .await?;
+
+    let mutated = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::MutateField {
+                struct_name: "Company".into(),
+                field: "website".into(),
+                ty: ValueType::Int,
+                repo: RepoId(1),
+                up: UP,
+                down: None,
+            }],
+        )
+        .await?;
+    h.install(UP, website_up());
+    h.engine.register(migration_def(UP, MigrationDirection::Up));
+
+    h.engine.catch_up(BRANCH).await?;
+    assert_eq!(
+        h.read(&prop(acme, "website"), ClientVersion(mutated))
+            .await?
+            .value,
+        Some(Value::Int(90)),
+        "a migration owes the values that were already there, not only the ones written after it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_migration_bridges_the_versions_its_branch_records() -> Result<()> {
+    let h = Harness::new();
+    let (v_from, v_to) = declare_then_mutate(&h).await?;
+
+    // The definition records a direction and nothing else. Everything about *which* versions is
+    // read back out of the chain the branch folded — which is what lets a def-only merge replay the
+    // same event onto a parent whose layer ids are different (SPEC.md §5.3).
+    let path = h.layers.read_path(BRANCH, None)?;
+    let view = h.defs.view(&path).await?;
+    let role = view
+        .migration_role(&migration_def(UP, MigrationDirection::Up))
+        .expect("the chain names this producer as the field's `up`");
+    assert_eq!(role.input, v_from, "up reads the older version");
+    assert_eq!(role.output, v_to, "and writes the newer one");
+    assert_eq!(
+        role.step,
+        vec![UP],
+        "with no `down` declared, the step is one-sided"
+    );
+
+    assert!(
+        view.migration_role(&migration_def(DOWN, MigrationDirection::Down))
+            .is_none(),
+        "a producer the chain does not name has no place in it"
     );
     Ok(())
 }

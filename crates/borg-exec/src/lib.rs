@@ -40,6 +40,17 @@ pub trait ProducerCtx: Send {
     /// sees the target view (SPEC.md §9.3).
     async fn get_at(&mut self, cell: &CellRef, version: ClientVersion) -> Result<Option<Value>>;
 
+    /// Read a cell at the version this producer takes its **input** at.
+    ///
+    /// [`get_at`](Self::get_at) with the one version a migration author should never have to name.
+    /// For `up` that is the older version and for `down` the newer, but a migration script says
+    /// `get_input` either way — the direction is the log's business, and a worker that had to do
+    /// arithmetic on layer ids to read its own input would be a worker nobody writes in bash.
+    ///
+    /// For a pipeline this is an ordinary [`get`](Self::get): its input version *is* its
+    /// ClientVersion.
+    async fn get_input(&mut self, cell: &CellRef) -> Result<Option<Value>>;
+
     /// Write a cell. Validated against the branch's definitions: the field must be declared, the
     /// value must fit its declared type, and the field must be one this producer *owns* — ownership
     /// is declared, not discovered (SPEC.md §5.1, §8). A violation poisons this producer rather than

@@ -115,6 +115,13 @@ pub enum ToWorker {
 pub enum FromWorker {
     /// Read a cell. Recorded into the read-set whether or not it exists.
     Get(String),
+    /// Read a cell at the version this producer takes its **input** at.
+    ///
+    /// Only a migration needs it, and every migration needs it in both directions: `up` reads the
+    /// older version, `down` the newer, and neither should have to say which. The alternative — a
+    /// `Get` carrying an explicit layer id — would put arithmetic over def-versions in a bash script
+    /// to reach the one cell the migration was written to translate (SPEC.md §9.3).
+    GetInput(String),
     /// Write a cell. Checked against field ownership.
     Set { cell: String, value: String },
     /// This invocation is finished; ready for another.
@@ -135,14 +142,23 @@ pub enum FromWorker {
 /// one way of producing this rather than a parallel path — and a Python repo defining structs
 /// through an SDK emits exactly the same shape from its runtime.
 ///
-/// Both lists default to empty: a repo of pure schema and a repo of pure code are both legitimate,
+/// **A schema change is a diff, not an instruction.** A repo emits the shape it believes in now, and
+/// `borg repo push` compares it with the definitions in force: a field nobody has declared becomes a
+/// `DeclareField`, and one whose type has moved becomes a `MutateField` — which §6.1 says must be
+/// accompanied by migrations, so the field names them. There is deliberately no way to spell "mutate
+/// this field" directly. A repo does not know what it is mutating *from*; the branch does, and on
+/// another branch the answer is different.
+///
+/// Every list defaults to empty: a repo of pure schema and a repo of pure code are both legitimate,
 /// and neither should have to write `"structs": []` to say so.
 ///
 /// ```json
 /// { "structs": [ { "name": "Company", "fields": [
 ///       { "name": "website",       "type": "String" },
+///       { "name": "founded",       "type": "Int", "up": "founded_up", "down": "founded_down" },
 ///       { "name": "is_investible", "type": "Bool", "derived_by": "invest" } ] } ],
-///   "producers": [ { "name": "invest", "source": "Company" } ] }
+///   "producers":  [ { "name": "invest",     "source": "Company" } ],
+///   "migrations": [ { "name": "founded_up" }, { "name": "founded_down" } ] }
 /// ```
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Description {
@@ -150,6 +166,11 @@ pub struct Description {
     pub structs: Vec<StructSpec>,
     #[serde(default)]
     pub producers: Vec<ProducerSpec>,
+    /// Migrations this repo implements, named. Which field each bridges and in which direction comes
+    /// from the field that names it as `up` or `down` — one source of truth, so the two cannot
+    /// disagree, and a migration nothing names is a push-time error rather than dead code.
+    #[serde(default)]
+    pub migrations: Vec<MigrationSpec>,
 }
 
 /// A struct's fields, as one repo declares them. The namespace is flat and there is no `extends`:
@@ -176,6 +197,29 @@ pub struct FieldSpec {
     /// compute the hash the engine turns that into.
     #[serde(default)]
     pub derived_by: Option<String>,
+    /// The migration that carries existing values forward when this field's type changes (SPEC.md
+    /// §6.1, §9.3). Required for a change to be pushable at all — a type that moves with no way to
+    /// bring the data with it is not a schema change, it is data loss.
+    #[serde(default)]
+    pub up: Option<String>,
+    /// The migration that carries values back, so clients authored against the previous version keep
+    /// reading (SPEC.md §5.4). Optional, and omitting it is a decision: values written after the
+    /// change become unreachable from those versions, and reads there report `broken` (§9.3, §10.4).
+    #[serde(default)]
+    pub down: Option<String>,
+}
+
+/// A migration this repo implements. See [`Description::migrations`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MigrationSpec {
+    /// Stable across pushes, and hashed to a `ProducerId` exactly as a pipeline's name is.
+    pub name: String,
+}
+
+impl MigrationSpec {
+    pub fn id(&self) -> u64 {
+        producer_id(&self.name)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -310,6 +354,7 @@ mod tests {
     fn every_codec_round_trips_the_same_messages() {
         let messages = vec![
             FromWorker::Get("Company#1.website".into()),
+            FromWorker::GetInput("Company#1.founded".into()),
             FromWorker::Set {
                 cell: "Company#1.is_investible".into(),
                 value: "true".into(),
@@ -358,6 +403,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(buffer).unwrap().trim(),
             r#"{"value":"9"}"#
+        );
+
+        // A migration's one extra verb, and it takes a cell and nothing else — no layer id for a
+        // shell script to compute (SPEC.md §9.3).
+        let mut buffer = Vec::new();
+        write_message(
+            &mut buffer,
+            Codec::Json,
+            &FromWorker::GetInput("Company#1.founded".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buffer).unwrap().trim(),
+            r#"{"get_input":"Company#1.founded"}"#
         );
     }
 
