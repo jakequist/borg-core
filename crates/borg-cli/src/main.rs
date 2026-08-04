@@ -16,6 +16,7 @@ use borg_exec_native::NativeExecutor;
 use borg_storage_sqlite::SqliteStorage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(0);
 
@@ -26,6 +27,12 @@ struct Args {
     version: Option<LayerId>,
     value_only: bool,
     count_only: bool,
+    /// `--freshness`. What a read is willing to pay for (SPEC.md §10.5).
+    freshness: FreshnessRequirement,
+    /// `--settled`: read at the settled frontier rather than at the ragged head.
+    settled: bool,
+    /// `--timeout`, in whole seconds. How long `borg frontier reaches` will wait.
+    timeout: u64,
     rest: Vec<String>,
 }
 
@@ -51,9 +58,11 @@ borg — an event-sourced data backend
   borg repo push <dir>                 push a repo: defs and pipelines
   borg producer list                   registered producers
   borg derive [--count]                run producers until caught up
+  borg derive pause | resume | status  auto-derivation on this branch
 
   borg layer list | borg layer head
   borg frontier                        how far each producer has caught up
+  borg frontier reaches <layer>        wait until every producer has incorporated it
 
 Cells are written Struct:pid.field, Struct:pid, Element[]:pid or Element[]:pid[n], where a pid
 looks like o-1234abcd and names the whole identity. Struct#100 is accepted on input as a
@@ -74,10 +83,23 @@ each invocation is authored against the schema as it stands. `--client-version` 
 which is how you act as a client written before a schema change: it writes the old shape and reads
 values back through the migrations that lead to its version.
 
+Derived data lags, and says so. Every write catches its branch up afterwards unless auto-derivation
+is paused there, and a read states how far behind what it returns may be. `--freshness current`
+computes the value at the call site instead of taking the lag; `--settled` reads the whole branch at
+the point everything is caught up to, which is a coherent snapshot slightly in the past rather than
+the latest of every field.
+
+A paused branch needs no special vocabulary: its frontier stops advancing, and every read of derived
+data already reports how far behind it is. `borg derive` still works while paused — that is what
+makes pausing useful in an emergency.
+
 Options:
   --store <path>            store file (default ./borg.db)
   --branch <name>           branch to operate on (default: the root branch)
   --client-version <layer>  act as a client authored against this def-layer
+  --freshness <mode>        any | validated (default) | current
+  --settled                 read at the settled frontier, not at the ragged head
+  --timeout <seconds>       how long `frontier reaches` waits (default 0)
   --value                   print only the value
   --count                   print only a count"
     );
@@ -91,6 +113,9 @@ fn parse_args() -> Args {
         version: None,
         value_only: false,
         count_only: false,
+        freshness: FreshnessRequirement::Validated,
+        settled: false,
+        timeout: 0,
         rest: Vec::new(),
     };
     let mut raw = std::env::args().skip(1);
@@ -99,6 +124,14 @@ fn parse_args() -> Args {
             "--store" => args.store = raw.next().unwrap_or_else(|| usage()).into(),
             "--branch" => args.branch = raw.next(),
             "--client-version" => args.version = raw.next().as_deref().map(layer_id),
+            "--freshness" => args.freshness = freshness(raw.next().as_deref()),
+            "--settled" => args.settled = true,
+            "--timeout" => {
+                args.timeout = raw
+                    .next()
+                    .and_then(|secs| secs.parse().ok())
+                    .unwrap_or_else(|| usage());
+            }
             "--value" => args.value_only = true,
             "--count" => args.count_only = true,
             "-h" | "--help" => usage(),
@@ -133,6 +166,20 @@ fn allocation_branch(registry: &Registry) -> Result<BranchId> {
     registry
         .default_branch()
         .ok_or_else(|| BorgError::Storage("store has no branches — run `borg init`".into()))
+}
+
+/// What a read is willing to pay for. SPEC.md §10.5.
+///
+/// `validated` is the default because it is the one that is always honest and never expensive: it
+/// walks the read-set and runs no user code. `any` is cheaper and says less; `current` computes and
+/// blocks.
+fn freshness(mode: Option<&str>) -> FreshnessRequirement {
+    match mode {
+        Some("any") => FreshnessRequirement::Any,
+        Some("validated") => FreshnessRequirement::Validated,
+        Some("current") => FreshnessRequirement::Current,
+        _ => usage(),
+    }
 }
 
 /// A layer id as written by `borg layer head` — `L7` — or bare.
@@ -205,7 +252,11 @@ async fn run(args: Args) -> Result<()> {
         ("layer", ["head"]) => layer_head(&args).await,
         ("repo", ["push", dir]) => repo_push(&args, dir).await,
         ("producer", ["list"]) => producer_list(&args).await,
+        ("derive", ["pause"]) => derive_pause(&args, true).await,
+        ("derive", ["resume"]) => derive_pause(&args, false).await,
+        ("derive", ["status"]) => derive_status(&args).await,
         ("derive", _) => derive(&args).await,
+        ("frontier", ["reaches", layer]) => frontier_reaches(&args, layer).await,
         ("frontier", _) => frontier(&args).await,
         _ => usage(),
     }
@@ -245,24 +296,47 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
         return Err(rejection);
     }
     println!("{}", session.commit().await?);
-    Ok(())
+    drop(registry);
+    auto_derive(args, branch).await
 }
 
 async fn get(args: &Args, cell: &str) -> Result<()> {
-    let registry = open(args).await?;
+    // Computing inline needs the same executor `borg derive` needs, and nothing else does. Paying
+    // for it on every read would double the cost of the cheap modes to serve the expensive one.
+    let (registry, workers) = if args.freshness == FreshnessRequirement::Current {
+        let (registry, workers) = open_deriving(args).await?;
+        (registry, Some(workers))
+    } else {
+        (open(args).await?, None)
+    };
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
+
+    // Two honest consistency modes (SPEC.md §10.5). Ragged head is the latest of everything with
+    // per-field freshness; the settled frontier is one layer where nothing is behind anything else.
+    let at = if args.settled {
+        Some(registry.settled(branch).await?)
+    } else {
+        None
+    };
 
     let resolved = registry
         .resolver
         .resolve(
             branch,
             &cell,
-            None,
+            at,
             client_version(&registry, args, branch).await?,
-            FreshnessRequirement::Validated,
+            args.freshness,
         )
-        .await?;
+        .await;
+    // Stopped before the read's outcome is raised: a `current` read that could not compute is still
+    // a read that started workers, and leaving them for process exit to clean up is how a longer-
+    // lived host inherits a leak.
+    if let Some(workers) = workers {
+        workers.shutdown().await;
+    }
+    let resolved = resolved?;
 
     // Interned content reads back as content, so a string field prints `acme.ai` rather than the
     // `@s-…` that is physically stored (§3.4). What `borg get --value` prints is what `borg set`
@@ -395,7 +469,23 @@ async fn branch_merge(args: &Args, child: &str, tail: &[&str]) -> Result<()> {
     };
     let replayed = registry.branches.merge(child_id, mode).await?;
     println!("{} layer(s) replayed", replayed.len());
-    Ok(())
+
+    // The branch that gained layers is the one that owes derivation, and it is not the one the
+    // command names — a merge replays a child onto its parent, so the parent is read back off the
+    // child's fork point.
+    let parent = registry
+        .branches
+        .all()
+        .into_iter()
+        .find(|b| b.id == child_id)
+        .and_then(|child| child.origin)
+        .and_then(|origin| registry.layers.layer(origin))
+        .map(|layer| layer.branch);
+    drop(registry);
+    match parent {
+        Some(parent) => auto_derive(args, parent).await,
+        None => Ok(()),
+    }
 }
 
 /// The JSON a `borg def push` file holds.
@@ -507,7 +597,11 @@ async fn def_push(args: &Args, file: &str) -> Result<()> {
 
     let layer = registry.defs.push(branch, events).await?;
     println!("{layer}");
-    Ok(())
+    drop(registry);
+    // A def push commits no data, and still creates work: a producer newer than the data it maps
+    // over owes its whole source buffer (§9.6), and a `MutateField` appoints migrations that owe
+    // every existing value.
+    auto_derive(args, branch).await
 }
 
 async fn def_show(args: &Args, name: &str) -> Result<()> {
@@ -576,6 +670,47 @@ async fn layer_head(args: &Args) -> Result<()> {
     let branch = branch_of(&registry, args.branch.as_deref())?;
     println!("{}", registry.layers.head(branch).unwrap_or(LayerId(0)));
     Ok(())
+}
+
+/// Wait until every producer on the branch has incorporated a layer. SPEC.md §10.5.
+///
+/// This is read-after-write consistency for the clients that want it: note the layer your write
+/// landed in, wait for it, then read. `FrontierTracker::reaches` is the primitive and it awaits an
+/// in-process signal — but the CLI is process-per-command, so the frontier this process holds only
+/// moves if this process derives. Whoever is catching the branch up is someone else's process, and
+/// the store is where the two meet, which is why the wait is a sequence of awaits over freshly
+/// opened registries rather than one long one. When derivation runs in-process, the loop is what
+/// goes away; the await inside it is already the right shape.
+///
+/// `--timeout 0`, the default, therefore means "answer now", and exit status is the answer.
+async fn frontier_reaches(args: &Args, layer: &str) -> Result<()> {
+    const POLL: Duration = Duration::from_millis(100);
+    let target = layer_id(layer);
+    let deadline = Instant::now() + Duration::from_secs(args.timeout);
+
+    loop {
+        let registry = open(args).await?;
+        let branch = branch_of(&registry, args.branch.as_deref())?;
+        let producers = registry.producers_of(branch).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let slice = remaining.min(POLL);
+
+        if tokio::time::timeout(slice, registry.frontier.reaches(branch, &producers, target))
+            .await
+            .is_ok()
+        {
+            println!("{target} reached");
+            return Ok(());
+        }
+        if remaining <= POLL {
+            // Non-zero exit, so `borg frontier reaches L7 && report` does the obvious thing.
+            return Err(BorgError::Storage(format!(
+                "{target} not reached: the branch is settled through {}",
+                registry.settled(branch).await?
+            )));
+        }
+        drop(registry);
+    }
 }
 
 async fn frontier(args: &Args) -> Result<()> {
@@ -822,7 +957,9 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
     if !events.is_empty() {
         registry.defs.push(branch, events).await?;
     }
-    save_impls(args, &impls)
+    drop(registry);
+    save_impls(args, &impls)?;
+    auto_derive(args, branch).await
 }
 
 /// Record where a producer's code lives. Producer ids are stable across pushes, so this replaces
@@ -874,17 +1011,27 @@ async fn producer_list(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Run every producer forward to head.
-async fn derive(args: &Args) -> Result<()> {
+/// Open the store with an executor that can run this store's producers, and make the engine aware
+/// of the ones defined on the branch.
+///
+/// Three paths need exactly this and need it identically: `borg derive`, the auto-derivation that
+/// follows a write, and a `--freshness current` read. Producer *definitions* live in the log and
+/// producer *implementations* in the sidecar beside it (§9.2), so being able to run anything at all
+/// means joining the two — and doing that in three places is how they drift.
+async fn open_deriving(args: &Args) -> Result<(Registry, Arc<borg_exec_process::ProcessExecutor>)> {
     let storage = Arc::new(SqliteStorage::open(&args.store)?);
     let impls = load_impls(args);
 
+    // A worker resolves the `Company#1` shorthand against the allocating branch, which is a fact
+    // about the store — so the store has to be open before the executor can be built.
     let probe = Registry::open(
         Arc::clone(&storage) as Arc<_>,
         Arc::new(NativeExecutor::new()),
     )
     .await?;
     let allocation = allocation_branch(&probe)?;
+    drop(probe);
+
     let executor = borg_exec_process::from_registrations(
         allocation,
         impls
@@ -892,25 +1039,128 @@ async fn derive(args: &Args) -> Result<()> {
             .iter()
             .map(|p| (p.id, p.command.clone(), p.source.clone())),
     );
-    drop(probe);
-
     let registry = Registry::open(storage, Arc::clone(&executor) as Arc<_>).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
 
-    // Producer definitions live in the log; this makes the engine aware of the ones on this branch.
+    let branch = branch_of(&registry, args.branch.as_deref())?;
     let path = registry.branches.read_path(branch, None)?;
-    let view = registry.defs.view(&path).await?;
-    for def in view.producers() {
+    for def in registry.defs.view(&path).await?.producers() {
         registry.engine.register(def.clone());
     }
+    Ok((registry, executor))
+}
 
+/// Run every producer forward to head.
+///
+/// **Works on a paused branch.** Pausing means "do not auto-derive", not "refuse to derive" — which
+/// is the whole point of having the switch: freeze the automation, then step it by hand.
+async fn derive(args: &Args) -> Result<()> {
+    let (registry, workers) = open_deriving(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
     let executed = registry.engine.catch_up(branch).await?;
-    executor.shutdown().await;
+    workers.shutdown().await;
 
     if args.count_only {
         println!("{executed}");
     } else {
         println!("{executed} invocation(s)");
     }
+    Ok(())
+}
+
+/// Catch a branch up after a commit. SPEC.md §9.6.
+///
+/// **This is what "materialization is continuous" means here.** The CLI is process-per-command, so
+/// there is no daemon to run a loop in; the process that commits a layer is the one in a position to
+/// chase it, and it does so before exiting. A worker pool with its own scheduler is a strictly better
+/// shape and needs a server to live in — which is the point at which this call becomes a signal
+/// rather than a call, with nothing above it changing, because §9.6 already says scheduling policy
+/// cannot affect correctness.
+///
+/// The pause check lives *here* and not in `catch_up`. The engine's job is the mechanism, and a
+/// mechanism that consults an operational switch is one `borg derive` would have to reach around —
+/// which is the shape that eventually gets it wrong.
+async fn auto_derive(args: &Args, branch: BranchId) -> Result<()> {
+    if paused_branches(args).contains(&branch.0) {
+        return Ok(());
+    }
+    // No implementations means nothing here can run, and building an executor to discover that would
+    // charge every store without producers for the ones that have them.
+    if load_impls(args).producers.is_empty() {
+        return Ok(());
+    }
+    let (registry, workers) = open_deriving(args).await?;
+    let caught_up = registry.engine.catch_up(branch).await;
+    workers.shutdown().await;
+
+    if let Err(err) = caught_up {
+        // Reported, not raised. The write this followed is ground truth whether or not anything has
+        // chased it yet, and §9.6's licence is exactly that scheduling cannot affect correctness — a
+        // write that failed because somebody else's pipeline is unrunnable would be a write failing
+        // for a reason that has nothing to do with it.
+        eprintln!("warning: auto-derivation did not complete: {err}");
+    }
+    Ok(())
+}
+
+/// Which branches auto-derivation is paused on.
+///
+/// Beside the store, like the producer-implementation table and for the same reason: this is
+/// **operational config, not log data**. Pausing does not change what is true, only when the system
+/// catches up. In the log it would be forkable, mergeable and time-travellable, and "was derivation
+/// paused at layer 400?" is not a question anybody has.
+///
+/// Branch *ids*, not names: a branch may be renamed or unnamed, and the id is what the log uses.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct DerivationConfig {
+    paused: Vec<u64>,
+}
+
+fn derivation_path(args: &Args) -> PathBuf {
+    args.store.with_extension("derivation.json")
+}
+
+fn paused_branches(args: &Args) -> Vec<u64> {
+    std::fs::read_to_string(derivation_path(args))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<DerivationConfig>(&raw).ok())
+        .unwrap_or_default()
+        .paused
+}
+
+async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+
+    let mut paused = paused_branches(args);
+    paused.retain(|id| *id != branch.0);
+    if pause {
+        paused.push(branch.0);
+    }
+    let raw = serde_json::to_string_pretty(&DerivationConfig { paused })
+        .map_err(|err| BorgError::Storage(err.to_string()))?;
+    std::fs::write(derivation_path(args), raw)
+        .map_err(|err| BorgError::Storage(err.to_string()))?;
+
+    println!(
+        "auto-derivation {} on {branch}",
+        if pause { "paused" } else { "resumed" }
+    );
+    Ok(())
+}
+
+/// Whether this branch catches itself up after a write.
+///
+/// **A pause needs no other vocabulary.** A paused branch's frontier stops advancing and every read
+/// of derived data already reports how far behind it is — so there is nothing to add to the read
+/// envelope, because a pause *is* lag and the freshness machinery already describes lag.
+async fn derive_status(args: &Args) -> Result<()> {
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let paused = paused_branches(args).contains(&branch.0);
+    println!(
+        "auto-derivation {} on {branch}",
+        if paused { "paused" } else { "running" }
+    );
+    println!("settled through {}", registry.settled(branch).await?);
     Ok(())
 }

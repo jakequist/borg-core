@@ -85,18 +85,19 @@ loud. The workspace is deliberately thin.
 
 Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 
-- Derivation runs only when asked (`borg derive`). There is no scheduler yet.
-- `FreshnessRequirement::Current` behaves as `Validated` — it does not compute inline yet.
+- Auto-derivation happens in the process that commits a layer, not in a scheduler of its own. A
+  write therefore pays for the derivation it causes; §9.6 says that is a latency property, not a
+  semantic one, and a server moves the same call behind a signal.
 - `settle()` is sequential; parallel workers need its round-ceiling reworked.
 - `scan_buffer` and `read_layer` materialise results before streaming them.
 - SQLite `Registry::open` rebuilds indexes by replaying the log — `O(log)` per CLI invocation.
 - Writes to list and untyped-container cells are **not** validated: there is no `ListDef` event to
   validate against, so requiring a declaration would make them unwritable (§8).
-- Migrations run only when `borg derive` is called, like every other producer. A read at a version
-  nothing has materialized yet reports `stale`, honestly; it does not compute the hop inline. That is
-  `FreshnessRequirement::Current`, above.
 - Nothing registers a ClientVersion as live (§5.5), so the live-version set is empty and every
   migration materializes. Real clients arrive with the network layer.
+- `borg frontier reaches` polls the store between awaits, because the CLI is process-per-command and
+  the frontier one process holds only moves if that process derives. The await inside the loop is
+  the primitive; the loop is what an in-process deriver removes.
 - `Set`, `Map`, aggregation pipelines, mid-list insertion, container isolation and generated SDKs
   are all deferred (§18).
 

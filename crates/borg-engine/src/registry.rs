@@ -20,7 +20,7 @@ use crate::defs::DefRegistry;
 use crate::derive::DerivationEngine;
 use crate::index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};
 use crate::log::LayerManager;
-use crate::resolve::{FrontierTracker, Resolver};
+use crate::resolve::{FrontierTracker, InlineDerivation, Resolver};
 use crate::seams::InProcessSequencer;
 use crate::touch::CellTouchIndex;
 use crate::values::Values;
@@ -97,6 +97,10 @@ impl Registry {
                 Arc::clone(&index),
                 Arc::clone(&defs),
                 Arc::clone(&branches),
+                // The read path's one link to derivation, and deliberately the narrowest one there
+                // is: `InlineDerivation` says "bring this cell up to date" and nothing else
+                // (SPEC.md §10.5).
+                Arc::clone(&engine) as Arc<dyn InlineDerivation>,
             ),
             storage,
             layers,
@@ -162,6 +166,31 @@ impl Registry {
     /// The branch a bare command operates on: the first root, by convention named `main`.
     pub fn default_branch(&self) -> Option<BranchId> {
         self.branches.roots().into_iter().min_by_key(|id| id.0)
+    }
+
+    /// The producers whose definitions are in force on a branch.
+    ///
+    /// Definitions travel the log, so this is branch-scoped like everything else: a pipeline pushed
+    /// on a fork is not a producer main is waiting for.
+    pub async fn producers_of(&self, branch: BranchId) -> Result<Vec<borg_core::ProducerId>> {
+        let path = self.branches.read_path(branch, None)?;
+        let view = self.defs.view(&path).await?;
+        Ok(view.producers().map(|def| def.id).collect())
+    }
+
+    /// The layer to read at for a coherent snapshot of this branch. SPEC.md §10.5.
+    ///
+    /// Everything visible here was computed from everything else visible here — the alternative to
+    /// the ragged head, where the latest of every field is served with per-field freshness. A branch
+    /// with no producers is settled at its head, because nothing derives and so nothing can be
+    /// behind.
+    pub async fn settled(&self, branch: BranchId) -> Result<LayerId> {
+        let head = self.layers.head(branch).unwrap_or(LayerId(0));
+        let producers = self.producers_of(branch).await?;
+        Ok(match self.frontier.settled(branch, &producers) {
+            Some(watermark) => self.layers.settled_ceiling(branch, watermark),
+            None => head,
+        })
     }
 
     /// Open the sanctioned write path: a layer plus the definitions it will be checked against

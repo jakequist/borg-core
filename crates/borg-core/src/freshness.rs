@@ -34,7 +34,12 @@ pub enum FreshnessRequirement {
     Any,
     /// Check the dependency index before answering; no user code runs.
     Validated,
-    /// Compute inline if necessary and block until correct.
+    /// Compute inline if necessary and block until correct — including whatever this cell's inputs
+    /// need first, and including a migration hop that has not run.
+    ///
+    /// It brings *this cell* up to date and deliberately leaves the producer's watermark where it
+    /// was: a watermark speaks for all of a producer's output, and one entity computed on demand
+    /// says nothing about the rest.
     Current,
 }
 

@@ -20,6 +20,7 @@ borg-storage-sqlite.workspace = true
 borg-exec-native.workspace = true
 borg-exec-process.workspace = true
 borg-protocol.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `time` is what bounds `borg frontier reaches`: a wait with no deadline is a hang.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 serde.workspace = true
 serde_json.workspace = true

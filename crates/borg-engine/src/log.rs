@@ -224,6 +224,37 @@ impl LayerManager {
             .collect()
     }
 
+    /// The highest layer that reads as a coherent snapshot of a settled frontier.
+    /// SPEC.md §10.5, §16.5.
+    ///
+    /// A watermark points into the **source** stream, and the derived layers carrying a source
+    /// layer's consequences have *higher* ids than it — so bounding a read at the watermark itself
+    /// would show the source data and hide everything computed from it, which is the opposite of
+    /// coherent. The ceiling is instead the longest prefix of the branch's layers in which nothing
+    /// is unsettled: layers at or below the watermark, plus derived layers reflecting one of them,
+    /// stopping at the first layer that is neither.
+    ///
+    /// A prefix rather than a filter, because a `ReadPath` bound is one layer id. That costs
+    /// precision in one case — a producer that has run ahead of the slowest one has derived layers
+    /// above an unsettled source layer, and they are excluded — and losing them is the safe
+    /// direction: what remains is still a world nothing in it is behind.
+    pub fn settled_ceiling(&self, branch: BranchId, watermark: LayerId) -> LayerId {
+        let mut layers = self.layers_of(branch);
+        layers.sort_by_key(|layer| layer.id.0);
+        let mut ceiling = LayerId(0);
+        for layer in layers {
+            let settled = match layer.author {
+                LayerAuthor::Source => layer.id.0 <= watermark.0,
+                LayerAuthor::Derived { reflects, .. } => reflects.0 <= watermark.0,
+            };
+            if !settled {
+                break;
+            }
+            ceiling = layer.id;
+        }
+        ceiling
+    }
+
     pub fn storage(&self) -> Arc<dyn StorageProvider> {
         Arc::clone(&self.storage)
     }

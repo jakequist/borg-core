@@ -22,6 +22,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../lib.sh"
 setup
 
+# Auto-derivation is paused throughout, on both branches. Every step below is about *when* a
+# migration has run and what a read says before it has, and a branch that catches itself up would
+# answer those questions before they could be asked. Pausing is per branch and does not stop
+# `borg derive`, so the story is the same one, stepped.
+borg derive pause >/dev/null
+
 # --- A field, and some data ------------------------------------------------------------------------
 
 # `Company.founded` starts life as a String holding an ISO date. The repo is a repo of pure schema:
@@ -36,6 +42,10 @@ assert_eq "$(borg get 'Company#1.founded' --value)" "1999-06-01" "and holds a da
 # --- Fork, then change the field's type on the fork --------------------------------------------------
 
 borg branch fork main --at "$(borg layer head)" --name feature >/dev/null
+
+# The switch is per branch, and a fork does not inherit it — a fork is a new branch with its own
+# operational settings, and pausing is not a fact in the log to be carried across.
+borg derive pause --branch feature >/dev/null
 
 # The same repo, one version on: `founded` is now an `Int` holding the year, and the field names the
 # two scripts that bridge the change. `borg repo push` sees a declared field whose type has moved and

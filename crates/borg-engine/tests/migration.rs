@@ -72,8 +72,14 @@ impl Harness {
         ));
         Self {
             layers,
-            engine,
-            resolver: Resolver::new(storage, index, defs.clone(), branches.clone()),
+            engine: engine.clone(),
+            resolver: Resolver::new(
+                storage,
+                index,
+                defs.clone(),
+                branches.clone(),
+                engine.clone(),
+            ),
             frontier,
             defs,
             executor,
@@ -259,6 +265,55 @@ async fn a_migration_materializes_the_new_version_without_disturbing_the_old() -
     // A migration carries a watermark like any other producer — pointing into the *source* stream,
     // not at head, which by now is the derived layer it just committed (SPEC.md §6.3).
     assert_eq!(h.frontier.watermark(BRANCH, UP), source);
+    Ok(())
+}
+
+/// The other half of "a migration is an eager producer, so a version it has not reached yet is lag
+/// like any other lag" (SPEC.md §10.4). The lag is real, and a reader unwilling to take it says so.
+#[tokio::test]
+async fn a_version_no_migration_has_reached_yet_is_computed_on_demand() -> Result<()> {
+    let h = Harness::new();
+    let (v_from, v_to) = declare_then_mutate(&h).await?;
+    h.install(UP, website_up());
+    h.engine.register(migration_def(UP, MigrationDirection::Up));
+
+    let acme = company(600);
+    h.push(v_from, vec![(prop(acme, "website"), Value::Int(9))])
+        .await?;
+    // Deliberately no catch-up: the migration exists, is implemented, and has not run.
+    let behind = h.read(&prop(acme, "website"), v_to).await?;
+    assert_eq!(
+        behind.state,
+        Freshness::Stale,
+        "the reachability check found a path here and reports that nothing has walked it"
+    );
+    assert_eq!(behind.value, None);
+
+    let computed = h
+        .resolver
+        .resolve(
+            BRANCH,
+            &prop(acme, "website"),
+            None,
+            v_to,
+            FreshnessRequirement::Current,
+        )
+        .await?;
+    assert_eq!(
+        computed.value,
+        Some(Value::Int(90)),
+        "the same path the read walked to prove reachability is the one that gets run"
+    );
+    assert_eq!(computed.state, Freshness::Current);
+    assert_eq!(computed.by, Some(UP));
+
+    // The migration has produced one cell, not caught up. Nothing about the rest of the branch was
+    // claimed on its behalf.
+    assert_eq!(
+        h.frontier.watermark(BRANCH, UP),
+        LayerId(0),
+        "computing one entity inline does not advance a migration's watermark"
+    );
     Ok(())
 }
 

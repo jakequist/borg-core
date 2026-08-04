@@ -10,7 +10,7 @@
 use crate::defs::DefView;
 use crate::index::{DependencyIndexProvider, Invocation};
 use crate::log::LayerManager;
-use crate::resolve::FrontierTracker;
+use crate::resolve::{FrontierTracker, InlineDerivation};
 use crate::seams::WorkGap;
 use crate::values::Values;
 use crate::write::WriteSession;
@@ -22,12 +22,32 @@ use borg_core::{
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_storage::StorageProvider;
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 /// How many times one invocation may re-run at a fixed branch head before it is judged to be
 /// cycling. SPEC.md §16.5.
 const CYCLE_RERUN_LIMIT: u32 = 8;
+
+/// Which layers one producer run is pinned to.
+///
+/// Three layer ids that coincide inside a settling round and must not be assumed to. Naming them
+/// separately is what lets an inline computation (§10.5) reuse this code path without lying about a
+/// producer's progress.
+#[derive(Clone, Copy)]
+struct RunAt {
+    /// What the output *claims*: the source layer through which its inputs have been incorporated,
+    /// written into every cell's `fresh_as_of` (SPEC.md §10.1).
+    fresh_as_of: LayerId,
+    /// What the derived *layer* is labelled with, and therefore what a restart folds back into the
+    /// producer's watermark. Equal to `fresh_as_of` inside a round; deliberately behind it for an
+    /// inline run, which speaks for one cell and must not advance a whole producer's frontier.
+    reflects: LayerId,
+    /// The ancestry bound the run's reads resolve through — the round's ceiling (SPEC.md §16.5).
+    read_at: LayerId,
+}
 
 /// The mediated view of the world handed to producer code.
 ///
@@ -40,11 +60,11 @@ struct RecordingCtx<'a> {
     values: &'a Values,
     /// This round's ancestry, resolved once rather than per read.
     path: ReadPath,
-    /// The source layer this run is bringing the world up to. This is the *label* on the output, not
-    /// where its inputs are read from: a producer consuming another producer's output must see that
+    /// The layer this run is bringing the world up to. This is the *label* on the output, not where
+    /// its inputs are read from: a producer consuming another producer's output must see that
     /// output, which lives in a derived layer with a higher id than the source layer they both
     /// reflect.
-    reflects: LayerId,
+    fresh_as_of: LayerId,
     producer: ProducerId,
     /// The def-view this producer's code was authored against. Reads resolve here and writes are
     /// labelled with it. For a migration it is the version it *produces*: a migration is the lens
@@ -90,7 +110,7 @@ impl ProducerCtx for RecordingCtx<'_> {
     async fn set(&mut self, cell: &CellRef, value: Value) -> Result<()> {
         let derivation = Derivation {
             producer: self.producer,
-            fresh_as_of: self.reflects,
+            fresh_as_of: self.fresh_as_of,
             read_set: self.read_set.clone(),
         };
         self.session.set_derived(cell, value, derivation).await?;
@@ -106,7 +126,7 @@ impl ProducerCtx for RecordingCtx<'_> {
     async fn set_text(&mut self, cell: &CellRef, text: &str) -> Result<()> {
         let derivation = Derivation {
             producer: self.producer,
-            fresh_as_of: self.reflects,
+            fresh_as_of: self.fresh_as_of,
             read_set: self.read_set.clone(),
         };
         // The session parses against the field's declared type, so a worker sending `true` into a
@@ -308,10 +328,12 @@ impl DerivationEngine {
                         break;
                     }
 
-                    match self
-                        .run(branch, &def, &defs, invocation.input, source_layer, ceiling)
-                        .await
-                    {
+                    let at = RunAt {
+                        fresh_as_of: source_layer,
+                        reflects: source_layer,
+                        read_at: ceiling,
+                    };
+                    match self.run(branch, &def, &defs, invocation.input, at).await {
                         Ok(derived) => {
                             executed += 1;
                             if derived.0 > ceiling.0 {
@@ -488,8 +510,7 @@ impl DerivationEngine {
         def: &ProducerDef,
         defs: &DefView,
         input: Pid,
-        reflects: LayerId,
-        read_at: LayerId,
+        at: RunAt,
     ) -> Result<LayerId> {
         // A migration's ClientVersion is the version it produces: it reads the world at that view
         // and writes that version. Its own source cell is the one exception, reached through
@@ -510,12 +531,12 @@ impl DerivationEngine {
             &self.layers,
             &self.defs,
             branch,
-            Some(read_at),
+            Some(at.read_at),
             version,
             Writer::Producer(def.id),
             LayerAuthor::Derived {
                 producer: def.id,
-                reflects,
+                reflects: at.reflects,
             },
         )
         .await?;
@@ -527,8 +548,8 @@ impl DerivationEngine {
         let mut ctx = RecordingCtx {
             storage: self.storage.as_ref(),
             values: &self.values,
-            path: self.branches.read_path(branch, Some(read_at))?,
-            reflects,
+            path: self.branches.read_path(branch, Some(at.read_at))?,
+            fresh_as_of: at.fresh_as_of,
             producer: def.id,
             version,
             input_version,
@@ -563,5 +584,127 @@ impl DerivationEngine {
             .lock()
             .unwrap()
             .insert((branch, producer), err.to_string());
+    }
+
+    /// Bring one cell up to date, recursing into whatever it was computed from.
+    ///
+    /// `computing` is the cells already being brought up to date further up this stack, and it is
+    /// what makes the recursion safe. §16.5's re-run counter cannot help here: it is scoped to a
+    /// settling round, and there is no round — an inline computation is one client's request, not a
+    /// consequence of a source layer. A chain that loops back on itself instead hits a cell it is
+    /// already computing and stops there, leaving that cell as it stands. The read that follows
+    /// reports it honestly, which is the same outcome the round-based detector arrives at by a
+    /// different route.
+    fn refresh<'a>(
+        &'a self,
+        branch: BranchId,
+        cell: CellRef,
+        version: ClientVersion,
+        computing: &'a mut HashSet<CellAt>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if !computing.insert(CellAt::new(cell.clone(), version)) {
+                return Ok(());
+            }
+
+            // Re-resolved on every step rather than hoisted: each producer this runs commits a
+            // layer, so the world a later hop reads is not the world the first one saw.
+            let path = self.branches.read_path(branch, None)?;
+            let defs = self.defs.view(&path).await?;
+
+            let Some(record) = self.storage.get_cell(&path, &cell, version).await? else {
+                // Nothing is materialized at this version. What is owed is a migration, and the
+                // hops that owe it are exactly the ones the reader's reachability check walks
+                // (SPEC.md §10.4) — the resolver computes that path already and, until now, never
+                // invoked it.
+                let available = self.storage.cell_versions(&path, &cell).await?;
+                let Some((from, hops)) = available.iter().find_map(|from| {
+                    defs.path(&cell.buffer, *from, version)
+                        .map(|hops| (*from, hops))
+                }) else {
+                    // No path here from any materialized version: this reader's ClientVersion is
+                    // unreachable, and no amount of computing changes that (SPEC.md §9.3).
+                    return Ok(());
+                };
+                // The far end of the chain may itself be behind — a migration reads a value some
+                // pipeline owes.
+                self.refresh(branch, cell.clone(), from, computing).await?;
+                for hop in hops {
+                    self.run_now(branch, hop.producer, *cell.pid(), &defs)
+                        .await?;
+                }
+                return Ok(());
+            };
+
+            // Source data is ground truth; there is nothing to compute and nothing behind it.
+            let Some(derivation) = record.derivation else {
+                return Ok(());
+            };
+            // Inputs first, so that the run below reads a settled world and can honestly claim to
+            // reflect head. Doing it the other way round would compute this cell from stale inputs
+            // and label the result current, which is the one thing §10 does not permit.
+            for dependency in derivation.read_set {
+                self.refresh(branch, dependency.cell, dependency.version, &mut *computing)
+                    .await?;
+            }
+            self.run_now(branch, derivation.producer, *cell.pid(), &defs)
+                .await
+        })
+    }
+
+    /// One producer run, outside any round.
+    ///
+    /// **It does not advance the producer's watermark**, and the derived layer it commits is
+    /// labelled with the watermark the producer already had. A watermark is a claim about *all* of a
+    /// producer's output (§10.1); one entity computed on demand says nothing about the other
+    /// hundred thousand, and letting it advance the frontier would make a single `current` read
+    /// declare a whole branch caught up.
+    ///
+    /// That is also what makes this self-healing. The work stays outstanding, so the next round
+    /// redoes it in the ordinary way and the consequences the round-based invalidator would have
+    /// propagated — downstream producers, chained migrations — still get propagated.
+    async fn run_now(
+        &self,
+        branch: BranchId,
+        producer: ProducerId,
+        input: Pid,
+        defs: &DefView,
+    ) -> Result<()> {
+        let Some(def) = self.producers.lock().unwrap().get(&producer).cloned() else {
+            // The definition is on the branch but no implementation is resolvable in this process.
+            // Not an error: the read simply reports the lag it already had.
+            return Ok(());
+        };
+        if self.is_broken(branch, producer).is_some() {
+            return Ok(());
+        }
+        // Read at head, claim head. The two coincide here precisely because there is no round: the
+        // ceiling a round exists to compute *is* the head once every input has been settled above.
+        let head = self.layers.head(branch).unwrap_or(LayerId(0));
+        let at = RunAt {
+            fresh_as_of: head,
+            reflects: self.frontier.watermark(branch, producer),
+            read_at: head,
+        };
+        // Errors propagate rather than poisoning. Poisoning is a judgement about a producer, made
+        // while settling a round; a failure here is the answer to one client's request, and the
+        // client that asked to pay for a fresh value is the one entitled to hear why it could not
+        // have one (SPEC.md §14).
+        self.run(branch, &def, defs, input, at).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl InlineDerivation for DerivationEngine {
+    async fn compute_now(
+        &self,
+        branch: BranchId,
+        cell: &CellRef,
+        version: ClientVersion,
+    ) -> Result<()> {
+        let mut computing = HashSet::new();
+        self.refresh(branch, cell.clone(), version, &mut computing)
+            .await
     }
 }

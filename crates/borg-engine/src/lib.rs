@@ -53,7 +53,7 @@ pub use index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};
 pub use log::{LayerHandle, LayerManager};
 pub use registry::Registry;
 pub use resolve::FrontierTracker;
-pub use resolve::{Lineage, LineageEdge, Resolver};
+pub use resolve::{InlineDerivation, Lineage, LineageEdge, Resolver};
 pub use seams::InProcessSequencer;
 pub use seams::{LayerSequencer, LockManager, WorkGap, WorkSource};
 pub use touch::CellTouchIndex;

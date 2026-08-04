@@ -112,8 +112,14 @@ impl Harness {
 
         Ok(Self {
             layers,
-            engine,
-            resolver: Resolver::new(storage, index, defs.clone(), branches.clone()),
+            engine: engine.clone(),
+            resolver: Resolver::new(
+                storage,
+                index,
+                defs.clone(),
+                branches.clone(),
+                engine.clone(),
+            ),
             defs,
         })
     }

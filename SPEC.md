@@ -859,11 +859,38 @@ re-execution safe and is the concrete form of the idempotency guarantee.
 ### 9.6 Scheduling
 
 Materialization is **asynchronous and continuous**. A source write commits immediately; the
-derivation engine chases it and advances watermarks.
+derivation engine chases it and advances watermarks. Nothing has to ask.
 
 Because every derived value states what it reflects, the scheduling policy **cannot affect
 correctness, only latency.** `NaiveEagerProducerPolicy` in v1; smarter prioritized policies later,
 provably without regression.
+
+That licence is what makes the *shape* of the chase an implementation matter. v1 runs it in the
+process that commits the layer: catch-up follows commit, before the caller returns. It is therefore
+synchronous with the writer and asynchronous with every reader, which is the half that carries the
+meaning — a reader never waits for derivation, and never receives a value pretending not to have
+waited. A server hosting a worker pool moves the same call behind a signal, and nothing above it
+changes.
+
+#### Pausing
+
+Auto-derivation is a **branch-scoped switch**, default on. Pausing a branch stops the chase; it does
+not stop derivation. Explicit catch-up still runs on a paused branch — freeze the automation, then
+step it by hand — which is what makes the switch usable in an emergency rather than a way to lose
+data.
+
+It is **operational config, not log data**, and lives beside the store with the producer
+implementations (§9.2). Pausing changes when the system catches up, not what is true, so it is not
+an event: in the log it would be forkable, mergeable and time-travellable, and *"was derivation
+paused at layer 400?"* is not a question with a use.
+
+**A pause needs no vocabulary of its own.** A paused branch's frontier stops advancing, and every
+read of derived data already reports how far behind it is (§10.4). A pause *is* lag, and the
+freshness envelope already describes lag — so nothing is added to it.
+
+There is deliberately no per-*producer* pause. A broken producer is already scoped by `IllegalState`
+(§14), and *"expensive but not broken"* is a scheduling-policy question, better answered by a policy
+than by a second switch.
 
 **Invalidation is driven by layer commit, not by buffer instrumentation.** A committed layer *is* the
 changeset — it already names precisely which cells moved — so buffers require no observation
@@ -984,12 +1011,41 @@ company#100:
 read(pid, field, { freshness: 'any' | 'validated' | 'current' })
 ```
 
+| Requirement | What it does | Runs user code |
+|---|---|---|
+| `any` | serves the stored value and states whether it is at the requested layer | no |
+| `validated` | walks the read-set first, so the reported watermark is tight (§10.2) | no |
+| `current` | computes inline and blocks until the answer is correct | yes |
+
 `current` forces inline computation and blocks. **Lazy materialization is therefore a per-read client
 mode, not a system architecture** — a client that needs a fresh answer pays for it at the call site;
 everyone else takes the lag.
 
+Three things follow from `current` being a *read*:
+
+- **It computes what it needs, not what it is asked for.** A cell's inputs may themselves be behind,
+  and computing from a stale input while labelling the result current is the one thing §10 does not
+  permit. So the read-set is followed first, recursively, and the producers behind it run in
+  dependency order. A chain that leads back to a cell already being computed stops there, which is
+  what bounds the recursion — the round-scoped re-run counter of §16.6 cannot help, because an
+  inline computation is one client's request and not the consequence of a source layer.
+- **It does not advance a watermark.** A watermark is a claim about *all* of a producer's output
+  (§10.1); one entity computed on demand says nothing about the other hundred thousand. The work
+  therefore stays outstanding and the next round does it again in the ordinary way — which is what
+  keeps the consequences a round would have propagated, downstream producers included, from being
+  lost.
+- **A missing version is one of the things it computes.** A value not yet materialized at the
+  reader's def-version is a migration that has not run (§10.4), and the hops the reachability check
+  walks to prove the version is reachable are exactly the ones `current` runs.
+
+A read pinned to a layer *below* head is a historical read, and `current` means what `validated`
+means there: nothing can make the past current, and a value computed now would land in a layer above
+the one being read through.
+
 **Await the frontier:** `await branch.frontier.reaches(L500)` — read-after-write consistency for the
-clients that need it, and deterministic tests without a synchronous system.
+clients that need it, and deterministic tests without a synchronous system. It returns when every
+producer on the branch has incorporated `L500`, and takes no deadline of its own: how long to wait is
+the caller's policy, and a primitive that chooses one has to be worked around.
 
 **Two consistency modes, both honest:**
 
@@ -998,6 +1054,12 @@ clients that need it, and deterministic tests without a synchronous system.
   Fully coherent snapshot, slightly in the past.
 
 A dashboard wants ragged; a report wants settled.
+
+A watermark points into the **source** stream, and the derived layers carrying a source layer's
+consequences have higher ids than it — so the layer a settled read resolves at is not the watermark
+itself but the highest layer below which nothing is unsettled: layers at or under the watermark, plus
+derived layers reflecting one of them. This is §16.5's round ceiling asked about the branch rather
+than about one round.
 
 ---
 
@@ -1245,6 +1307,12 @@ def-mutation on a large type enqueues millions. Three properties fall out of hav
 - **Distributability** — workers derive their own work from shared state instead of contending on a
   shared queue.
 
+The pause switch (§9.6) does not qualify this. It is a single per-branch flag saying whether the
+scheduler is *invoked*, not a record of what it would do; nothing about which work is pending is
+remembered anywhere, and a paused branch resumed a week later derives exactly the same gap it would
+have derived a week earlier. The same is true of a `current` read, which invokes producers without
+enqueueing anything.
+
 ### 16.5 A source layer settles as a closure
 
 A committed layer triggers producers; their output commits further layers, which trigger more.
@@ -1281,6 +1349,11 @@ producer runs, advances its watermark, dirties its own input, and is rediscovere
 **v1 detection is a per-invocation re-run counter scoped to one round (§16.5).** If an invocation
 runs more than `K` times while settling a single source layer, it is cycling; the producer is marked
 broken (§14) and its output cells report `state: 'broken'`.
+
+An inline computation (§10.5) has no round to scope a counter to, and does not livelock either: it
+walks *recorded* read-sets rather than being rediscovered by a scheduler, so a cycle appears as
+re-entry and is stopped by refusing to compute a cell already being computed further up the same
+call. That cell keeps whatever value it has, and the read describes it honestly.
 
 *(The precise form — walk the forward index from each written cell and test whether it reaches
 anything in the transitive closure of the read-set — is deferred to a v2 policy provider.)*

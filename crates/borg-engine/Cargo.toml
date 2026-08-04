@@ -19,4 +19,6 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 [dev-dependencies]
 borg-exec-native.workspace = true
 borg-storage-sqlite.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+# `time` is dev-only: the waiting primitive itself takes no deadline (a deadline is the
+# caller's policy), but a test asserting that a wait *does not* return needs one.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

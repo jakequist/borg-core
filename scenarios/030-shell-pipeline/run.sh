@@ -5,6 +5,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../lib.sh"
 setup
 
+# Derivation runs itself after every write (§9.6). This scenario is about *which* invocations a
+# write causes, and counting them means being the one who asks — so the automation is paused and the
+# rounds are stepped by hand. That `borg derive` still works here is the point of pausing meaning
+# "do not auto-derive" rather than "refuse to derive".
+borg derive pause >/dev/null
+
 borg repo push "$HERE"/../030-shell-pipeline/repo
 assert_contains "$(borg producer list)" "invest" \
     "the script described itself, and the server recorded a producer definition"

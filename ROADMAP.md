@@ -26,7 +26,12 @@ the parent is untouched; a def-only merge carries both and the parent's values f
 authored against the old schema goes on reading and writing the old shape — or is told plainly that
 it is broken, when the push supplied no way back.
 
-What remains before "Act 1 is the modern ORM" is true: derivation that runs without being asked (D).
+**Derivation runs without being asked.** A write catches its branch up on the way out, a read can pay
+to be current at the call site instead of taking the lag, a client can wait for the frontier to reach
+its own write, and a report can read the whole branch at the point everything agrees. The automation
+is pausable per branch, and a paused branch reports its lag in the vocabulary that already existed.
+
+What remains before "Act 1 is the modern ORM" is true: concurrency — the second half of D.
 
 ---
 
@@ -115,6 +120,19 @@ compute inline; add `frontier.reaches()`; add the branch-scoped pause switch.
 Concurrency is folded in here because it is the same work: a background loop is exactly where you
 parallelise, and `settle()`'s round-ceiling is what both need reworked. Deferring it this long is a
 deliberate bet that the sequential assumption lives in one function — it should not slide past C.
+
+**The freshness half is done.** `Current` computes inline for real, through a narrow
+`InlineDerivation` seam the resolver holds instead of the engine; it follows recorded read-sets so a
+cell's inputs are computed before the cell, and it runs migration hops, which closes the gap C left
+where a version nothing had materialized read `stale` forever. Derivation now follows every commit
+unless the branch is paused, and `borg derive pause | resume | status` is that switch, beside the
+store. `frontier.reaches()` and settled-frontier reads exist and are exposed as
+`borg frontier reaches <layer>` and `borg get --settled`. §9.6, §10.5, §16.4 and §16.6 are updated,
+`scenarios/090-freshness-controls` is the proof, and 040 now demonstrates lag by pausing rather than
+by declining to derive. Three decisions came out of it, below.
+
+**Concurrency is not.** `settle()` is still sequential and its round-ceiling still assumes derivation
+is the only writer.
 
 ### Deferred, still
 
@@ -228,6 +246,61 @@ than with a second switch.
 derived data already reports `stale` with a watermark showing how far behind. No new vocabulary
 needed — a pause *is* lag, and the freshness envelope already describes lag.
 
+**Implemented in D.** The switch is a per-branch flag in a sidecar next to the implementation table,
+and the check lives in the CLI's auto-derive path rather than inside `catch_up`. The engine's job is
+the mechanism; a mechanism that consulted an operational switch is one `borg derive` would have to
+reach around, which is the shape that eventually gets it wrong. A fork does not inherit the flag,
+which follows from the flag not being in the log.
+
+### Background derivation follows the commit that caused it
+
+The CLI is process-per-command, so "background" had to mean something. Considered: a `borg watch`
+foreground loop, and a daemon. Chosen: **the process that commits a layer catches the branch up
+before it exits** — after `set`, `delete`, `def push`, `repo push` and the parent side of a merge.
+
+A daemon is a real answer and the wrong one to build first: it needs a lifecycle, a socket and a
+supervision story, none of which the scenarios could then run without. A `watch` loop is a daemon
+with the supervision left to the user, and would leave every existing scenario needing a second
+terminal.
+
+What is bought is that **no scenario says `borg derive` unless it is making a point about rounds**,
+which is the observable claim §9.6 makes. What is not bought is asynchrony from the *writer's* point
+of view: a write now pays for the derivation it causes. That is a v1 latency property and not a
+semantic one — §9.6's licence is precisely that scheduling policy cannot affect correctness — and it
+is the property a server with a worker pool changes by moving one call behind a signal.
+
+A def push auto-derives too, which is not obvious: it commits no data. It creates work anyway, since
+a producer newer than its data owes its whole source buffer (§9.6) and a `MutateField` appoints
+migrations that owe every existing value.
+
+### An inline computation does not advance a watermark
+
+`FreshnessRequirement::Current` runs producers, and the obvious thing — label the output with head,
+like a round does — is wrong twice over. A watermark is a claim about *all* of a producer's output,
+so one entity computed on demand advancing it would declare a whole branch caught up on the strength
+of one read; and because watermarks are rebuilt from derived layers' `reflects` on open, the lie
+would survive the process.
+
+So an inline run labels its *layer* with the watermark the producer already had, while labelling the
+*cell* with head. The cell's claim is true — its inputs were computed first, recursively, precisely
+so that it is — and the producer's claim does not move.
+
+The side effect is the good one: the work stays outstanding, so the next round redoes it and
+propagates the consequences a round propagates. Without that, an inline computation would silently
+strand every downstream producer, since nothing but a round walks the invalidation index forward.
+
+### The resolver holds an interface, not the engine
+
+`Current` needs to run producers, and handing `Resolver` the `DerivationEngine` would make the read
+path a second entry point into derivation — two callers of `settle`, two opinions about what a round
+is, and a dependency edge pointing both ways as soon as anything in the engine wanted to read.
+
+`InlineDerivation` is one method: *bring this cell up to date*. Not catch a branch up, not settle a
+round, not register a producer. That is the whole of what a read needs, and stating it as an
+interface is what makes §10.5's claim structural rather than aspirational: with this seam the read
+path is a **client** of derivation, which is exactly what "lazy materialization is a per-read client
+mode, not a system architecture" says it is.
+
 ### A schema change is a diff, not an instruction
 
 `describe` has no "mutate this field" — a repo emits the shape it believes in now, and `borg repo
@@ -326,3 +399,8 @@ in `def_events.rs`. Nothing had exercised a branch chain deeper than one fork be
 Paid off in C: both migration directions and their non-interaction (`migration.rs`), a producer
 seeded over data that predates it, migration roles resolved from a folded chain, and the two-def-view
 write path (`write_validation.rs`). Nothing had run a `down` migration at all before.
+
+Paid off in D: the three read modes distinguished from each other, inline computation recursing
+through a chain and terminating on a cyclic read-set, an inline run proved not to advance a
+watermark, the settled frontier read against the ragged head, and `reaches` in all three of its
+cases (`freshness.rs`) — plus a migration hop computed on demand (`migration.rs`).

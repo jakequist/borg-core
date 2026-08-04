@@ -14,6 +14,7 @@ use borg_core::{
 use borg_storage::StorageProvider;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 /// Per-producer watermarks and the settled frontier. SPEC.md §10.3.
 ///
@@ -22,6 +23,11 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 pub struct FrontierTracker {
     watermarks: Mutex<HashMap<(BranchId, ProducerId), LayerId>>,
+    /// Woken whenever a watermark moves, so [`FrontierTracker::reaches`] re-checks instead of
+    /// polling on a timer. Notification carries no payload on purpose: a waiter re-reads the
+    /// frontier, which means a coalesced burst of advances is indistinguishable from one — the
+    /// property that keeps this correct once several workers advance watermarks at once.
+    advanced: Notify,
 }
 
 impl FrontierTracker {
@@ -43,23 +49,89 @@ impl FrontierTracker {
     /// Advance monotonically. Never moves backwards, so a late-arriving run cannot un-catch-up a
     /// producer.
     pub fn advance(&self, branch: BranchId, producer: ProducerId, to: LayerId) {
-        let mut marks = self.watermarks.lock().unwrap();
-        let entry = marks.entry((branch, producer)).or_insert(LayerId(0));
-        if to.0 > entry.0 {
-            *entry = to;
+        let moved = {
+            let mut marks = self.watermarks.lock().unwrap();
+            let entry = marks.entry((branch, producer)).or_insert(LayerId(0));
+            if to.0 > entry.0 {
+                *entry = to;
+                true
+            } else {
+                false
+            }
+        };
+        // Notified outside the lock: a waiter wakes to re-read the frontier, and waking it while
+        // holding the lock it is about to take is how that becomes a stall.
+        if moved {
+            self.advanced.notify_waiters();
         }
     }
 
     /// The layer through which *all* derived data on this branch is caught up — the minimum over
     /// every producer. Reading here gives a fully coherent snapshot, slightly in the past, as
     /// opposed to the ragged head (SPEC.md §10.5).
-    pub fn settled(&self, branch: BranchId, producers: &[ProducerId]) -> LayerId {
-        producers
-            .iter()
-            .map(|p| self.watermark(branch, *p))
-            .min()
-            .unwrap_or(LayerId(0))
+    ///
+    /// `None` where the branch has no producers: nothing derives, so nothing can lag, and the
+    /// settled frontier *is* the head. Returning `LayerId(0)` for that case would read as "caught up
+    /// through nothing" and make a settled read on a producerless branch see an empty world.
+    pub fn settled(&self, branch: BranchId, producers: &[ProducerId]) -> Option<LayerId> {
+        producers.iter().map(|p| self.watermark(branch, *p)).min()
     }
+
+    /// Block until every producer on this branch has incorporated `target`. SPEC.md §10.5.
+    ///
+    /// This is read-after-write consistency for the clients that want it, and deterministic tests
+    /// without making the system synchronous: write, note the layer, await it, read. Everyone else
+    /// keeps reading at whatever the frontier has got to and is told how far behind that is.
+    ///
+    /// Deliberately has no timeout of its own. A deadline is the caller's policy — a report may
+    /// happily wait a minute where an API handler must not wait at all — and a primitive that
+    /// chooses one for you is a primitive that has to be worked around.
+    pub async fn reaches(&self, branch: BranchId, producers: &[ProducerId], target: LayerId) {
+        loop {
+            // Interest is registered *before* the check. The other order loses an advance that lands
+            // between the two, and the waiter then sleeps through the very wake-up it needed.
+            let notified = self.advanced.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .settled(branch, producers)
+                .is_none_or(|settled| settled.0 >= target.0)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// *Bring this cell up to date, now.* The engine side of `FreshnessRequirement::Current`
+/// (SPEC.md §10.5).
+///
+/// The resolver holds one of these rather than the derivation engine itself, and the narrowness is
+/// the point. A read that needs a fresh answer needs exactly one thing — this cell, computed — and
+/// nothing else the engine can do: not catching a branch up, not settling a round, not registering
+/// producers. Handing the resolver the engine would make the read path a second entry point into
+/// derivation, with two callers of `settle` and two opinions about what a round is; handing it this
+/// makes the read path a *client* of derivation, which is what §10.5 says it is when it calls lazy
+/// materialization "a per-read client mode, not a system architecture".
+///
+/// It also keeps the dependency pointing one way. Derivation reads cells through storage and never
+/// through the resolver, so nothing here can close a loop.
+#[async_trait::async_trait]
+pub trait InlineDerivation: Send + Sync {
+    /// Make this cell, at this version, correct as of the branch head — running whatever producers
+    /// that takes, including the ones that produce its inputs.
+    ///
+    /// Returns `Ok(())` when there is nothing to be done, which includes the cases where the cell is
+    /// source data, where no producer here can produce it, and where the chain leading to it turns
+    /// out to be cyclic. The read that follows describes the outcome; this reports only failures the
+    /// caller could not have discovered by reading.
+    async fn compute_now(
+        &self,
+        branch: BranchId,
+        cell: &CellRef,
+        version: ClientVersion,
+    ) -> Result<()>;
 }
 
 /// One edge of a cell's provenance. SPEC.md §11.
@@ -86,6 +158,7 @@ pub struct Resolver {
     index: Arc<dyn DependencyIndexProvider>,
     defs: Arc<DefRegistry>,
     branches: Arc<BranchManager>,
+    inline: Arc<dyn InlineDerivation>,
 }
 
 impl Resolver {
@@ -94,12 +167,14 @@ impl Resolver {
         index: Arc<dyn DependencyIndexProvider>,
         defs: Arc<DefRegistry>,
         branches: Arc<BranchManager>,
+        inline: Arc<dyn InlineDerivation>,
     ) -> Self {
         Self {
             storage,
             index,
             defs,
             branches,
+            inline,
         }
     }
 
@@ -115,6 +190,13 @@ impl Resolver {
         version: ClientVersion,
         requirement: FreshnessRequirement,
     ) -> Result<Resolved<Option<Value>>> {
+        // **`Current` pays at the call site.** Everything below this line is the same read every
+        // other requirement gets; the difference is that the world has been brought up to date
+        // first. Note it happens *before* the read path is resolved, because computing commits
+        // layers and the answer must be read from after them.
+        if requirement == FreshnessRequirement::Current && self.can_compute_at(branch, layer)? {
+            self.inline.compute_now(branch, cell, version).await?;
+        }
         // `None` means HEAD — which for a fork that has not written anything yet is the fork point
         // it inherits from, not a head of its own.
         let path = self.branches.read_path(branch, layer)?;
@@ -152,6 +234,10 @@ impl Resolver {
                     Freshness::Unvalidated
                 }
             }
+            // `Current` validates too rather than assuming its own computation succeeded. If the
+            // producer that owns this cell is not resolvable here, the honest answer is still the
+            // one validation gives — which is what stops "I asked for current" from becoming "I was
+            // told current".
             FreshnessRequirement::Validated | FreshnessRequirement::Current => {
                 self.validate(&path, &derivation.read_set, derivation.fresh_as_of)
                     .await?
@@ -176,6 +262,20 @@ impl Resolver {
             },
             by: Some(derivation.producer),
         })
+    }
+
+    /// Whether computing inline could change this read's answer.
+    ///
+    /// It cannot for a read pinned below the branch head. That is a *historical* read — "what did
+    /// this say at L40" — and nothing can make the past current: whatever a producer computed now
+    /// would land in a layer above the one being read through and stay invisible. `Current` there
+    /// means what `Validated` means, and the value it returns is already the final answer for that
+    /// layer rather than a weaker version of one.
+    fn can_compute_at(&self, branch: BranchId, layer: Option<LayerId>) -> Result<bool> {
+        let Some(requested) = layer else {
+            return Ok(true);
+        };
+        Ok(requested.0 >= self.branches.read_path(branch, None)?.ceiling().0)
     }
 
     /// **Validate**: check whether anything in the read-set moved since the value was computed.
@@ -210,6 +310,10 @@ impl Resolver {
     /// materialized version exists, the honest answer is `Stale`; if no path exists, this reader's
     /// ClientVersion is unreachable, which is what a def-push without a `down` migration does to
     /// older clients (SPEC.md §9.3).
+    ///
+    /// A reader unwilling to take that lag asks for `Current`, which walks the same path and runs
+    /// its hops before the read gets here (SPEC.md §10.5). Reaching this with `Current` therefore
+    /// means the hops genuinely could not be run, and `Stale` is still the truthful answer.
     async fn resolve_unmaterialized(
         &self,
         path: &ReadPath,

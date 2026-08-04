@@ -100,7 +100,13 @@ impl Harness {
             declaring_repo: RepoId(1),
         });
 
-        let resolver = Resolver::new(storage, index, defs.clone(), branches.clone());
+        let resolver = Resolver::new(
+            storage,
+            index,
+            defs.clone(),
+            branches.clone(),
+            engine.clone(),
+        );
         Ok(Self {
             layers,
             branches,
