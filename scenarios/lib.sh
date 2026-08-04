@@ -40,11 +40,16 @@ assert_contains() {
     esac
 }
 
+# field <output> <field>
+# One `field:   value` line from a provenance envelope, without caring about column alignment.
+field() {
+    printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -1
+}
+
 # assert_field <output> <field> <expected> <description>
-# Matches a `field:   value` line without caring about column alignment.
 assert_field() {
     local got
-    got="$(printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -1)"
+    got="$(field "$1" "$2")"
     if [ "$got" != "$3" ]; then
         fail "$4
       expected $2: $3

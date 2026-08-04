@@ -48,6 +48,8 @@ struct Args {
     version: Option<LayerId>,
     value_only: bool,
     count_only: bool,
+    /// `--rebuild`. See [`derive`].
+    rebuild: bool,
     /// `--freshness`. What a read is willing to pay for (SPEC.md §10.5).
     freshness: FreshnessRequirement,
     /// `--settled`: read at the settled frontier rather than at the ragged head.
@@ -79,6 +81,7 @@ borg — an event-sourced data backend
   borg repo push <dir>                 push a repo: defs and pipelines
   borg producer list                   registered producers
   borg derive [--count]                run producers until caught up
+  borg derive --rebuild                recompute derived data from source, ignoring the cache
   borg derive pause | resume | status  auto-derivation on this branch
 
   borg layer list | borg layer head
@@ -114,6 +117,11 @@ A paused branch needs no special vocabulary: its frontier stops advancing, and e
 data already reports how far behind it is. `borg derive` still works while paused — that is what
 makes pausing useful in an emergency.
 
+Derived layers are a cache that happens to live in the log, and dropping them loses nothing because
+source is separate. `borg derive --rebuild` is that fallback: it forgets what has been derived here
+and recomputes it from source. Run on a fork, it recomputes the world as of the fork point without
+touching the branch it forked from — which is how you check a watermark rather than trust it.
+
 Options:
   --store <path>            store file (default ./borg.db)
   --branch <name>           branch to operate on (default: the root branch)
@@ -122,7 +130,8 @@ Options:
   --settled                 read at the settled frontier, not at the ragged head
   --timeout <seconds>       how long `frontier reaches` waits (default 0)
   --value                   print only the value
-  --count                   print only a count"
+  --count                   print only a count
+  --rebuild                 `derive`: recompute from source instead of catching up"
     );
     std::process::exit(2)
 }
@@ -134,6 +143,7 @@ fn parse_args() -> Args {
         version: None,
         value_only: false,
         count_only: false,
+        rebuild: false,
         freshness: FreshnessRequirement::Validated,
         settled: false,
         timeout: 0,
@@ -155,6 +165,7 @@ fn parse_args() -> Args {
             }
             "--value" => args.value_only = true,
             "--count" => args.count_only = true,
+            "--rebuild" => args.rebuild = true,
             "-h" | "--help" => usage(),
             _ => args.rest.push(arg),
         }
@@ -1112,10 +1123,19 @@ fn derive_parallelism() -> usize {
 ///
 /// **Works on a paused branch.** Pausing means "do not auto-derive", not "refuse to derive" — which
 /// is the whole point of having the switch: freeze the automation, then step it by hand.
+///
+/// `--rebuild` swaps catching up for recomputing: this branch forgets what it has derived and
+/// derives it again from source (§6.3). On a fork that is a replay of the world as of the fork
+/// point, which is the operation a watermark's meaning is defined in terms of (§10.1) and the one
+/// `scenarios/100-watermark-truth` uses to check that meaning holds.
 async fn derive(args: &Args) -> Result<()> {
     let (registry, workers) = open_deriving(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
-    let executed = registry.engine.catch_up(branch).await?;
+    let executed = if args.rebuild {
+        registry.engine.recompute(branch).await?
+    } else {
+        registry.engine.catch_up(branch).await?
+    };
     workers.shutdown().await;
 
     if args.count_only {

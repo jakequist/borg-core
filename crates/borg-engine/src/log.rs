@@ -305,6 +305,29 @@ impl LayerManager {
         ceiling
     }
 
+    /// The highest **source** layer visible anywhere along a read path.
+    ///
+    /// The layer a branch *stands at* as far as anything derived is concerned, which is not the same
+    /// as its head: a watermark points into the source stream (§6.3), and a settled branch's head is
+    /// usually the last derived layer some round committed. `None` where the path reaches no source
+    /// layer at all — an empty store, where there is nothing to derive from.
+    pub fn highest_source_layer(&self, path: &ReadPath) -> Option<LayerId> {
+        let state = self.state.lock().unwrap();
+        state
+            .layers
+            .values()
+            .filter(|layer| {
+                layer.state == LayerState::Committed && matches!(layer.author, LayerAuthor::Source)
+            })
+            .filter(|layer| {
+                path.segments
+                    .iter()
+                    .any(|(branch, bound)| layer.branch == *branch && layer.id.0 <= bound.0)
+            })
+            .map(|layer| layer.id)
+            .max()
+    }
+
     pub fn storage(&self) -> Arc<dyn StorageProvider> {
         Arc::clone(&self.storage)
     }

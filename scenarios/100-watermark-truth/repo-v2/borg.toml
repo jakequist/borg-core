@@ -1,0 +1,18 @@
+# The same repo, one schema version on: `founded` becomes an Int. Same id as repo-v1, because a repo
+# may mutate only the fields it declared (§5.2).
+#
+# The pipelines are unchanged and are duplicated here rather than shared, because a repo is a
+# directory and a version of a repo is what a directory holds — a `describe` that reached outside it
+# would be a repo whose schema depends on where it was pushed from.
+[repo]
+id = 1
+name = "atlas"
+
+[[pipelines]]
+command = "pipelines/band.sh"
+
+[[pipelines]]
+command = "pipelines/rating.sh"
+
+[[pipelines]]
+command = "pipelines/founded_up.sh"

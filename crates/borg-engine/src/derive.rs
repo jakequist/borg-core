@@ -341,6 +341,44 @@ impl DerivationEngine {
         (!gap.is_empty()).then_some(gap)
     }
 
+    /// Recompute this branch's derived data from source, ignoring everything already derived.
+    ///
+    /// §6.3 calls derived layers **droppable** — "a cache that happens to live in the log", whose
+    /// fallback is always recompute, because source is separate. Nothing could invoke that fallback,
+    /// and one thing needs it badly: a watermark claims *"replay the world at layer W and you get
+    /// exactly this value"* (§10.1), and the only way to check a claim of that shape is to do the
+    /// replay and compare. Fork at W, recompute there, read both.
+    ///
+    /// **A fork is where this is cheap and where it is honest.** A fork inherits its parent's
+    /// derived layers by ancestry (§7.4), so recomputing on one costs nothing until it writes, and
+    /// what it does write shadows what it inherited — the fork's own segment is the first the read
+    /// path walks (§7.2). Meanwhile its ancestors stay bounded at the fork point however far the
+    /// round's ceiling climbs, so the producers re-run against exactly the world W names and not
+    /// against whatever has landed on the parent since.
+    ///
+    /// Rewinding the frontier is the whole difference from [`catch_up`](Self::catch_up). A producer
+    /// standing at W correctly has nothing left to do; saying it has incorporated *nothing* is what
+    /// puts its entire source buffer back in front of it, through the same [`backfill`](Self::backfill)
+    /// path a producer newer than its data takes.
+    ///
+    /// This is not free — it is `O(everything derivable)`, which is what "rebuild the cache" costs
+    /// anywhere.
+    pub async fn recompute(self: &Arc<Self>, branch: BranchId) -> Result<usize> {
+        let path = self.branches.read_path(branch, None)?;
+        // A round settles one *source* layer and labels its output `reflects: that layer` (§6.3), so
+        // it is opened at the highest source layer under the branch's ceiling rather than at the
+        // ceiling itself — the same world, named in the stream watermarks actually point into. The
+        // two differ whenever the last thing to commit was derived, which on a settled branch is
+        // almost always.
+        let Some(at) = self.layers.highest_source_layer(&path) else {
+            return Ok(0);
+        };
+        for producer in self.producer_ids() {
+            self.frontier.rewind(branch, producer);
+        }
+        self.settle(branch, at).await
+    }
+
     /// Run every producer forward to head. Returns the number of invocations executed.
     ///
     /// Work is discovered, never queued: the layers between a producer's watermark and head are the
