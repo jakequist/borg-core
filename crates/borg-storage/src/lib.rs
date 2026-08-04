@@ -11,8 +11,8 @@ pub use memory::MemoryStorage;
 
 use async_trait::async_trait;
 use borg_core::{
-    Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Layer, LayerId,
-    ReadPath, Result,
+    Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Layer, LayerId, Pid,
+    PidKind, ReadPath, Result,
 };
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
@@ -81,6 +81,37 @@ pub trait StorageProvider: Send + Sync {
     async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>>;
 
     async fn open_layer(&self, branch: BranchId, id: LayerId) -> Result<Box<dyn OpenLayer>>;
+
+    // --- Interned values ---
+    //
+    // Content-addressed values are branch-independent and eternal (SPEC.md §3.1), so these take no
+    // [`ReadPath`], no layer and no def-version: there is nothing here for two branches to disagree
+    // about, and nothing to time-travel through. That absence is the feature — it is what makes a
+    // string write unable to conflict across branches and what stores equal strings exactly once
+    // registry-wide.
+    //
+    // The buffer is not a parameter either. A PID encodes its own kind, so dispatch to the
+    // `String`/`Binary`/`BigInt` buffer requires no lookup (SPEC.md §3.1, §4.2); those three
+    // buffers are singular precisely because interned values have no def to partition by.
+
+    /// Store a value by content and return its PID.
+    ///
+    /// Idempotent by construction: the PID is a pure function of `(kind, bytes)`, so interning the
+    /// same value twice — on one branch, on two branches, or on two machines that never spoke —
+    /// yields the same PID and one stored copy.
+    ///
+    /// Interning is **not layered**. It takes effect immediately rather than inside an open layer,
+    /// because an interned value nobody references is garbage rather than corruption: an aborted
+    /// layer may strand one, and all that costs is space. Routing it through a layer would buy
+    /// nothing and would reintroduce the branch scoping the whole scheme exists to avoid.
+    async fn intern(&self, kind: PidKind, bytes: &[u8]) -> Result<Pid>;
+
+    /// The bytes behind a content-addressed PID, or `None` if this store has never seen them.
+    ///
+    /// `None` is a legitimate answer, not a failure: PIDs travel — through layers, across branches,
+    /// between stores — so holding one is no promise the content is local. An *allocated* PID is a
+    /// different matter and errors, because there is no interned row it could ever name.
+    async fn read_interned(&self, pid: &Pid) -> Result<Option<Vec<u8>>>;
 
     // --- Log structure ---
     //

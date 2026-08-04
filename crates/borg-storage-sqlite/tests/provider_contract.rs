@@ -368,3 +368,169 @@ async fn a_layer_larger_than_one_batch_flushes_without_losing_rows() -> Result<(
     }
     Ok(())
 }
+
+// --- Interned values (SPEC.md §3.1, §4.2) ---
+
+#[tokio::test]
+async fn interning_the_same_bytes_twice_yields_the_same_pid() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    let first = storage.intern(PidKind::String, b"acme.ai").await?;
+    let again = storage.intern(PidKind::String, b"acme.ai").await?;
+    assert_eq!(
+        first, again,
+        "the PID is a function of the bytes, so interning is idempotent"
+    );
+    assert_eq!(
+        storage.read_interned(&first).await?,
+        Some(b"acme.ai".to_vec()),
+        "and the second write neither duplicated nor corrupted the row"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn different_bytes_yield_different_pids() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    let ai = storage.intern(PidKind::String, b"acme.ai").await?;
+    let com = storage.intern(PidKind::String, b"acme.com").await?;
+    assert_ne!(ai, com);
+    assert_eq!(storage.read_interned(&ai).await?, Some(b"acme.ai".to_vec()));
+    assert_eq!(
+        storage.read_interned(&com).await?,
+        Some(b"acme.com".to_vec())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_string_interned_on_two_branches_is_one_pid() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    let feature = BranchId(2);
+
+    // Two branches each write `"acme.ai"` into a website cell of their own. Neither interning call
+    // names a branch, because a content PID has no branch to name — this is what makes a string
+    // write unable to conflict across branches, and why `interned` has no branch column.
+    let on_main = storage.intern(PidKind::String, b"acme.ai").await?;
+    commit(
+        &storage,
+        MAIN,
+        LayerId(1),
+        &[(
+            prop(1, "website"),
+            record(Value::Ref(on_main), V1, LayerId(1)),
+        )],
+    )
+    .await?;
+
+    let on_feature = storage.intern(PidKind::String, b"acme.ai").await?;
+    commit(
+        &storage,
+        feature,
+        LayerId(2),
+        &[(
+            prop(2, "website"),
+            record(Value::Ref(on_feature), V1, LayerId(2)),
+        )],
+    )
+    .await?;
+
+    assert_eq!(on_main, on_feature);
+    assert_eq!(
+        storage
+            .get_cell(&path(&[(MAIN, LayerId(100))]), &prop(1, "website"), V1)
+            .await?
+            .map(|r| r.value),
+        storage
+            .get_cell(&path(&[(feature, LayerId(100))]), &prop(2, "website"), V1)
+            .await?
+            .map(|r| r.value),
+        "the two branches reference one and the same value"
+    );
+    assert_eq!(
+        storage.read_interned(&on_main).await?,
+        Some(b"acme.ai".to_vec()),
+        "and it is readable without naming a branch at all"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn interned_bytes_round_trip() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    for (kind, bytes) in [
+        (PidKind::String, "héllo — utf-8".as_bytes()),
+        // Embedded NULs and high bytes: stored as a BLOB, so nothing here is text-truncated.
+        (PidKind::Binary, &[0x00, 0xff, 0x00][..]),
+        (PidKind::BigInt, &[0x01, 0x00, 0x00, 0x00, 0x00][..]),
+        (PidKind::String, b""),
+    ] {
+        let pid = storage.intern(kind, bytes).await?;
+        assert_eq!(pid.kind(), kind);
+        assert_eq!(storage.read_interned(&pid).await?.as_deref(), Some(bytes));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_preimage_under_two_kinds_stores_two_values() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    let text = storage.intern(PidKind::String, b"x").await?;
+    let blob = storage.intern(PidKind::Binary, b"x").await?;
+    assert_ne!(text, blob, "the kind is part of the PID, not of the hash");
+    assert_eq!(storage.read_interned(&text).await?, Some(b"x".to_vec()));
+    assert_eq!(
+        storage.read_interned(&blob).await?,
+        Some(b"x".to_vec()),
+        "equal hashes under different kinds are separate rows, not a collision"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unknown_content_pid_reads_as_none() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    // A PID travels further than the bytes behind it, so a miss is an answer, not a failure.
+    let elsewhere = borg_core::content::pid(PidKind::String, b"never interned here")?;
+    assert_eq!(storage.read_interned(&elsewhere).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_allocated_pid_is_not_an_interned_value() -> Result<()> {
+    let storage = SqliteStorage::in_memory()?;
+    assert!(matches!(
+        storage.read_interned(&pid(1)).await,
+        Err(borg_core::BorgError::NotContentAddressed { .. })
+    ));
+    assert!(matches!(
+        storage.intern(PidKind::Object, b"acme.ai").await,
+        Err(borg_core::BorgError::NotContentAddressed { .. })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn interned_values_survive_reopening_the_file() -> Result<()> {
+    let file = std::env::temp_dir().join("borg-sqlite-interning-test.db");
+    let _ = std::fs::remove_file(&file);
+
+    let stored = {
+        let storage = SqliteStorage::open(&file)?;
+        storage.intern(PidKind::String, b"acme.ai").await?
+    };
+
+    let reopened = SqliteStorage::open(&file)?;
+    assert_eq!(
+        reopened.read_interned(&stored).await?,
+        Some(b"acme.ai".to_vec()),
+        "interned values are eternal, so they had better outlive the process"
+    );
+    assert_eq!(
+        reopened.intern(PidKind::String, b"acme.ai").await?,
+        stored,
+        "and re-interning across a restart still lands on the same PID"
+    );
+
+    std::fs::remove_file(&file).ok();
+    Ok(())
+}

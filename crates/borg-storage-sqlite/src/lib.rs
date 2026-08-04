@@ -35,7 +35,7 @@
 use async_trait::async_trait;
 use borg_core::{
     BorgError, Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent,
-    Derivation, Layer, LayerId, Origin, ReadPath, Result, Value,
+    Derivation, Layer, LayerId, Origin, Pid, PidKind, ReadPath, Result, Value, content,
 };
 use borg_storage::{CellStream, OpenLayer, SealedLayer, StorageProvider};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -83,6 +83,26 @@ CREATE TABLE IF NOT EXISTS cells (
 
 CREATE INDEX IF NOT EXISTS cells_by_layer  ON cells(written_at);
 CREATE INDEX IF NOT EXISTS cells_by_buffer ON cells(branch, buffer);
+
+-- Interned values — the contents of the String, Binary and BigInt buffers (SPEC.md §3.1, §4.2).
+--
+-- **No branch column, no layer, no version.** That is the point of the table rather than an
+-- omission: a content-addressed PID is branch-independent and eternal, so there is exactly one row
+-- per distinct value registry-wide, a string write can never conflict across branches, and there is
+-- no history for a read to travel through. Nothing here joins against `layers`.
+--
+-- `kind` is a column rather than being folded into the hash so that `hash` stays reproducible from
+-- the bytes alone — `printf 'hello' | sha256sum` names the PID. It is part of the key because a
+-- String and a Binary of the same octets are different values sharing one preimage.
+--
+-- A rowid table, unlike `cells`: an interned value is arbitrary-length content, and WITHOUT ROWID
+-- would carry that payload inside the index B-tree it is keyed by.
+CREATE TABLE IF NOT EXISTS interned (
+    kind  INTEGER NOT NULL,
+    hash  BLOB    NOT NULL,
+    bytes BLOB    NOT NULL,
+    PRIMARY KEY (kind, hash)
+);
 
 CREATE TABLE IF NOT EXISTS def_events (
     layer INTEGER NOT NULL,
@@ -590,6 +610,45 @@ impl StorageProvider for SqliteStorage {
             pending: Vec::with_capacity(BATCH),
             conn: Arc::clone(&self.conn),
         }))
+    }
+
+    async fn intern(&self, kind: PidKind, bytes: &[u8]) -> Result<Pid> {
+        let pid = content::pid(kind, bytes)?;
+        let hash = content::hash_of(&pid)?.to_vec();
+        // The discriminant, not a JSON tag: `PidKind`'s values are assigned explicitly in
+        // `borg-core` precisely because this is a persisted format.
+        let tag = i64::from(kind as u8);
+        let payload = bytes.to_vec();
+        with_conn(&self.conn, move |conn| {
+            // OR IGNORE, not OR REPLACE: an existing row necessarily holds these exact bytes, so
+            // rewriting it would be pure cost. This is what makes interning idempotent in storage
+            // as well as in identity.
+            conn.execute(
+                "INSERT OR IGNORE INTO interned (kind, hash, bytes) VALUES (?1, ?2, ?3)",
+                params![tag, hash, payload],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await?;
+        Ok(pid)
+    }
+
+    async fn read_interned(&self, pid: &Pid) -> Result<Option<Vec<u8>>> {
+        // Rejects an allocated PID rather than answering `None` — there is no row it could name, so
+        // a miss would be a lie about a caller bug.
+        let hash = content::hash_of(pid)?.to_vec();
+        let tag = i64::from(pid.kind() as u8);
+        with_conn(&self.conn, move |conn| {
+            // No join against `layers`, and no `ReadPath` walk: an interned value is visible to
+            // every branch the moment it exists (SPEC.md §3.1).
+            conn.prepare_cached("SELECT bytes FROM interned WHERE kind = ?1 AND hash = ?2")
+                .map_err(sql)?
+                .query_row(params![tag, hash], |row| row.get::<_, Vec<u8>>(0))
+                .optional()
+                .map_err(sql)
+        })
+        .await
     }
 
     async fn commit_layer(&self, layer: SealedLayer) -> Result<()> {
