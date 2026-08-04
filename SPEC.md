@@ -70,7 +70,18 @@ collision-free by construction — which makes merge safe without coordination.
 
 **Content-addressed PIDs** are branch-independent and eternal. The string `"hello"` has the same PID
 on every branch, forever. Consequences: string writes can never conflict across branches, and equal
-strings are stored exactly once registry-wide.
+strings are stored exactly once registry-wide. Interning storage therefore has no branch column, no
+layer and no def-version — there is nothing here for two branches to disagree about.
+
+The hash is **SHA-256 of the value's canonical byte encoding** — UTF-8 for `String`, the octets
+themselves for `Binary`. *Canonical* is load-bearing: two encodings of one value would intern as two
+values and defeat the deduplication that is interning's entire purpose.
+
+The kind is **not** part of the preimage. It is a field of the PID in its own right, so `String("x")`
+and `Binary("x")` are already distinct PIDs without paying for domain separation, and the hash stays
+reproducible by anything that can run `sha256sum`. Like `allocatorId`, this is a persisted format and
+is fixed now rather than retrofitted (§17.2): changing the function or the preimage renames every
+interned value ever stored.
 
 A PID encodes its own kind, so the dispatch to the correct buffer requires no lookup.
 
@@ -179,6 +190,11 @@ A **buffer** is a partition of cells, and the partition key is a def:
 
 The interning buffers are singular by necessity: registry-wide deduplication is their entire purpose.
 The `Any*` buffers are singular because untyped values have no def to partition by.
+
+The interning buffers hold **values, not cells**. An interned value has no def-version, no origin and
+no writing layer — a `CellRecord`'s fields are all meaningless for it — so it is reached through
+`intern` / `read_interned` (§17.1) rather than through a cell read, and a `BufferId` never has to be
+named: the PID already carries its kind (§3.1).
 
 **Why this granularity.** Buffers are expected to do a great deal of work, and partitioning them
 finely is what makes scaling them horizontally possible later (§17.2). Per-field partitioning also
@@ -1083,7 +1099,16 @@ get_cell(branch, cell, layer) -> CellRecord?
 put_cell(open_layer, cell, CellRecord)          // streaming; never buffered whole
 scan_buffer(branch, buffer, layer) -> Iterator   // engine-internal enumeration only
 open_layer / seal_layer / commit_layer / abort_layer
+intern(kind, bytes) -> Pid                       // content-addressed; no branch, no layer
+read_interned(pid) -> bytes?
 ```
+
+**Interning is unscoped, and that is the whole point.** `intern` takes no branch, no layer and no
+def-version, because a content PID has none (§3.1); a provider that scoped it would reintroduce
+exactly the conflict the scheme exists to eliminate. Nor is it written into a layer: interning takes
+effect immediately, since an interned value nobody references is garbage rather than corruption, and
+an aborted layer stranding one costs only space. `read_interned` answering `None` is a legitimate
+result — a PID travels further than the bytes behind it.
 
 **Streaming commit is the binding constraint** (§6.2). Any provider that cannot accept an unbounded
 write stream into an uncommitted, invisible layer is disqualified.

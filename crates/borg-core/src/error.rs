@@ -84,6 +84,13 @@ pub enum BorgError {
     #[error("a layer may contain value events xor def events, never both")]
     MixedLayerKind,
 
+    // --- Values ---
+    /// SPEC.md §3.1: only `String`, `Binary` and `BigInt` are content-addressed. Asking to intern
+    /// anything else, or to read interned bytes behind an allocated PID, is a caller bug rather
+    /// than a miss.
+    #[error("{kind:?} is not content-addressed; only String, Binary and BigInt are interned")]
+    NotContentAddressed { kind: crate::pid::PidKind },
+
     #[error("storage: {0}")]
     Storage(String),
 

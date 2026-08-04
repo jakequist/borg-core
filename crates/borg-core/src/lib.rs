@@ -6,6 +6,7 @@
 //! See `SPEC.md` at the repository root — every type here cites the section it implements.
 
 pub mod cell;
+pub mod content;
 pub mod def;
 pub mod error;
 pub mod freshness;

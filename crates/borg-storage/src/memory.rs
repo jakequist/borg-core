@@ -11,7 +11,7 @@ use crate::{CellStream, OpenLayer, SealedLayer, StorageProvider};
 use async_trait::async_trait;
 use borg_core::{
     BorgError, Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Layer,
-    LayerId, ReadPath, Result,
+    LayerId, Pid, PidKind, ReadPath, Result, content,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,6 +30,10 @@ struct Inner {
     def_contents: HashMap<LayerId, Vec<DefEvent>>,
     layer_meta: HashMap<LayerId, Layer>,
     branches: HashMap<BranchId, Branch>,
+    /// Interned values, keyed by their PID and nothing else — no branch, no layer, no version
+    /// (SPEC.md §3.1). One map rather than three because the PID carries its own kind, which is
+    /// what keeps `String("x")` and `Binary("x")` apart despite sharing a hash.
+    interned: HashMap<Pid, Vec<u8>>,
 }
 
 struct StagedLayer {
@@ -252,6 +256,26 @@ impl StorageProvider for MemoryStorage {
         }))
     }
 
+    async fn intern(&self, kind: PidKind, bytes: &[u8]) -> Result<Pid> {
+        let pid = content::pid(kind, bytes)?;
+        // Re-interning is a no-op rather than an overwrite: an occupied entry already holds these
+        // exact bytes, so rewriting it is pure cost.
+        self.inner
+            .lock()
+            .unwrap()
+            .interned
+            .entry(pid)
+            .or_insert_with(|| bytes.to_vec());
+        Ok(pid)
+    }
+
+    async fn read_interned(&self, pid: &Pid) -> Result<Option<Vec<u8>>> {
+        // Rejects an allocated PID rather than answering `None` — there is no interned value it
+        // could name, so a miss would be a lie about a caller bug.
+        content::hash_of(pid)?;
+        Ok(self.inner.lock().unwrap().interned.get(pid).cloned())
+    }
+
     async fn commit_layer(&self, layer: SealedLayer) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let staged = inner
@@ -273,6 +297,189 @@ impl StorageProvider for MemoryStorage {
         }
         inner.layer_contents.insert(layer.id, staged.writes);
         inner.def_contents.insert(layer.id, staged.defs);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use borg_core::{AllocatorId, CellKey, Origin, Value};
+
+    const MAIN: BranchId = BranchId(1);
+    const FEATURE: BranchId = BranchId(2);
+    const V1: ClientVersion = ClientVersion(LayerId(1));
+
+    fn prop(n: u64, field: &str) -> CellRef {
+        CellRef::prop(
+            "Company".into(),
+            field.into(),
+            Pid::Allocated {
+                kind: PidKind::Object,
+                branch: MAIN,
+                allocator: AllocatorId(0),
+                counter: n,
+            },
+        )
+    }
+
+    fn record(value: Value, at: LayerId) -> CellRecord {
+        CellRecord {
+            value,
+            version: V1,
+            written_at: at,
+            origin: Origin::Source,
+            derivation: None,
+        }
+    }
+
+    async fn commit(
+        storage: &MemoryStorage,
+        branch: BranchId,
+        id: LayerId,
+        writes: &[(CellRef, CellRecord)],
+    ) -> Result<()> {
+        let mut layer = storage.open_layer(branch, id).await?;
+        for (cell, rec) in writes {
+            layer.put_cell(cell, rec.clone()).await?;
+        }
+        let sealed = layer.seal().await?;
+        storage.commit_layer(sealed).await
+    }
+
+    #[tokio::test]
+    async fn interning_the_same_bytes_twice_yields_the_same_pid() -> Result<()> {
+        let storage = MemoryStorage::new();
+        let first = storage.intern(PidKind::String, b"acme.ai").await?;
+        let again = storage.intern(PidKind::String, b"acme.ai").await?;
+        assert_eq!(
+            first, again,
+            "the PID is a function of the bytes, so interning is idempotent"
+        );
+        assert_eq!(
+            storage.inner.lock().unwrap().interned.len(),
+            1,
+            "and equal content is stored exactly once (SPEC.md §3.1)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn different_bytes_yield_different_pids() -> Result<()> {
+        let storage = MemoryStorage::new();
+        assert_ne!(
+            storage.intern(PidKind::String, b"acme.ai").await?,
+            storage.intern(PidKind::String, b"acme.com").await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_string_interned_on_two_branches_is_one_pid() -> Result<()> {
+        let storage = MemoryStorage::new();
+
+        // Two branches, each writing `"acme.ai"` into a website cell of its own. Neither interning
+        // call mentions a branch, because a content PID has no branch to mention — and that is the
+        // property that makes string writes unable to conflict across branches (SPEC.md §3.1).
+        let on_main = storage.intern(PidKind::String, b"acme.ai").await?;
+        commit(
+            &storage,
+            MAIN,
+            LayerId(1),
+            &[(prop(1, "website"), record(Value::Ref(on_main), LayerId(1)))],
+        )
+        .await?;
+
+        let on_feature = storage.intern(PidKind::String, b"acme.ai").await?;
+        commit(
+            &storage,
+            FEATURE,
+            LayerId(2),
+            &[(
+                prop(2, "website"),
+                record(Value::Ref(on_feature), LayerId(2)),
+            )],
+        )
+        .await?;
+
+        assert_eq!(on_main, on_feature);
+        assert_eq!(
+            storage
+                .get_cell(
+                    &ReadPath::new(vec![(MAIN, LayerId(9))]),
+                    &prop(1, "website"),
+                    V1
+                )
+                .await?
+                .map(|r| r.value),
+            storage
+                .get_cell(
+                    &ReadPath::new(vec![(FEATURE, LayerId(9))]),
+                    &prop(2, "website"),
+                    V1
+                )
+                .await?
+                .map(|r| r.value),
+            "the two branches reference one and the same value"
+        );
+        assert_eq!(
+            storage.read_interned(&on_main).await?,
+            Some(b"acme.ai".to_vec()),
+            "and it is readable without naming a branch at all"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interned_bytes_round_trip() -> Result<()> {
+        let storage = MemoryStorage::new();
+        for (kind, bytes) in [
+            (PidKind::String, "héllo — utf-8".as_bytes()),
+            (PidKind::Binary, &[0x00, 0xff, 0x00][..]),
+            (PidKind::BigInt, &[0x01, 0x00, 0x00, 0x00, 0x00][..]),
+            (PidKind::String, b""),
+        ] {
+            let pid = storage.intern(kind, bytes).await?;
+            assert_eq!(pid.kind(), kind);
+            assert_eq!(storage.read_interned(&pid).await?.as_deref(), Some(bytes));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_preimage_under_two_kinds_stores_two_values() -> Result<()> {
+        let storage = MemoryStorage::new();
+        let text = storage.intern(PidKind::String, b"x").await?;
+        let blob = storage.intern(PidKind::Binary, b"x").await?;
+        assert_ne!(text, blob, "the kind is part of the PID, not of the hash");
+        assert_eq!(storage.read_interned(&text).await?, Some(b"x".to_vec()));
+        assert_eq!(storage.read_interned(&blob).await?, Some(b"x".to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unknown_content_pid_reads_as_none() -> Result<()> {
+        let storage = MemoryStorage::new();
+        // A PID travels further than the bytes behind it, so a miss is an answer, not a failure.
+        let elsewhere = content::pid(PidKind::String, b"never interned here")?;
+        assert_eq!(storage.read_interned(&elsewhere).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_allocated_pid_is_not_an_interned_value() -> Result<()> {
+        let storage = MemoryStorage::new();
+        let CellKey::Pid(allocated) = prop(1, "website").key else {
+            unreachable!()
+        };
+        assert!(matches!(
+            storage.read_interned(&allocated).await,
+            Err(BorgError::NotContentAddressed { .. })
+        ));
+        assert!(matches!(
+            storage.intern(PidKind::Object, b"acme.ai").await,
+            Err(BorgError::NotContentAddressed { .. })
+        ));
         Ok(())
     }
 }
