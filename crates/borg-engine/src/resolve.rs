@@ -139,7 +139,9 @@ pub trait InlineDerivation: Send + Sync {
 pub struct LineageEdge {
     pub cell: CellAt,
     pub origin: Origin,
-    pub written_at: LayerId,
+    /// Where this input arrived on the branch being explained. What lineage wants to know about an
+    /// input is when it became visible here, which for a merged input is the merge, not the write.
+    pub landed_at: LayerId,
 }
 
 /// Where a value came from. Requires no storage of its own — it is the dependency index read
@@ -148,7 +150,10 @@ pub struct LineageEdge {
 pub struct Lineage {
     pub cell: CellAt,
     pub produced_by: Option<ProducerId>,
-    pub written_at: LayerId,
+    /// Where this value was first committed, and where it landed on the branch being explained.
+    /// They differ exactly when the value arrived by merge (SPEC.md §13).
+    pub authored_at: LayerId,
+    pub landed_at: LayerId,
     pub fresh_as_of: LayerId,
     pub from: Vec<LineageEdge>,
 }
@@ -201,19 +206,26 @@ impl Resolver {
         // it inherits from, not a head of its own.
         let path = self.branches.read_path(branch, layer)?;
         let layer = layer.unwrap_or_else(|| path.ceiling());
-        let Some(record) = self.storage.get_cell(&path, cell, version).await? else {
+        let Some(found) = self.storage.get_cell(&path, cell, version).await? else {
             return self
                 .resolve_unmaterialized(&path, cell, layer, version)
                 .await;
         };
+        // Both halves of the provenance, which only exist separately now that events are not
+        // rewritten on the way across a merge: where the value was authored, and where the branch
+        // being read acquired it (SPEC.md §4.3, §13).
+        let landed_at = found.landed_at;
+        let record = found.event;
 
         let Some(derivation) = record.derivation else {
-            // Source data is ground truth: written once and correct thereafter, so `written_at` and
+            // Source data is ground truth: written once and correct thereafter, so `landed_at` and
             // `fresh_as_of` collapse and the state is always `Current` (SPEC.md §10.4).
             return Ok(Resolved {
                 value: (!record.value.is_tombstone()).then_some(record.value),
                 origin: Origin::Source,
-                written_at: record.written_at,
+                event: Some(record.id),
+                authored_at: record.authored,
+                landed_at,
                 fresh_as_of: layer,
                 state: if record.value.is_tombstone() {
                     Freshness::Tombstoned
@@ -253,7 +265,9 @@ impl Resolver {
         Ok(Resolved {
             value: (!record.value.is_tombstone()).then_some(record.value),
             origin: Origin::Derived,
-            written_at: record.written_at,
+            event: Some(record.id),
+            authored_at: record.authored,
+            landed_at,
             fresh_as_of,
             state: if record.value.is_tombstone() {
                 Freshness::Tombstoned
@@ -292,11 +306,16 @@ impl Resolver {
         for dependency in read_set {
             // Each dependency is checked at the version the producer *read it at*, not at the
             // reader's version. Those differ whenever a migration is involved.
+            //
+            // Against `landed_at`, never `authored`. `fresh_as_of` is a layer on *this* branch, and
+            // a merge can carry an event authored long ago onto it long after this value was
+            // computed. Comparing against where the event was written would call that dependency
+            // unmoved and report a stale value as current — the one thing §10 does not permit.
             let moved = self
                 .storage
                 .get_cell(path, &dependency.cell, dependency.version)
                 .await?
-                .is_some_and(|record| record.written_at.0 > fresh_as_of.0);
+                .is_some_and(|found| found.landed_at.0 > fresh_as_of.0);
             if moved {
                 return Ok(Freshness::Stale);
             }
@@ -333,7 +352,11 @@ impl Resolver {
         Ok(Resolved {
             value: None,
             origin: Origin::Derived,
-            written_at: LayerId(0),
+            // Nothing is stored at this version, so there is no event to name and no layer that
+            // could have carried one.
+            event: None,
+            authored_at: LayerId(0),
+            landed_at: LayerId(0),
             fresh_as_of: LayerId(0),
             state: if available.is_empty() {
                 // Genuinely absent at every version — the cell was simply never written.
@@ -356,7 +379,7 @@ impl Resolver {
         version: ClientVersion,
     ) -> Result<Option<Lineage>> {
         let path = self.branches.read_path(branch, layer)?;
-        let Some(record) = self.storage.get_cell(&path, cell, version).await? else {
+        let Some(found) = self.storage.get_cell(&path, cell, version).await? else {
             return Ok(None);
         };
         let target = CellAt::new(cell.clone(), version);
@@ -371,20 +394,22 @@ impl Resolver {
             {
                 from.push(LineageEdge {
                     cell: dependency,
-                    origin: source.origin,
-                    written_at: source.written_at,
+                    origin: source.event.origin,
+                    landed_at: source.landed_at,
                 });
             }
         }
 
         Ok(Some(Lineage {
             cell: target,
-            produced_by: record.derivation.as_ref().map(|d| d.producer),
-            written_at: record.written_at,
-            fresh_as_of: record
+            produced_by: found.event.derivation.as_ref().map(|d| d.producer),
+            authored_at: found.event.authored,
+            landed_at: found.landed_at,
+            fresh_as_of: found
+                .event
                 .derivation
                 .as_ref()
-                .map_or(record.written_at, |d| d.fresh_as_of),
+                .map_or(found.landed_at, |d| d.fresh_as_of),
             from,
         }))
     }

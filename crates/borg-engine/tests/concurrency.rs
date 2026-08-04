@@ -150,7 +150,7 @@ impl Harness {
             .get_cell(&path, cell, version)
             .await
             .unwrap()
-            .map(|record| record.value)
+            .map(|found| found.event.value)
     }
 }
 

@@ -11,8 +11,8 @@ pub use memory::MemoryStorage;
 
 use async_trait::async_trait;
 use borg_core::{
-    Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Layer, LayerId, Pid,
-    PidKind, ReadPath, Result,
+    Branch, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, EventDraft, EventId,
+    Landed, Layer, LayerId, Pid, PidKind, ReadPath, Result,
 };
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
@@ -21,12 +21,29 @@ use borg_core::{
 /// exactly one layer, so a flip of a widely-depended-on field may produce a single layer containing
 /// 100k mutations. A layer can never be assembled in memory and flushed; any provider that cannot
 /// accept an unbounded write stream into an uncommitted layer is disqualified.
+///
+/// A layer acquires members two ways, and the difference is the whole of §13's cost argument:
+/// [`author_event`](OpenLayer::author_event) creates one, and
+/// [`include_event`](OpenLayer::include_event) names one that already exists.
 #[async_trait]
 pub trait OpenLayer: Send {
     fn id(&self) -> LayerId;
 
-    /// Append one cell write. Called an unbounded number of times.
-    async fn put_cell(&mut self, cell: &CellRef, record: CellRecord) -> Result<()>;
+    /// Create an event in this layer, and return the identity the log gave it. Called an unbounded
+    /// number of times.
+    ///
+    /// The draft names no layer: `authored` is this layer, by definition, so a writer cannot claim
+    /// otherwise.
+    async fn author_event(&mut self, cell: &CellRef, draft: EventDraft) -> Result<EventId>;
+
+    /// Name an existing event as a member of this layer. SPEC.md §13.
+    ///
+    /// **This is what makes a merge not copy.** The event keeps its identity and its `authored`
+    /// layer; this layer merely records that it landed here too. The membership row is
+    /// `(layer, event)` rather than a whole record carrying value, version, origin, derivation and
+    /// read-set — a large constant-factor saving, not an asymptotic one: there are still `n` rows,
+    /// and the provider's read index has to gain a row for each.
+    async fn include_event(&mut self, event: EventId) -> Result<()>;
 
     /// Append one def mutation. A layer holds value events *xor* def events, never both
     /// (SPEC.md §6.2), so a layer taking these takes no cells.
@@ -58,12 +75,19 @@ pub trait StorageProvider: Send + Sync {
     /// Reads resolve through a [`ReadPath`] rather than a bare branch, so that a fork inherits its
     /// parent by ancestry instead of by copying (SPEC.md §7.2). Storage never has to know what a
     /// branch *is* — only how to walk the segments it is handed.
+    ///
+    /// Answers *"the latest write to this cell visible on this branch at layer ≤ N"*, which is a
+    /// question about **membership**: the layers of the branch's chain up to N, their events, those
+    /// touching this cell, the latest. A provider is expected to keep that a single indexed lookup
+    /// by materializing `(branch, cell, version) -> (layer, event)` as events are put into a layer.
+    /// Like every other index in the system that one is a projection of the log, and
+    /// [`rebuild_read_index`](StorageProvider::rebuild_read_index) is the proof.
     async fn get_cell(
         &self,
         path: &ReadPath,
         cell: &CellRef,
         version: ClientVersion,
-    ) -> Result<Option<CellRecord>>;
+    ) -> Result<Option<Landed>>;
 
     /// Which def-versions this cell is materialized at, as of a layer. Used by the resolver to find
     /// a migration path when the requested version is not yet materialized.
@@ -71,11 +95,16 @@ pub trait StorageProvider: Send + Sync {
 
     /// Enumerate a buffer. **Engine-internal only** — used by the scheduler to discover new
     /// entities (SPEC.md §9.6). Enumeration is not exposed as a user-facing query in v1.
-    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<CellStream>;
+    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<EventStream>;
 
-    /// Read a committed layer's contents. This is what drives invalidation: the committed layer *is*
-    /// the changeset, so buffers need no observation machinery (SPEC.md §9.6).
-    async fn read_layer(&self, layer: LayerId) -> Result<CellStream>;
+    /// A committed layer's membership, in order. This is what drives invalidation: the committed
+    /// layer *is* the changeset, so buffers need no observation machinery (SPEC.md §9.6).
+    ///
+    /// Membership, not authorship: a merge layer yields the events it named, which still report the
+    /// layer that authored them. Two writes to one cell in one layer are two events and both appear
+    /// — a layer is an *ordered group of events* (§6.2), and it is the read index, not the group,
+    /// that decides which of them resolves.
+    async fn read_layer(&self, layer: LayerId) -> Result<EventStream>;
 
     /// A committed def layer's events, in order.
     async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>>;
@@ -132,9 +161,18 @@ pub trait StorageProvider: Send + Sync {
 
     /// Make a sealed layer visible. *This edge is what triggers dependent producers.*
     async fn commit_layer(&self, layer: SealedLayer) -> Result<()>;
+
+    /// Discard the read index and rebuild it from layer membership.
+    ///
+    /// Nothing on the read or write path calls this. It exists so that *"the index is a projection
+    /// of the log, not a second source of truth"* is a property a test can check rather than a
+    /// claim a comment makes — the same standing the dependency and touch indexes have, which
+    /// `Registry::open` rebuilds by replaying committed layers. It is deliberately not called at
+    /// open: unlike those two, this one is durable, and rebuilding it per process would turn an
+    /// `O(log)` read into an `O(log)` write.
+    async fn rebuild_read_index(&self) -> Result<()>;
 }
 
-/// A stream of cells. Boxed rather than returning a concrete iterator so that a remote provider can
+/// A stream of events. Boxed rather than returning a concrete iterator so that a remote provider can
 /// page without the engine noticing.
-pub type CellStream =
-    std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<(CellRef, CellRecord)>> + Send>>;
+pub type EventStream = std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<Event>> + Send>>;

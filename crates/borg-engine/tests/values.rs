@@ -6,9 +6,9 @@
 //! business, and these tests are what keep it that way.
 
 use borg_core::{
-    BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId,
-    Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
-    ValueInput, ValueType, Writer,
+    BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, LayerAuthor, LayerId, Ownership,
+    Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value, ValueInput,
+    ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -100,10 +100,14 @@ impl Harness {
         session.commit().await
     }
 
-    async fn record(&self, cell: &CellRef) -> Option<CellRecord> {
+    async fn record(&self, cell: &CellRef) -> Option<Event> {
         let head = self.layers.head(BRANCH).unwrap();
         let path = self.branches.read_path(BRANCH, Some(head)).unwrap();
-        self.storage.get_cell(&path, cell, V1).await.unwrap()
+        self.storage
+            .get_cell(&path, cell, V1)
+            .await
+            .unwrap()
+            .map(|found| found.event)
     }
 
     /// What a client sees for a cell — the text, not the storage.
@@ -226,7 +230,7 @@ async fn two_equal_strings_are_one_stored_value() -> Result<()> {
 
     async fn pid_of(harness: &Harness, n: u64) -> Pid {
         match harness.record(&prop(company(n), "website")).await {
-            Some(CellRecord {
+            Some(Event {
                 value: Value::Ref(pid),
                 ..
             }) => pid,

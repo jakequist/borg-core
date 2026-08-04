@@ -6,16 +6,26 @@
 //! branches or watermarks appears here. It stores cells and def events, and walks whatever
 //! [`ReadPath`] it is handed.
 //!
+//! ## Three tables, and which of them is the log
+//!
+//! `events` and `layer_events` are the log: an event with an identity of its own, and the layers
+//! that name it (SPEC.md §4.3, §6.2). `cell_index` is a **projection** of those two — the
+//! materialised `(branch, cell, version) -> (layer, event)` that keeps a read one indexed seek once
+//! events no longer carry the layer they live in. [`SqliteStorage::rebuild_read_index`] rebuilds it
+//! from the log with one `INSERT ... SELECT`, which is what makes that claim checkable.
+//!
 //! ## How commit streams
 //!
 //! A layer may hold millions of mutations and can never be buffered whole (SPEC.md §6.2). So rows
-//! are inserted as they arrive, and **visibility is a join, not a rewrite**: every read joins
-//! `cells` against `layers` and keeps only rows whose layer is committed. Committing is therefore a
-//! single-row update — `O(1)` however large the layer — and an open layer is invisible without any
-//! row of its own being touched.
+//! are inserted as they arrive — index rows included — and **visibility is a join, not a rewrite**:
+//! every read joins against `layers` and keeps only rows whose layer is committed. Committing is
+//! therefore a single-row update, `O(1)` however large the layer, and an open layer is invisible
+//! without any row of its own being touched.
 //!
 //! The obvious alternative, flipping a `visible` flag on every row at commit, would make commit
-//! `O(rows)` and undo the streaming property the interface exists to preserve.
+//! `O(rows)` and undo the streaming property the interface exists to preserve. It is also why the
+//! index is maintained on the way in rather than at commit: an index built at commit would make
+//! commit `O(rows)` just as surely.
 //!
 //! ## Blocking work stays off the async executor
 //!
@@ -34,12 +44,14 @@
 
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent,
-    Derivation, Layer, LayerId, Origin, Pid, PidKind, ReadPath, Result, Value, content,
+    BorgError, Branch, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Derivation, Event,
+    EventDraft, EventId, Landed, Layer, LayerId, Origin, Pid, PidKind, ReadPath, Result, Value,
+    content,
 };
-use borg_storage::{CellStream, OpenLayer, SealedLayer, StorageProvider};
+use borg_storage::{EventStream, OpenLayer, SealedLayer, StorageProvider};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const OPEN: i64 = 0;
@@ -69,20 +81,49 @@ CREATE TABLE IF NOT EXISTS branches (
     branch TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS cells (
-    branch     INTEGER NOT NULL,
+-- Events. **No branch, and no layer they live in** — only the layer that first committed them
+-- (SPEC.md §4.3). A merged event gets a membership row on the parent and is not rewritten, which is
+-- both what makes merge cheap and what keeps `authored` true afterwards.
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY,
     buffer     TEXT    NOT NULL,
     cell_key   TEXT    NOT NULL,
     version    INTEGER NOT NULL,
-    written_at INTEGER NOT NULL,
     value      TEXT    NOT NULL,
     origin     INTEGER NOT NULL,
     derivation TEXT,
-    PRIMARY KEY (branch, buffer, cell_key, version, written_at)
+    authored   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS events_by_author ON events(authored);
+
+-- Membership: a layer is an ordered group of events, and many layers may name one event.
+CREATE TABLE IF NOT EXISTS layer_events (
+    layer INTEGER NOT NULL,
+    seq   INTEGER NOT NULL,
+    event INTEGER NOT NULL,
+    PRIMARY KEY (layer, seq)
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS cells_by_layer  ON cells(written_at);
-CREATE INDEX IF NOT EXISTS cells_by_buffer ON cells(branch, buffer);
+-- The read index — a projection of the two tables above, and the only reason a read stays a single
+-- lookup now that an event does not carry a layer. `landed` is the layer *on this branch* whose
+-- membership carried the event here, which for a merged event is not `events.authored`.
+--
+-- **One row per landing**, so `MAX(landed)` is never a tie and every read resolves the same way in
+-- both backends. A layer that writes one cell twice keeps both events in its membership — it really
+-- does contain two — and replaces its one index row, because only the later write can be the answer.
+CREATE TABLE IF NOT EXISTS cell_index (
+    branch   INTEGER NOT NULL,
+    buffer   TEXT    NOT NULL,
+    cell_key TEXT    NOT NULL,
+    version  INTEGER NOT NULL,
+    landed   INTEGER NOT NULL,
+    event    INTEGER NOT NULL,
+    PRIMARY KEY (branch, buffer, cell_key, version, landed)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS cell_index_by_layer  ON cell_index(landed);
+CREATE INDEX IF NOT EXISTS cell_index_by_buffer ON cell_index(branch, buffer);
 
 -- Interned values — the contents of the String, Binary and BigInt buffers (SPEC.md §3.1, §4.2).
 --
@@ -95,8 +136,8 @@ CREATE INDEX IF NOT EXISTS cells_by_buffer ON cells(branch, buffer);
 -- the bytes alone — `printf 'hello' | sha256sum` names the PID. It is part of the key because a
 -- String and a Binary of the same octets are different values sharing one preimage.
 --
--- A rowid table, unlike `cells`: an interned value is arbitrary-length content, and WITHOUT ROWID
--- would carry that payload inside the index B-tree it is keyed by.
+-- A rowid table, unlike the tables above: an interned value is arbitrary-length content, and
+-- WITHOUT ROWID would carry that payload inside the index B-tree it is keyed by.
 CREATE TABLE IF NOT EXISTS interned (
     kind  INTEGER NOT NULL,
     hash  BLOB    NOT NULL,
@@ -144,15 +185,20 @@ fn decode<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T> {
     serde_json::from_str(raw).map_err(sql)
 }
 
-/// The columns every cell read projects.
-type CellRow = (String, i64, i64, i64, Option<String>);
+/// The columns every event read projects: id, buffer, cell_key, value, version, origin, derivation,
+/// authored.
+type EventRow = (i64, String, String, String, i64, i64, Option<String>, i64);
 
-fn to_record(row: CellRow) -> Result<CellRecord> {
-    let (value, version, written_at, origin, derivation) = row;
-    Ok(CellRecord {
+fn to_event(row: EventRow) -> Result<Event> {
+    let (id, buffer, key, value, version, origin, derivation, authored) = row;
+    Ok(Event {
+        id: EventId(id as u64),
+        cell: CellRef {
+            buffer: decode(&buffer)?,
+            key: decode(&key)?,
+        },
         value: decode::<Value>(&value)?,
         version: ClientVersion(LayerId(version as u64)),
-        written_at: LayerId(written_at as u64),
         origin: if origin == 0 {
             Origin::Source
         } else {
@@ -161,15 +207,44 @@ fn to_record(row: CellRow) -> Result<CellRecord> {
         derivation: derivation
             .map(|raw| decode::<Derivation>(&raw))
             .transpose()?,
+        authored: LayerId(authored as u64),
     })
 }
 
-/// One cell write, already encoded, waiting to be flushed.
-type PendingCell = (String, String, i64, String, i64, Option<String>);
+/// The eight columns of an event, in the order [`to_event`] expects them.
+const EVENT_COLUMNS: &str =
+    "e.id, e.buffer, e.cell_key, e.value, e.version, e.origin, e.derivation, e.authored";
+
+fn read_event(row: &rusqlite::Row<'_>, from: usize) -> rusqlite::Result<EventRow> {
+    Ok((
+        row.get(from)?,
+        row.get(from + 1)?,
+        row.get(from + 2)?,
+        row.get(from + 3)?,
+        row.get(from + 4)?,
+        row.get(from + 5)?,
+        row.get(from + 6)?,
+        row.get(from + 7)?,
+    ))
+}
+
+/// One membership row waiting to be flushed: its position in the layer, the event it names, and —
+/// for an event this layer is authoring — the event itself, still uninserted.
+struct Pending {
+    seq: i64,
+    event: i64,
+    /// `(buffer, cell_key, version, value, origin, derivation)`, or `None` when the event already
+    /// exists and this layer is only naming it.
+    authored: Option<(String, String, i64, String, i64, Option<String>)>,
+}
 
 #[derive(Clone)]
 pub struct SqliteStorage {
     conn: Conn,
+    /// The next event id to mint. Seeded from the store on open, exactly as the engine resumes layer
+    /// ids, so that a second process cannot reuse an id that already exists. A collision would fail
+    /// the insert rather than corrupt anything, because `events.id` is a primary key.
+    next_event: Arc<AtomicU64>,
 }
 
 impl SqliteStorage {
@@ -182,9 +257,32 @@ impl SqliteStorage {
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
+        // A store written before events had identity holds its data in a `cells` table this schema
+        // no longer reads. Saying so is the only kind thing to do: `CREATE TABLE IF NOT EXISTS`
+        // would otherwise open it successfully and report an empty world.
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cells'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if legacy > 0 {
+            return Err(BorgError::Storage(
+                "this store predates the event model (SPEC.md §4.3): its cells carry the layer they \
+                 live in and cannot be read. Create a new store."
+                    .into(),
+            ));
+        }
         conn.execute_batch(SCHEMA).map_err(sql)?;
+        let highest: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .map_err(sql)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            next_event: Arc::new(AtomicU64::new(highest as u64 + 1)),
         })
     }
 }
@@ -195,7 +293,9 @@ pub struct SqliteOpenLayer {
     id: LayerId,
     branch: BranchId,
     defs: u32,
-    pending: Vec<PendingCell>,
+    seq: i64,
+    pending: Vec<Pending>,
+    next_event: Arc<AtomicU64>,
     conn: Conn,
 }
 
@@ -210,18 +310,51 @@ impl SqliteOpenLayer {
         with_conn(&self.conn, move |conn| {
             let tx = conn.unchecked_transaction().map_err(sql)?;
             {
-                let mut stmt = tx
+                let mut event = tx
                     .prepare_cached(
-                        "INSERT OR REPLACE INTO cells
-                         (branch, buffer, cell_key, version, written_at, value, origin, derivation)
+                        "INSERT INTO events
+                         (id, buffer, cell_key, version, value, origin, derivation, authored)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     )
                     .map_err(sql)?;
-                for (buffer, key, version, value, origin, derivation) in rows {
-                    stmt.execute(params![
-                        branch, buffer, key, version, layer, value, origin, derivation
-                    ])
+                let mut member = tx
+                    .prepare_cached(
+                        "INSERT INTO layer_events (layer, seq, event) VALUES (?1, ?2, ?3)",
+                    )
                     .map_err(sql)?;
+                // The index row is derived from the event rather than from the caller, so an
+                // included event indexes under the cell it actually names and a layer cannot lie
+                // about what it landed.
+                let mut index = tx
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO cell_index
+                         (branch, buffer, cell_key, version, landed, event)
+                         SELECT ?1, buffer, cell_key, version, ?2, id
+                         FROM events WHERE id = ?3",
+                    )
+                    .map_err(sql)?;
+                for row in rows {
+                    if let Some((buffer, key, version, value, origin, derivation)) = row.authored {
+                        event
+                            .execute(params![
+                                row.event, buffer, key, version, value, origin, derivation, layer
+                            ])
+                            .map_err(sql)?;
+                    }
+                    member
+                        .execute(params![layer, row.seq, row.event])
+                        .map_err(sql)?;
+                    // Indexing nothing means the named event does not exist. Checking the row count
+                    // costs nothing and is what keeps `include_event` from silently writing a
+                    // membership row that resolves to no value — a probe per included event would
+                    // be a round trip per merged cell, which is exactly the cost merge is shedding.
+                    if index
+                        .execute(params![branch, layer, row.event])
+                        .map_err(sql)?
+                        == 0
+                    {
+                        return Err(BorgError::Storage(format!("unknown event e{}", row.event)));
+                    }
                 }
             }
             tx.commit().map_err(sql)
@@ -236,15 +369,34 @@ impl OpenLayer for SqliteOpenLayer {
         self.id
     }
 
-    async fn put_cell(&mut self, cell: &CellRef, record: CellRecord) -> Result<()> {
-        self.pending.push((
-            encode(&cell.buffer)?,
-            encode(&cell.key)?,
-            record.version.0.0 as i64,
-            encode(&record.value)?,
-            i64::from(record.origin == Origin::Derived),
-            record.derivation.as_ref().map(encode).transpose()?,
-        ));
+    async fn author_event(&mut self, cell: &CellRef, draft: EventDraft) -> Result<EventId> {
+        let id = EventId(self.next_event.fetch_add(1, Ordering::Relaxed));
+        self.pending.push(Pending {
+            seq: self.seq,
+            event: id.0 as i64,
+            authored: Some((
+                encode(&cell.buffer)?,
+                encode(&cell.key)?,
+                draft.version.0.0 as i64,
+                encode(&draft.value)?,
+                i64::from(draft.origin == Origin::Derived),
+                draft.derivation.as_ref().map(encode).transpose()?,
+            )),
+        });
+        self.seq += 1;
+        if self.pending.len() >= BATCH {
+            self.flush().await?;
+        }
+        Ok(id)
+    }
+
+    async fn include_event(&mut self, event: EventId) -> Result<()> {
+        self.pending.push(Pending {
+            seq: self.seq,
+            event: event.0 as i64,
+            authored: None,
+        });
+        self.seq += 1;
         if self.pending.len() >= BATCH {
             self.flush().await?;
         }
@@ -289,8 +441,12 @@ impl OpenLayer for SqliteOpenLayer {
         self.pending.clear();
         let id = self.id.0 as i64;
         with_conn(&self.conn, move |conn| {
+            // Events *authored* here go; events merely named here do not — they belong to the layer
+            // that authored them and are still named by it.
             for statement in [
-                "DELETE FROM cells WHERE written_at = ?1",
+                "DELETE FROM cell_index WHERE landed = ?1",
+                "DELETE FROM layer_events WHERE layer = ?1",
+                "DELETE FROM events WHERE authored = ?1",
                 "DELETE FROM def_events WHERE layer = ?1",
                 "DELETE FROM layers WHERE id = ?1",
             ] {
@@ -309,21 +465,26 @@ impl StorageProvider for SqliteStorage {
         path: &ReadPath,
         cell: &CellRef,
         version: ClientVersion,
-    ) -> Result<Option<CellRecord>> {
+    ) -> Result<Option<Landed>> {
         let segments = path.segments.clone();
         let buffer = encode(&cell.buffer)?;
         let key = encode(&cell.key)?;
         let version = version.0.0 as i64;
 
         with_conn(&self.conn, move |conn| {
+            // One seek down `cell_index`'s primary key per segment, however many layers the branch
+            // has and however many of them merged this cell in. `landed`, never `authored`: a merged
+            // event was written on another branch at an id that says nothing about when it became
+            // visible here.
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT c.value, c.version, c.written_at, c.origin, c.derivation
-                     FROM cells c JOIN layers l ON c.written_at = l.id
-                     WHERE c.branch = ?1 AND c.buffer = ?2 AND c.cell_key = ?3 AND c.version = ?4
-                       AND l.state = ?5 AND c.written_at <= ?6
-                     ORDER BY c.written_at DESC LIMIT 1",
-                )
+                .prepare_cached(&format!(
+                    "SELECT {EVENT_COLUMNS}, i.landed
+                     FROM cell_index i JOIN events e ON i.event = e.id
+                                       JOIN layers l ON i.landed = l.id
+                     WHERE i.branch = ?1 AND i.buffer = ?2 AND i.cell_key = ?3 AND i.version = ?4
+                       AND l.state = ?5 AND i.landed <= ?6
+                     ORDER BY i.landed DESC LIMIT 1"
+                ))
                 .map_err(sql)?;
 
             // Walk outward. The first segment holding *any* record wins — including a tombstone,
@@ -339,20 +500,15 @@ impl StorageProvider for SqliteStorage {
                             COMMITTED,
                             bound.0 as i64
                         ],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                            ))
-                        },
+                        |row| Ok((read_event(row, 0)?, row.get::<_, i64>(8)?)),
                     )
                     .optional()
                     .map_err(sql)?;
-                if let Some(row) = found {
-                    return Ok(Some(to_record(row)?));
+                if let Some((event, landed)) = found {
+                    return Ok(Some(Landed {
+                        event: to_event(event)?,
+                        landed_at: LayerId(landed as u64),
+                    }));
                 }
             }
             Ok(None)
@@ -368,10 +524,10 @@ impl StorageProvider for SqliteStorage {
         with_conn(&self.conn, move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT DISTINCT c.version
-                     FROM cells c JOIN layers l ON c.written_at = l.id
-                     WHERE c.branch = ?1 AND c.buffer = ?2 AND c.cell_key = ?3
-                       AND l.state = ?4 AND c.written_at <= ?5",
+                    "SELECT DISTINCT i.version
+                     FROM cell_index i JOIN layers l ON i.landed = l.id
+                     WHERE i.branch = ?1 AND i.buffer = ?2 AND i.cell_key = ?3
+                       AND l.state = ?4 AND i.landed <= ?5",
                 )
                 .map_err(sql)?;
 
@@ -395,57 +551,44 @@ impl StorageProvider for SqliteStorage {
         .await
     }
 
-    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<CellStream> {
+    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<EventStream> {
         let segments = path.segments.clone();
-        let target = buffer.clone();
         let encoded = encode(buffer)?;
 
         let rows = with_conn(&self.conn, move |conn| {
+            // `MAX(i.landed)` picks the bare columns from the row it maximises, and there is exactly
+            // one index row per landing, so the choice is never a tie — which is what makes this
+            // agree with `MemoryStorage` rather than merely usually agree.
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT c.cell_key, c.value, c.version, MAX(c.written_at), c.origin,
-                            c.derivation
-                     FROM cells c JOIN layers l ON c.written_at = l.id
-                     WHERE c.branch = ?1 AND c.buffer = ?2 AND l.state = ?3 AND c.written_at <= ?4
-                     GROUP BY c.cell_key, c.version",
-                )
+                .prepare_cached(&format!(
+                    "SELECT {EVENT_COLUMNS}, MAX(i.landed)
+                     FROM cell_index i JOIN events e ON i.event = e.id
+                                       JOIN layers l ON i.landed = l.id
+                     WHERE i.branch = ?1 AND i.buffer = ?2 AND l.state = ?3 AND i.landed <= ?4
+                     GROUP BY i.cell_key, i.version"
+                ))
                 .map_err(sql)?;
 
             // A child's own record shadows the parent's, so remember what the inner segments
             // covered.
             let mut seen: Vec<String> = Vec::new();
-            let mut rows = Vec::new();
+            let mut rows: Vec<Event> = Vec::new();
             for (branch, bound) in &segments {
                 let found = stmt
                     .query_map(
                         params![branch.0 as i64, &encoded, COMMITTED, bound.0 as i64],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                                row.get(5)?,
-                            ))
-                        },
+                        |row| read_event(row, 0),
                     )
                     .map_err(sql)?;
 
                 let mut segment = Vec::new();
                 for row in found {
-                    let (key, value, version, written_at, origin, derivation) = row.map_err(sql)?;
-                    if seen.contains(&key) {
+                    let event = row.map_err(sql)?;
+                    if seen.contains(&event.2) {
                         continue;
                     }
-                    segment.push(key.clone());
-                    rows.push(Ok((
-                        CellRef {
-                            buffer: target.clone(),
-                            key: decode(&key)?,
-                        },
-                        to_record((value, version, written_at, origin, derivation))?,
-                    )));
+                    segment.push(event.2.clone());
+                    rows.push(to_event(event)?);
                 }
                 seen.extend(segment);
             }
@@ -453,49 +596,38 @@ impl StorageProvider for SqliteStorage {
         })
         .await?;
 
-        Ok(Box::pin(futures_util::stream::iter(rows)))
+        Ok(Box::pin(futures_util::stream::iter(
+            rows.into_iter().map(Ok),
+        )))
     }
 
-    async fn read_layer(&self, layer: LayerId) -> Result<CellStream> {
+    async fn read_layer(&self, layer: LayerId) -> Result<EventStream> {
         let id = layer.0 as i64;
         let rows = with_conn(&self.conn, move |conn| {
+            // Membership, in order — including events this layer named rather than authored, which
+            // is what a merge layer is made of.
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT buffer, cell_key, value, version, written_at, origin, derivation
-                     FROM cells WHERE written_at = ?1",
-                )
+                .prepare_cached(&format!(
+                    "SELECT {EVENT_COLUMNS}
+                     FROM layer_events m JOIN events e ON m.event = e.id
+                     WHERE m.layer = ?1 ORDER BY m.seq"
+                ))
                 .map_err(sql)?;
             let found = stmt
-                .query_map(params![id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                })
+                .query_map(params![id], |row| read_event(row, 0))
                 .map_err(sql)?;
 
             let mut rows = Vec::new();
             for row in found {
-                let (buffer, key, value, version, written_at, origin, derivation) =
-                    row.map_err(sql)?;
-                rows.push(Ok((
-                    CellRef {
-                        buffer: decode(&buffer)?,
-                        key: decode(&key)?,
-                    },
-                    to_record((value, version, written_at, origin, derivation))?,
-                )));
+                rows.push(to_event(row.map_err(sql)?)?);
             }
             Ok(rows)
         })
         .await?;
 
-        Ok(Box::pin(futures_util::stream::iter(rows)))
+        Ok(Box::pin(futures_util::stream::iter(
+            rows.into_iter().map(Ok),
+        )))
     }
 
     async fn put_layer_meta(&self, layer: &Layer) -> Result<()> {
@@ -607,7 +739,9 @@ impl StorageProvider for SqliteStorage {
             id,
             branch,
             defs: 0,
+            seq: 0,
             pending: Vec::with_capacity(BATCH),
+            next_event: Arc::clone(&self.next_event),
             conn: Arc::clone(&self.conn),
         }))
     }
@@ -665,6 +799,29 @@ impl StorageProvider for SqliteStorage {
                 return Err(BorgError::Storage(format!("layer {id} is not sealed")));
             }
             Ok(())
+        })
+        .await
+    }
+
+    async fn rebuild_read_index(&self) -> Result<()> {
+        with_conn(&self.conn, move |conn| {
+            let tx = conn.unchecked_transaction().map_err(sql)?;
+            tx.execute("DELETE FROM cell_index", []).map_err(sql)?;
+            // The whole index in one statement, which is the clearest possible statement of what it
+            // is: layer membership joined to the events it names, keyed by the branch each layer
+            // belongs to. Replayed in `(layer, seq)` order so that a layer writing one cell twice
+            // collapses to the same row it collapsed to on the way in.
+            tx.execute(
+                "INSERT OR REPLACE INTO cell_index
+                 (branch, buffer, cell_key, version, landed, event)
+                 SELECT l.branch, e.buffer, e.cell_key, e.version, m.layer, m.event
+                 FROM layer_events m JOIN events e ON m.event = e.id
+                                     JOIN layers l ON m.layer = l.id
+                 ORDER BY m.layer, m.seq",
+                [],
+            )
+            .map_err(sql)?;
+            tx.commit().map_err(sql)
         })
         .await
     }

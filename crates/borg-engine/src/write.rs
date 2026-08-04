@@ -46,7 +46,7 @@ use crate::defs::{DefRegistry, DefView};
 use crate::log::{LayerHandle, LayerManager};
 use crate::values::Values;
 use borg_core::{
-    AllocatorId, BranchId, BufferId, CellRecord, CellRef, ClientVersion, Derivation, LayerAuthor,
+    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, Derivation, EventDraft, LayerAuthor,
     LayerId, LayerKind, ReadPath, Result, Value, ValueType, Writer, parse,
 };
 use borg_storage::StorageProvider;
@@ -187,14 +187,16 @@ impl WriteSession {
         self.defs
             .check_write(cell, &value, self.writer, &self.authority)?;
         self.imply_existence(cell).await?;
-        let record = CellRecord {
+        // The draft names no layer: the log stamps `authored` with the layer it goes into, which is
+        // the one fact a writer must not be able to assert about itself (§4.3).
+        let draft = EventDraft {
             value,
             version: self.version,
-            written_at: self.handle.id(),
             origin: self.writer.origin(),
             derivation,
         };
-        self.handle.put(cell, record).await
+        self.handle.put(cell, draft).await?;
+        Ok(())
     }
 
     /// The declared type of a cell, where it has one.
@@ -254,14 +256,14 @@ impl WriteSession {
         {
             return Ok(());
         }
-        let record = CellRecord {
+        let draft = EventDraft {
             value: Value::Bool(true),
             version: self.version,
-            written_at: self.handle.id(),
             origin: self.writer.origin(),
             derivation: None,
         };
-        self.handle.put(&existence, record).await
+        self.handle.put(&existence, draft).await?;
+        Ok(())
     }
 
     /// Seal and commit. The commit edge is what triggers dependent producers (§6.2).

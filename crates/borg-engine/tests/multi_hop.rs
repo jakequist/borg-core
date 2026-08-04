@@ -11,9 +11,9 @@
 //! tracking either survives this or the design does not work.
 
 use borg_core::{
-    AllocatorId, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, LayerAuthor,
-    LayerId, ObjectTypeName, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind,
-    RepoId, Result, Value, ValueType, Writer,
+    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, LayerAuthor, LayerId,
+    ObjectTypeName, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result,
+    Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -203,9 +203,13 @@ impl Harness {
         session.commit().await
     }
 
-    async fn read(&self, cell: &CellRef) -> Result<Option<CellRecord>> {
+    async fn read(&self, cell: &CellRef) -> Result<Option<Event>> {
         let path = self.branches.read_path(self.branch, None)?;
-        self.storage.get_cell(&path, cell, V1).await
+        Ok(self
+            .storage
+            .get_cell(&path, cell, V1)
+            .await?
+            .map(|found| found.event))
     }
 
     async fn investible(&self, c: Pid) -> Result<Option<Value>> {

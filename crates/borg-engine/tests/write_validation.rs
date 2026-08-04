@@ -306,7 +306,8 @@ async fn a_string_field_holds_the_text_of_a_form_that_used_to_win() -> Result<()
             .storage()
             .get_cell(&path, &cell, V1)
             .await?
-            .expect("just written");
+            .expect("just written")
+            .event;
         let Value::Ref(pid) = stored.value else {
             panic!(
                 "{text} should have interned as a string, got {:?}",
@@ -380,7 +381,8 @@ async fn an_old_client_goes_on_writing_the_shape_its_own_def_view_declares() -> 
             V1,
         )
         .await?
-        .expect("just written");
+        .expect("just written")
+        .event;
     assert_eq!(
         stored.value,
         Value::Int(40),

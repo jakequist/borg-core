@@ -396,7 +396,12 @@ async fn get(args: &Args, cell: &str) -> Result<()> {
         }
     );
     outln!("  state:       {}", state_name(resolved.state));
-    outln!("  written at:  {}", resolved.written_at);
+    // Two layers, not one. `authored at` is where the value was first committed — on whichever
+    // branch wrote it — and `landed at` is where it arrived on the branch being read. They differ
+    // exactly when the value came across a merge, and the old single `written at` reported only the
+    // second because merge rewrote the first away (SPEC.md §4.3, §13).
+    outln!("  authored at: {}", resolved.authored_at);
+    outln!("  landed at:   {}", resolved.landed_at);
     outln!("  fresh as of: {}", resolved.fresh_as_of);
     if let Some(producer) = resolved.by {
         outln!("  produced by: {producer}");
@@ -430,9 +435,20 @@ async fn explain(args: &Args, cell: &str) -> Result<()> {
     };
 
     outln!("{cell}");
+    let landed = if lineage.landed_at == lineage.authored_at {
+        String::new()
+    } else {
+        // Said only when it is news: on the branch that authored a value the two coincide, and
+        // repeating the same layer twice would make the merged case harder to spot rather than
+        // easier.
+        format!(", landed at {}", lineage.landed_at)
+    };
     match lineage.produced_by {
-        Some(producer) => outln!("  produced by {producer} at {}", lineage.written_at),
-        None => outln!("  source, written at {}", lineage.written_at),
+        Some(producer) => outln!(
+            "  produced by {producer}, authored at {}{landed}",
+            lineage.authored_at
+        ),
+        None => outln!("  source, authored at {}{landed}", lineage.authored_at),
     }
     if !lineage.from.is_empty() {
         outln!("  from");
@@ -444,7 +460,7 @@ async fn explain(args: &Args, cell: &str) -> Result<()> {
                     Origin::Source => "source ",
                     Origin::Derived => "derived",
                 },
-                edge.written_at
+                edge.landed_at
             );
         }
     }

@@ -45,15 +45,25 @@ pub enum FreshnessRequirement {
 
 /// A resolved cell, with provenance. SPEC.md §10.4.
 ///
-/// Named `Resolved` rather than the spec's `Cell<T>` to avoid confusion with `CellRef`/`CellRecord`
-/// and with `std::cell`.
+/// Named `Resolved` rather than the spec's `Cell<T>` to avoid confusion with `CellRef` and with
+/// `std::cell`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Resolved<T> {
     pub value: T,
     pub origin: crate::cell::Origin,
-    /// When this value was actually produced.
-    pub written_at: LayerId,
-    /// Certain-correct through here. For source cells this collapses into `written_at` — source data
+    /// The event this value came from, or `None` where nothing is stored at the reader's version.
+    ///
+    /// Reported because it is the answer to "is this the same write I saw on the other branch?",
+    /// which is a question the model can now answer: a merged event is *one* event named by two
+    /// layers, not a copy on each side (SPEC.md §13).
+    pub event: Option<crate::ids::EventId>,
+    /// Where this value was first committed — on whichever branch authored it.
+    pub authored_at: LayerId,
+    /// Where it arrived on the branch this read resolved through. Equal to `authored_at` until a
+    /// merge carries the event onto another branch, and the two together are the lineage the old
+    /// single `written_at` collapsed (SPEC.md §4.3, §13).
+    pub landed_at: LayerId,
+    /// Certain-correct through here. For source cells this collapses into `landed_at` — source data
     /// is written once and correct thereafter, so the distinction only carries information for
     /// derived data.
     pub fresh_as_of: LayerId,

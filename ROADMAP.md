@@ -148,10 +148,30 @@ change; all four are below. `crates/borg-engine/tests/concurrency.rs` is the pro
 each replayed 30–120 times at sixteen-way parallelism, asserting the settled result and never the
 schedule. §6.2, §7.3, §16.3, §16.4, §16.5 and §17.3 are updated.
 
+### E — events get identity; layers reference them
+
+Phase 1 of the transactional model (`SPEC-DRAFT.md` §1, §4). A stored record no longer carries the
+layer it lives in: an `Event` carries `authored`, the layer it was *first* committed to, and layers
+name their members. Merge stops copying — a parent layer names the child layer's events — and the
+lineage the old rewrite destroyed survives, so a read reports both where a value was authored and
+where it landed. `StorageProvider` grew `author_event` / `include_event` / `rebuild_read_index`,
+`read_layer` yields membership, and both backends keep a materialised
+`(branch, cell, version) -> (layer, event)` index maintained as events stream into an open layer.
+§4.3, §6.2, §10.4, §11, §13, §16.3 and §17.1 are updated;
+`crates/borg-engine/tests/events.rs` is S11 and S12, and the `StorageProvider` contract now runs
+against **both** backends rather than SQLite alone.
+
+**Phases 2 and 3 — transactions and derivation-as-a-transaction — are not started.**
+
 ### Deferred, still
 
 Aggregations, `Set`/`Map`, container isolation, generated SDKs. Nothing has argued for pulling any of
 them forward, and the CLI is doing the SDK's job well enough to keep learning from it first.
+
+`O(1)` merge, explicitly. A parent layer that *references* a child layer's event set rather than
+enumerating it is what would make merge asymptotically free; the model now permits it and the old
+one forbade it. It needs read-path compaction to pay for itself, so what landed is the honest
+version: `n` membership rows and `n` index entries per merged layer instead of `n` full records.
 
 ---
 
@@ -527,6 +547,48 @@ found by stress-testing the concurrency work rather than by it.
 Not fixed with a signal disposition, which needs `unsafe` and the workspace forbids it. One macro
 that writes, and exits `0` if nobody is listening — which is what a Unix tool does. Errors keep going
 to stderr, which the pipe did not close.
+
+---
+
+### Layer membership is not part of a layer's metadata
+
+`SPEC-DRAFT.md` §1 sketches `Layer { …, events: [EventId] }`, and taking that literally would break
+the constraint that governs everything else about layers: a layer may hold millions of events, and
+its metadata is written and read *whole* (`put_layer_meta` is one row). A `Vec<EventId>` on it would
+buffer a layer's membership in memory to write one commit.
+
+So membership lives in storage as a `(layer, event)` relation, enumerated by `read_layer` and
+extended by `include_event`. `Layer` in `borg-core` is unchanged. The model is the draft's — layers
+reference events — but the representation is a relation rather than a field, for the same reason
+commit streams.
+
+### The read index is durable, and not rebuilt on open
+
+The dependency and touch indexes are rebuilt by replaying the log at every `Registry::open`, and the
+obvious symmetry would be to do the same for the `(branch, cell, version) -> (layer, event)` index.
+It is the wrong symmetry: those two are in-memory caches of a process, and this one is what makes a
+read a single indexed lookup in the store itself. Rebuilding it per CLI invocation would turn the
+`O(log)` read we already pay into an `O(log)` *write*.
+
+It is still a projection, and `rebuild_read_index` on `StorageProvider` is how that stays a fact
+rather than a claim: a test throws the index away, rebuilds it from membership, and asserts no
+answer changed. Nothing on the read or write path calls it.
+
+### The index is maintained on the way in, not at commit
+
+Index rows stream in with the events they project and are invisible by the same join against the
+layer's state. Building the index at commit instead would make commit `O(rows)` — the identical
+mistake as flipping a `visible` flag per row, which §17.1 already rejects. It also makes the merge
+case correct by construction: the membership and the index entries for a merge land in the same
+invisible layer, so a read can never see one without the other.
+
+### Two writes to one cell in one layer are two events, and one index row
+
+Membership keeps both — the layer really does contain two, and `read_layer` yields both, which is
+what the invalidator sees. The read index keeps one, the later. That is the same collapse the old
+`cells` table got from its primary key, and stating it explicitly is what keeps `MemoryStorage` and
+SQLite answering identically: with one index row per landing layer, "the newest landing" is a
+maximum with no tie to break, in either backend.
 
 ---
 

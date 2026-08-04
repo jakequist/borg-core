@@ -190,7 +190,7 @@ learn that a provider batches writes (§17.1): a runtime concern, not a user con
 The universal addressable unit is the **cell**:
 
 ```
-CellRef { buffer: BufferId, key: CellKey }  ->  CellRecord
+CellRef { buffer: BufferId, key: CellKey }  ->  Event
 
 key = Pid                 // an object property, or an object's existence
     | (Pid, index)        // a list element
@@ -245,7 +245,7 @@ cell partitions all the same: an `Any` container is mutable, so its contents are
 and origins like any other.
 
 **Interning is not a buffer.** The interning stores hold **values, not cells**. An interned value has
-no def-version, no origin and no writing layer — a `CellRecord`'s fields are all meaningless for it —
+no def-version, no origin and no authoring layer — an `Event`'s fields are all meaningless for it —
 so it is reached through `intern` / `read_interned` (§17.1) rather than through a cell read, and a
 `BufferId` is never named: the PID already carries its kind (§3.1). `BufferId` therefore has **no**
 `String`, `Binary` or `BigInt` variant. Naming one would promise a cell partition that cannot exist,
@@ -268,14 +268,19 @@ whole objects. Keeping those two concerns separate is what preserves the option.
 
 Buffers hold complex values only. Primitives live inline in cells.
 
-### 4.3 The cell record
+### 4.3 The event
+
+A cell's contents are not a record that names a layer. They are an **event with an identity of its
+own**, which layers name (§6.2):
 
 ```
-CellRecord {
+Event {
+  id:         EventId
+  cell:       CellRef
   value:      Primitive | Pid
   version:    LayerId        // the ClientVersion this value was written at
-  writtenAt:  LayerId        // the layer that produced this value
   origin:     Source | Derived
+  authored:   LayerId        // where this event was FIRST committed
   // derived only:
   producer:   ProducerId
   freshAsOf:  LayerId
@@ -283,11 +288,39 @@ CellRecord {
 }
 ```
 
+**An event does not carry the layer it lives in.** It carries only where it was first committed.
+That inversion is what lets one event belong to several layers, which is what lets a merge *name* a
+child's events instead of rewriting them (§13). Groups contain their members; members do not carry
+their group.
+
+**What a read returns is a pair**, and both halves are provenance:
+
+| | meaning |
+|---|---|
+| `event.authored` | where this event was first committed — on whichever branch wrote it |
+| the layer it was reached through | where it landed on *this* branch |
+
+They coincide until a merge shares the event, and then they do not. A single `writtenAt` could only
+report the second, because merge rewrote the first away: "authored on `feature` at L20, landed on
+main at L30" collapsed into L30. Both now survive and the read envelope reports both (§10.4).
+
+**Everything else compares against the landing layer, never `authored`.** Time travel, guard checks
+and watermark validation all ask "was this visible here, by then", and an event authored on another
+branch at a low layer id can land on this one arbitrarily late. Ordering by where an event was
+written would rank a freshly merged value beneath everything the branch has done since.
+
 **Every cell carries its own def-version tag.** A def-mutation touching one field does not stale the
 other fields of the object.
 
-Source cells carry only `value`, `version`, `writtenAt`. The heavy metadata — watermark, read-set,
-producer — attaches to derived cells only, which in a normalized model are the minority.
+Source events carry only `value`, `version`, `origin`, `authored`. The heavy metadata — watermark,
+read-set, producer — attaches to derived events only, which in a normalized model are the minority.
+
+**A materialised read index keeps reads a single lookup.** "The latest write to cell `C` visible on
+branch `B` at layer ≤ `N`" is now a question about membership, so a provider maintains
+`(branch, cell, version) -> (layer, event)` as events are put into a layer. Like every other index
+in the system it is a projection of the log and must be rebuildable from it (§17.1); unlike the
+dependency and touch indexes it is durable, because rebuilding it on open would turn an `O(log)`
+read into an `O(log)` write.
 
 ### 4.4 Lists
 
@@ -431,6 +464,9 @@ has no `down` migration and will break the N clients currently on versions X and
 `CreateObject`, `SetObjectProp`, `UnsetObjectProp`, `DeleteObject`, `ListAppend`, `CreateList`,
 `DeleteList`.
 
+A ValueEvent is stored as an `Event` (§4.3): one cell, one value, and an identity of its own. Those
+identities are what layers hold.
+
 **DefEvents** mutate definitions:
 `CreateObjectDef`, `MutateObjectDef`, `DeleteObjectDef`, `DeclareField`, `MutateField`,
 `DeleteField`, `PushProducer`.
@@ -443,10 +479,22 @@ Every `DefEvent` that alters the shape of existing data **must** supply a migrat
 
 ### 6.2 Layers
 
+**A layer is an ordered group of events, and it holds its members by reference.** Membership is a
+`(layer, event)` relation: many layers may name one event, and an event names none of them (§4.3).
+That is the model this prose always described; it is now also the model the storage implements.
+
 A layer contains ValueEvents **xor** DefEvents, never both. This is what makes "the def-version as
 of layer L" well-defined.
 
-A layer belongs to exactly one branch. LayerIds are registry-unique.
+**A layer belongs to exactly one branch**, unchanged and load-bearing. Only *events* are shared.
+LayerIds are registry-unique.
+
+Membership is not part of a layer's metadata, which is written whole. A layer may hold millions of
+events, so its members are enumerated and streamed like its contents always were — the same
+constraint that governs commit governs reading a layer back.
+
+Two writes to one cell in one layer are **two events**, both members. It is the read index, not the
+group, that decides which of them resolves: the later one.
 
 **A layer is the universal unit of atomicity**, for client transactions and producer runs alike. Both
 follow the same state machine:
@@ -947,7 +995,7 @@ Two distinct operations, and separating them is where the efficiency lives:
 | Operation | What it does | Runs user code | Advances |
 |---|---|---|---|
 | **Validate** | checks the dependency index for changes in `(freshAsOf, target]` | no | `freshAsOf` |
-| **Recompute** | re-runs the producer, yielding a new value and read-set | yes | `writtenAt` **and** `freshAsOf` |
+| **Recompute** | re-runs the producer, yielding a new value and read-set | yes | a new event, so `landedAt` **and** `freshAsOf` |
 
 Most derived cells most of the time need only validation. A cell depending on `website` and three
 schools is unaffected by the other 40,000 writes that landed meanwhile, and its watermark advances
@@ -973,18 +1021,24 @@ down-migration receives a watermark accounting for both hops.
 Every cell read returns provenance, not a bare value:
 
 ```ts
-// Named `Resolved<T>` in the Rust implementation: `Cell` collides with CellRef,
-// CellRecord and std::cell.
+// Named `Resolved<T>` in the Rust implementation: `Cell` collides with CellRef
+// and std::cell.
 type Cell<T> = {
-  value:     T
-  origin:    'source' | 'derived'
-  writtenAt: LayerId    // when this value was actually produced
-  freshAsOf: LayerId    // certain-correct through here
-  state:     'current' | 'unvalidated' | 'stale' | 'broken' | 'tombstoned'
-  by?:       ProducerId
+  value:      T
+  origin:     'source' | 'derived'
+  event?:     EventId    // which write this is — absent when nothing is stored here
+  authoredAt: LayerId    // where this value was first committed
+  landedAt:   LayerId    // where it arrived on the branch being read
+  freshAsOf:  LayerId    // certain-correct through here
+  state:      'current' | 'unvalidated' | 'stale' | 'broken' | 'tombstoned'
+  by?:        ProducerId
   // deferred: expectedFreshAt — an ETA for when catch-up will complete
 }
 ```
+
+`authoredAt` and `landedAt` are equal until the value arrives by merge, and then they are the two
+halves of its lineage (§4.3, §13). `event` is reported because "is this the same write I saw on the
+other branch?" is now a question with an answer: a merged event is one event named by two layers.
 
 | State | Meaning |
 |---|---|
@@ -994,7 +1048,7 @@ type Cell<T> = {
 | `broken` | The producer threw or cycled. `IllegalState`, scoped to this cell. |
 | `tombstoned` | Explicitly removed (§8.1), or reached through a dangling reference (§8.2). |
 
-For source cells `writtenAt` and `freshAsOf` collapse — source data is written once and correct
+For source cells `landedAt` and `freshAsOf` collapse — source data is written once and correct
 thereafter. The distinction only carries information for derived data.
 
 **A cell not materialized at the reader's def-version is one of three different facts**, and the
@@ -1009,8 +1063,8 @@ Worked example, reading `company#100` at HEAD = L500:
 
 ```
 company#100:
-  name             "Acme"   source    writtenAt L120   freshAsOf L500   current
-  is_hot_startup   true     derived   writtenAt L400   freshAsOf L450   stale
+  name             "Acme"   source    authored L120  landed L120  freshAsOf L500  current
+  is_hot_startup   true     derived   authored L400  landed L400  freshAsOf L450  stale
                                       by pipeline:invest_score
 ```
 
@@ -1081,13 +1135,17 @@ Lineage requires no new storage. It is the dependency index read backwards.
 ```
 explain(company#100, is_hot_startup) →
   produced by  pipeline:invest_score @ ClientVersion L380
-  writtenAt    L400
+  authored     L400
   freshAsOf    L450
   from
     (company#100, website)     source    @ L120
     (company#100, founders)    source    @ L390
     (school#77,  is_top_ten)   derived   @ L400   ← recursively expandable
 ```
+
+An input's layer is where it **landed** on the branch being explained, which for a merged input is
+the merge rather than the write. Where a value's own `authored` and landing layers differ, both are
+reported — that is lineage merge used to destroy (§4.3, §13).
 
 ---
 
@@ -1128,6 +1186,24 @@ instead.
 Merge replays the child branch's **source** events onto the parent as **new** layers. Derived layers
 are tagged and skipped — the child's derived values are wrong on the parent by construction, because
 the underlying data differs. The parent's derivation engine re-derives in the background.
+
+**Merge does not copy events.** Each new parent layer *names* the events of the child layer it
+replays (§4.3, §6.2). Nothing is rewritten, so:
+
+- an event keeps its identity — one event named by two layers, not a copy on each branch;
+- it keeps `authored`, so lineage survives the merge instead of being overwritten by it;
+- it keeps the ClientVersion it was authored at, so the parent's readers migrate and nothing is
+  coerced.
+
+**What this costs.** Membership is `(layer, event)` rather than a full record carrying value,
+version, origin, derivation and read-set, and the read index gains one entry per event. That is a
+large constant factor and deliberately **not** an asymptotic one: there are still `n` rows per
+merged layer, and the index must be updated with the merge or reads miss the data. Genuine `O(1)`
+would need a parent layer to *reference* a child layer's event set rather than enumerate it, which
+grows the read path per merge and needs compaction to pay for itself. Deferred.
+
+The events a merge names are also why an aborted merge is harmless: aborting a layer discards what
+it *authored*, and it authored nothing.
 
 The user chooses **def-only** or **def+data**.
 
@@ -1302,7 +1378,11 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 4. **Locks are per-layer, never per-branch.** A branch-wide write lock would serialize derivation.
 5. **Derived data is addressed by `reflects`, never by derived LayerId.** This is what makes the
    ordering of concurrent independent producers unobservable.
-6. **No membership test in the dependency index may be a linear scan.** A widely-shared upstream
+6. **The read index is consistent with the merge that changed it.** A merge adds membership without
+   writing values, so the `(branch, cell, version) -> (layer, event)` projection has to gain its
+   entries in the same invisible layer the membership went into. An index updated separately from
+   the merge is a read that misses data.
+7. **No membership test in the dependency index may be a linear scan.** A widely-shared upstream
    cell accumulates one dependent per invocation, and every one of them retracts itself on re-run.
    Vector membership turns a fan-out of `n` into `O(n²)` — measured, and the difference between
    1.3s and 0.28s at 32k dependents. Sets everywhere the index dedupes or removes.
@@ -1442,8 +1522,11 @@ memory lookups.
 Deliberately minimal, so that a plain KV store and Postgres remain equally viable:
 
 ```
-get_cell(branch, cell, layer) -> CellRecord?
-put_cell(open_layer, cell, CellRecord)          // streaming; never buffered whole
+get_cell(branch, cell, layer) -> (Event, landedAt)?
+author_event(open_layer, cell, EventDraft) -> EventId   // streaming; never buffered whole
+include_event(open_layer, EventId)              // membership — what makes merge not copy
+read_layer(layer) -> Iterator<Event>            // a layer's membership, in order
+rebuild_read_index()                            // the index is a projection, and this proves it
 scan_buffer(branch, buffer, layer) -> Iterator   // engine-internal enumeration only
 open_layer / seal_layer / commit_layer / abort_layer
 intern(kind, bytes) -> Pid                       // content-addressed; no branch, no layer
@@ -1470,10 +1553,16 @@ store handle of its own and must not acquire one, but it delegates rather than r
 write stream into an uncommitted, invisible layer is disqualified.
 
 The SQL shape that satisfies it: rows are inserted as they arrive and **visibility is a join, not a
-rewrite** — every read joins the cell table against a layer table and keeps only rows whose layer is
-committed. Committing is then a single-row update, `O(1)` however large the layer. Flipping a
-`visible` column on each row instead would make commit `O(rows)` and undo the very property the
-interface exists to preserve.
+rewrite** — every read joins the event and membership tables against a layer table and keeps only
+rows whose layer is committed. Committing is then a single-row update, `O(1)` however large the
+layer. Flipping a `visible` column on each row instead would make commit `O(rows)` and undo the very
+property the interface exists to preserve.
+
+**The read index is maintained on the way in, for the same reason.** Its rows stream in with the
+events they project and are invisible by the same join; building it at commit instead would make
+commit `O(rows)` just as surely as a `visible` flag would. `rebuild_read_index` exists so that
+"the index is a projection of the log, not a second source of truth" is checkable rather than
+merely claimed — it is on the interface, not on the write path, and nothing in the engine calls it.
 
 Reading at HEAD is expressed as *no layer*, not as the branch's head: a fork that has not written
 anything yet has no head of its own, and its effective ceiling is the fork point it inherits.
@@ -1482,7 +1571,7 @@ anything yet has no head of its own, and its effective ceiling is the fork point
 awaits, so a synchronous store is the provider's problem alone and must not occupy an async worker
 thread.
 
-**Writes batch; reads do not need to.** `put_cell` is called an unbounded number of times, so
+**Writes batch; reads do not need to.** `author_event` is called an unbounded number of times, so
 dispatching each one individually makes overhead dominate. A provider is free to accumulate writes
 into a **bounded** buffer and flush in one transaction — safe precisely because an open layer is
 invisible, so nothing can observe the difference between a row written immediately and one written

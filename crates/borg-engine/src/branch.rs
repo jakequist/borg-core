@@ -6,10 +6,19 @@
 //! Merge replays the child's **source** layers onto the parent as new layers. Derived layers are
 //! skipped, because the child's derived values are wrong on the parent by construction: they were
 //! computed from different data.
+//!
+//! **Merge does not copy events.** A parent layer *names* the events of the child layer it replays
+//! (§13). The events are not rewritten, so `authored` still says where they were written and the
+//! parent layer says where they landed — the two facts the old model collapsed into one. What this
+//! costs is `n` membership rows and `n` read-index entries rather than `n` full records carrying
+//! value, version, origin, derivation and read-set: a large constant factor, and deliberately not
+//! an asymptotic one. Genuine `O(1)` needs a parent layer to reference a child layer's event *set*
+//! rather than enumerate it, which grows the read path per merge and needs compaction to pay for
+//! itself. Deferred.
 
 use crate::log::LayerManager;
 use borg_core::{
-    BorgError, Branch, BranchId, CellRecord, CellRef, FieldName, LayerAuthor, LayerId, LayerKind,
+    BorgError, Branch, BranchId, CellRef, Event, FieldName, LayerAuthor, LayerId, LayerKind,
     MergeMode, MergeRejection, ObjectTypeName, ReadPath, Result,
 };
 use borg_storage::StorageProvider;
@@ -152,8 +161,8 @@ impl BranchManager {
                     }));
                 }
             }
-            let writes = self.contents_of(*layer).await?;
-            self.check_dangling(parent, origin, &writes).await?;
+            let events = self.contents_of(*layer).await?;
+            self.check_dangling(parent, origin, &events).await?;
 
             // Re-evaluate the child's guards against the *parent*, since the fork point. "Has the
             // parent touched this while I was working?" is exactly the definition of a merge
@@ -175,11 +184,11 @@ impl BranchManager {
                     other => other,
                 });
             }
-            staged.push(writes);
+            staged.push(events);
         }
 
         let mut replayed = Vec::new();
-        for (source, writes) in replayable.iter().zip(staged) {
+        for (source, events) in replayable.iter().zip(staged) {
             let kind = self
                 .layers
                 .layer(*source)
@@ -188,17 +197,19 @@ impl BranchManager {
             for event in self.storage.read_def_layer(*source).await? {
                 layer.put_def(event).await?;
             }
-            for (cell, mut record) in writes {
-                // Each event keeps the ClientVersion it was authored at, so the parent's readers
-                // migrate rather than anything being coerced (SPEC.md §13).
-                record.written_at = layer.id();
-                // Replay writes through the log directly rather than through a `WriteSession`.
-                // These were validated once already, on the child, against the def-view they were
-                // authored under; the def layers that made them legal are replayed in this same
-                // merge. Re-checking them against a def-view that is itself mid-replay would reject
-                // a `DefOnly` merge's own data half and turn "the merge is atomic" into "the merge
-                // is atomic if you ordered your layers correctly".
-                layer.put(&cell, record).await?;
+            for event in events {
+                // **The whole change, in one line.** The parent layer names the child's event; it
+                // does not rewrite it. The event keeps its identity, the ClientVersion it was
+                // authored at — so the parent's readers migrate and nothing is coerced (§13) — and
+                // the layer that authored it, which is what makes lineage survive the merge.
+                //
+                // Membership is also the reason this needs no revalidation. These events were
+                // validated once, on the child, against the def-view they were authored under, and
+                // the def layers that made them legal are replayed in this same merge. Re-checking
+                // them against a def-view that is itself mid-replay would reject a `DefOnly`
+                // merge's own data half and turn "the merge is atomic" into "the merge is atomic if
+                // you ordered your layers correctly".
+                layer.include(event.id).await?;
             }
             replayed.push(self.layers.commit(layer).await?);
         }
@@ -246,13 +257,14 @@ impl BranchManager {
         Ok(touched)
     }
 
-    async fn contents_of(&self, layer: LayerId) -> Result<Vec<(CellRef, CellRecord)>> {
+    /// A layer's membership, oldest first.
+    async fn contents_of(&self, layer: LayerId) -> Result<Vec<Event>> {
         let mut stream = self.storage.read_layer(layer).await?;
-        let mut writes = Vec::new();
+        let mut events = Vec::new();
         while let Some(row) = stream.next().await {
-            writes.push(row?);
+            events.push(row?);
         }
-        Ok(writes)
+        Ok(events)
     }
 
     /// Reject if the child wrote to an object the parent has since deleted. SPEC.md §13.
@@ -260,24 +272,27 @@ impl BranchManager {
         &self,
         parent: BranchId,
         fork_point: LayerId,
-        writes: &[(CellRef, CellRecord)],
+        events: &[Event],
     ) -> Result<()> {
         let path = self.read_path(parent, None)?;
-        for (cell, record) in writes {
-            let existence = CellRef::existence_of(cell);
-            if existence == *cell {
+        for event in events {
+            let existence = CellRef::existence_of(&event.cell);
+            if existence == event.cell {
                 continue;
             }
+            // *Landed*, not authored: the question is whether the deletion became visible on the
+            // parent after the fork, and a tombstone the parent inherited by merge was authored
+            // somewhere else entirely.
             let deleted = self
                 .storage
-                .get_cell(&path, &existence, record.version)
+                .get_cell(&path, &existence, event.version)
                 .await?
-                .filter(|found| found.value.is_tombstone())
-                .filter(|found| found.written_at.0 > fork_point.0);
+                .filter(|found| found.event.value.is_tombstone())
+                .filter(|found| found.landed_at.0 > fork_point.0);
             if let Some(found) = deleted {
                 return Err(BorgError::MergeRejected(MergeRejection::DanglingWrite {
-                    cell: cell.clone(),
-                    deleted_at: found.written_at,
+                    cell: event.cell.clone(),
+                    deleted_at: found.landed_at,
                 }));
             }
         }

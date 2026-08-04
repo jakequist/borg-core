@@ -18,14 +18,15 @@ pub mod pid;
 pub mod value;
 
 pub use cell::{
-    BufferId, CellAt, CellKey, CellRecord, CellRef, Derivation, FieldName, Origin, Writer,
+    BufferId, CellAt, CellKey, CellRef, Derivation, Event, EventDraft, FieldName, Landed, Origin,
+    Writer,
 };
 pub use def::{
     DefEvent, FieldDef, MigrationDirection, ObjectDef, Ownership, ProducerDef, ProducerKind,
 };
 pub use error::{BorgError, MergeRejection, Result, WriteRejection};
 pub use freshness::{Freshness, FreshnessRequirement, Resolved, Watermark};
-pub use ids::{AllocatorId, BranchId, ClientVersion, LayerId, ProducerId, RepoId};
+pub use ids::{AllocatorId, BranchId, ClientVersion, EventId, LayerId, ProducerId, RepoId};
 pub use layer::{Branch, Guard, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
 pub use parse::ParseError;
 pub use pid::{Pid, PidAllocator, PidKind};

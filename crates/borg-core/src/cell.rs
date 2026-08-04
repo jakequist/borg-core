@@ -4,7 +4,7 @@
 //! ownership, migration staleness, and merge conflict resolution all key on the same primitive. So
 //! the physical unit of storage is the cell, not the object.
 
-use crate::ids::{ClientVersion, LayerId, ProducerId};
+use crate::ids::{ClientVersion, EventId, LayerId, ProducerId};
 use crate::pid::Pid;
 use crate::value::{ObjectTypeName, Value};
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub type FieldName = Arc<str>;
 ///
 /// **The interning buffers are deliberately absent.** §4.2 calls `StringBuffer`, `BinaryBuffer` and
 /// `BigIntBuffer` buffers, but they hold *values, not cells*: an interned value has no version, no
-/// origin and no writing layer, so a `CellRecord`'s fields are all meaningless for it and there is
+/// origin and no authoring layer, so an [`Event`]'s fields are all meaningless for it and there is
 /// no cell for a `BufferId` to partition. They are reached through `intern` / `read_interned`
 /// (§17.1), which need no buffer argument because a PID already carries its kind (§3.1). Naming
 /// them here would promise a cell partition that cannot exist.
@@ -279,21 +279,62 @@ impl fmt::Display for Writer {
     }
 }
 
-/// What is physically stored for a cell. SPEC.md §4.3.
+/// One mutation, with an identity of its own. SPEC.md §4.3, §6.1.
 ///
-/// Source cells carry only the first three fields. The heavy metadata — watermark, read-set,
-/// producer — attaches to derived cells only, which in a normalized model are the minority.
+/// **An event does not carry the layer it lives in.** Layers name their events (§6.2); an event
+/// records only where it was *first* committed. That inversion is what lets one event belong to
+/// several layers, which is what lets a merge name a child's events instead of rewriting them
+/// (§13) — and it is what keeps the lineage a rewrite would destroy: `authored` survives the merge,
+/// and the layer you reached the event through says where it landed on *this* branch.
+///
+/// Source events carry only value, version and origin. The heavy metadata — watermark, read-set,
+/// producer — attaches to derived events only, which in a normalized model are the minority.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CellRecord {
+pub struct Event {
+    pub id: EventId,
+    /// The cell this event mutates. On the event rather than beside it, because an event is now a
+    /// thing in its own right that layers merely reference.
+    pub cell: CellRef,
     pub value: Value,
     /// The `ClientVersion` this value was *written* at. Never coerced or rewritten; readers at other
     /// versions migrate on the read path (SPEC.md §5.4).
     pub version: ClientVersion,
-    /// The layer that produced this value.
-    pub written_at: LayerId,
     pub origin: Origin,
     /// Present only when `origin == Derived`.
     pub derivation: Option<Derivation>,
+    /// Where this event was **first** committed — on whichever branch wrote it. A merge never
+    /// rewrites it, so "authored on `feature` at L20, landed on main at L30" survives as two facts
+    /// rather than collapsing into the second (SPEC.md §13).
+    pub authored: LayerId,
+}
+
+/// An event before the log has given it one: no id, and no place. SPEC.md §4.3.
+///
+/// The two fields an [`Event`] has and this does not are exactly the two the log supplies —
+/// identity, and the layer that authored it. A writer names neither, which is what makes it
+/// impossible to author an event claiming to have been written somewhere it was not.
+#[derive(Clone, Debug)]
+pub struct EventDraft {
+    pub value: Value,
+    pub version: ClientVersion,
+    pub origin: Origin,
+    pub derivation: Option<Derivation>,
+}
+
+/// An event as reached through one branch: what it is, and where it arrived here. SPEC.md §4.3.
+///
+/// The pair is the whole point of the inversion. `event.authored` is a fact about the event and is
+/// the same on every branch that names it; `landed_at` is a fact about *this* read path — the layer
+/// whose membership carried the event onto the branch being read. They coincide until a merge
+/// shares the event, and then they do not.
+///
+/// Time travel, guard checking and validation all compare against `landed_at`, never `authored`: the
+/// question is always "was this visible here, by then", and an event authored on another branch at a
+/// low layer id can land on this one arbitrarily late.
+#[derive(Clone, Debug)]
+pub struct Landed {
+    pub event: Event,
+    pub landed_at: LayerId,
 }
 
 /// Derived-cell metadata. SPEC.md §4.3, §10.

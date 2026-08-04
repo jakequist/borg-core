@@ -18,6 +18,14 @@ pub struct BranchId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LayerId(pub u64);
 
+/// Identifies an event — one mutation, with an identity of its own. SPEC.md §4.3, §6.1.
+///
+/// Registry-unique rather than layer-scoped or branch-scoped, and for the same reason `LayerId` is:
+/// a merge makes one event a member of layers on two branches (§13), so an id that meant something
+/// only within one of them would stop naming the same event the moment it was shared.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EventId(pub u64);
+
 /// The def-view an actor's code was authored against. SPEC.md §5.4.
 ///
 /// A distinct type from [`LayerId`] despite the identical representation, because conflating "which
@@ -60,6 +68,7 @@ macro_rules! debug_as {
 
 debug_as!(BranchId, "b");
 debug_as!(LayerId, "L");
+debug_as!(EventId, "e");
 debug_as!(AllocatorId, "a");
 debug_as!(ProducerId, "P");
 debug_as!(RepoId, "r");

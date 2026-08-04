@@ -7,39 +7,75 @@
 //! It does honour the two constraints that actually shape the interface: writes stream into an
 //! invisible open layer, and nothing becomes visible until commit.
 
-use crate::{CellStream, OpenLayer, SealedLayer, StorageProvider};
+use crate::{EventStream, OpenLayer, SealedLayer, StorageProvider};
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, Branch, BranchId, BufferId, CellRecord, CellRef, ClientVersion, DefEvent, Layer,
-    LayerId, Pid, PidKind, ReadPath, Result, content,
+    BorgError, Branch, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, EventDraft,
+    EventId, Landed, Layer, LayerId, Pid, PidKind, ReadPath, Result, content,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-type Committed = HashMap<BranchId, HashMap<(CellRef, ClientVersion), Vec<(LayerId, CellRecord)>>>;
+/// The read index: `(branch, cell, version) -> (layer, event)`, one entry per landing layer.
+///
+/// A projection of layer membership, kept because reads must stay a single lookup once events no
+/// longer carry a layer. [`MemoryStorage::rebuild_read_index`] regenerates it from the log, which
+/// is what makes it a cache rather than a second source of truth.
+type ReadIndex = HashMap<BranchId, HashMap<(CellRef, ClientVersion), Vec<(LayerId, EventId)>>>;
 
-/// The newest write to a cell at or below a bound.
+/// The newest landing at or below a bound.
 ///
 /// A `max_by_key`, not the last entry that fits. Layers commit out of order — ids are assigned at
 /// open and order is established at commit (SPEC.md §7.3) — so this history is in *commit* order,
 /// not id order, and "walk backwards to the first one that fits" would serve a superseded value
 /// whenever two layers on one cell landed in the other order.
-fn newest_at(history: &[(LayerId, CellRecord)], bound: LayerId) -> Option<&(LayerId, CellRecord)> {
+///
+/// Keyed on the **landing** layer, never on the event's `authored`: a merge carries an event
+/// authored long ago onto this branch now, and ordering by where it was written would rank it under
+/// whatever the branch has done since.
+fn newest_at(history: &[(LayerId, EventId)], bound: LayerId) -> Option<(LayerId, EventId)> {
     history
         .iter()
-        .filter(|(written_at, _)| written_at.0 <= bound.0)
-        .max_by_key(|(written_at, _)| written_at.0)
+        .filter(|(landed, _)| landed.0 <= bound.0)
+        .max_by_key(|(landed, _)| landed.0)
+        .copied()
+}
+
+/// Record that `event` landed on `branch` at `layer`.
+///
+/// One entry per landing layer, replaced rather than appended when a layer writes the same cell
+/// twice: within one layer the later write wins, and collapsing it here is what keeps
+/// [`newest_at`]'s `max_by_key` unambiguous. Membership keeps both events — the layer really does
+/// contain two — but only one of them can be the answer to a read.
+fn index(into: &mut ReadIndex, branch: BranchId, layer: LayerId, event: &Event) {
+    let history = into
+        .entry(branch)
+        .or_default()
+        .entry((event.cell.clone(), event.version))
+        .or_default();
+    match history.iter_mut().find(|(landed, _)| *landed == layer) {
+        Some(entry) => entry.1 = event.id,
+        None => history.push((layer, event.id)),
+    }
 }
 
 #[derive(Default)]
 struct Inner {
-    /// Per cell, the history of writes — in **commit** order, which is not id order (§7.3). Time
-    /// travel is [`newest_at`] over this.
-    committed: Committed,
+    /// Every event, by identity. One entry however many layers name it — which is the property the
+    /// whole inversion exists for.
+    ///
+    /// A `Vec` indexed by id rather than a map, because this store mints the ids itself and mints
+    /// them densely from 1. A layer that aborts leaves a hole, which is what `Option` is for. It
+    /// matters because a fan-out round authors one event and reads seven per invocation, and a
+    /// hash per event is the sort of constant the scale benchmark notices.
+    events: Vec<Option<Event>>,
+    /// A committed layer's membership, in order (SPEC.md §6.2), and the branch it belongs to — a
+    /// layer still belongs to exactly one branch, and only *events* are shared.
+    members: HashMap<LayerId, Membership>,
+    /// Per branch and cell, where events landed. See [`ReadIndex`].
+    reads: ReadIndex,
     /// Open and sealed layers, invisible to readers until commit.
     staged: HashMap<LayerId, StagedLayer>,
-    /// A committed layer's contents — the changeset that drives invalidation (SPEC.md §9.6).
-    layer_contents: HashMap<LayerId, Vec<(CellRef, CellRecord)>>,
     /// A committed def layer's events.
     def_contents: HashMap<LayerId, Vec<DefEvent>>,
     layer_meta: HashMap<LayerId, Layer>,
@@ -48,11 +84,47 @@ struct Inner {
     /// (SPEC.md §3.1). One map rather than three because the PID carries its own kind, which is
     /// what keeps `String("x")` and `Binary("x")` apart despite sharing a hash.
     interned: HashMap<Pid, Vec<u8>>,
+    next_event: u64,
+}
+
+impl Inner {
+    fn mint(&mut self) -> EventId {
+        self.next_event += 1;
+        EventId(self.next_event)
+    }
+
+    fn stored(&self, id: EventId) -> Option<&Event> {
+        self.events.get(id.0.checked_sub(1)? as usize)?.as_ref()
+    }
+
+    /// An event by identity. A membership row naming an event that does not exist is a corrupt log,
+    /// not a miss, so this errors rather than returning `None`.
+    fn event(&self, id: EventId) -> Result<Event> {
+        self.stored(id)
+            .cloned()
+            .ok_or_else(|| BorgError::Storage(format!("unknown event {id}")))
+    }
+
+    fn store(&mut self, event: Event) {
+        let slot = event.id.0 as usize - 1;
+        if self.events.len() <= slot {
+            self.events.resize_with(slot + 1, || None);
+        }
+        self.events[slot] = Some(event);
+    }
+}
+
+struct Membership {
+    branch: BranchId,
+    events: Vec<EventId>,
 }
 
 struct StagedLayer {
     branch: BranchId,
-    writes: Vec<(CellRef, CellRecord)>,
+    /// Membership in the order it was written, whether authored here or named from elsewhere.
+    members: Vec<EventId>,
+    /// The events this layer is the author of, still invisible.
+    authored: Vec<Event>,
     defs: Vec<DefEvent>,
     sealed: bool,
 }
@@ -68,6 +140,18 @@ impl MemoryStorage {
     }
 }
 
+/// The staged layer this handle writes into, refusing once it is sealed.
+fn staged(inner: &mut Inner, id: LayerId) -> Result<&mut StagedLayer> {
+    let staged = inner
+        .staged
+        .get_mut(&id)
+        .ok_or_else(|| BorgError::Storage(format!("layer {id} is not open")))?;
+    if staged.sealed {
+        return Err(BorgError::Storage(format!("layer {id} is sealed")));
+    }
+    Ok(staged)
+}
+
 /// A handle to one open layer. Writes accumulate here and are invisible to every reader until the
 /// layer commits (SPEC.md §6.2).
 pub struct MemoryOpenLayer {
@@ -81,29 +165,36 @@ impl OpenLayer for MemoryOpenLayer {
         self.id
     }
 
-    async fn put_cell(&mut self, cell: &CellRef, record: CellRecord) -> Result<()> {
+    async fn author_event(&mut self, cell: &CellRef, draft: EventDraft) -> Result<EventId> {
         let mut inner = self.inner.lock().unwrap();
-        let staged = inner
-            .staged
-            .get_mut(&self.id)
-            .ok_or_else(|| BorgError::Storage(format!("layer {} is not open", self.id)))?;
-        if staged.sealed {
-            return Err(BorgError::Storage(format!("layer {} is sealed", self.id)));
+        let id = inner.mint();
+        let staged = staged(&mut inner, self.id)?;
+        staged.members.push(id);
+        staged.authored.push(Event {
+            id,
+            cell: cell.clone(),
+            value: draft.value,
+            version: draft.version,
+            origin: draft.origin,
+            derivation: draft.derivation,
+            // Authored here, because this is where it is being created. Nothing else can set it.
+            authored: self.id,
+        });
+        Ok(id)
+    }
+
+    async fn include_event(&mut self, event: EventId) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.stored(event).is_none() {
+            return Err(BorgError::Storage(format!("unknown event {event}")));
         }
-        staged.writes.push((cell.clone(), record));
+        staged(&mut inner, self.id)?.members.push(event);
         Ok(())
     }
 
     async fn put_def(&mut self, event: DefEvent) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let staged = inner
-            .staged
-            .get_mut(&self.id)
-            .ok_or_else(|| BorgError::Storage(format!("layer {} is not open", self.id)))?;
-        if staged.sealed {
-            return Err(BorgError::Storage(format!("layer {} is sealed", self.id)));
-        }
-        staged.defs.push(event);
+        staged(&mut inner, self.id)?.defs.push(event);
         Ok(())
     }
 
@@ -130,18 +221,21 @@ impl StorageProvider for MemoryStorage {
         path: &ReadPath,
         cell: &CellRef,
         version: ClientVersion,
-    ) -> Result<Option<CellRecord>> {
+    ) -> Result<Option<Landed>> {
         let inner = self.inner.lock().unwrap();
         // Walk outward. The first segment holding *any* record wins — including a tombstone, which
         // must stop the walk rather than fall through and resurrect the parent's value.
         for (branch, bound) in &path.segments {
             let found = inner
-                .committed
+                .reads
                 .get(branch)
                 .and_then(|cells| cells.get(&(cell.clone(), version)))
-                .and_then(|history| newest_at(history, *bound).map(|(_, record)| record.clone()));
-            if found.is_some() {
-                return Ok(found);
+                .and_then(|history| newest_at(history, *bound));
+            if let Some((landed_at, event)) = found {
+                return Ok(Some(Landed {
+                    event: inner.event(event)?,
+                    landed_at,
+                }));
             }
         }
         Ok(None)
@@ -151,7 +245,7 @@ impl StorageProvider for MemoryStorage {
         let inner = self.inner.lock().unwrap();
         let mut versions = Vec::new();
         for (branch, bound) in &path.segments {
-            for ((c, version), history) in inner.committed.get(branch).into_iter().flatten() {
+            for ((c, version), history) in inner.reads.get(branch).into_iter().flatten() {
                 if c == cell
                     && !versions.contains(version)
                     && history.iter().any(|(at, _)| at.0 <= bound.0)
@@ -163,34 +257,39 @@ impl StorageProvider for MemoryStorage {
         Ok(versions)
     }
 
-    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<CellStream> {
+    async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<EventStream> {
         let inner = self.inner.lock().unwrap();
         // A child's own record shadows the parent's, so remember what the inner segments covered.
+        // `seen` is extended only once the segment is finished: shadowing is between segments, and
+        // a cell materialized at two versions is two rows within one — one per version, because a
+        // version is part of the record key (§4.3) and hiding one of them would hide a migration's
+        // output from the only enumeration the engine has.
         let mut seen: Vec<CellRef> = Vec::new();
         let mut rows = Vec::new();
         for (branch, bound) in &path.segments {
-            for ((cell, _), history) in inner.committed.get(branch).into_iter().flatten() {
+            let mut segment = Vec::new();
+            for ((cell, _), history) in inner.reads.get(branch).into_iter().flatten() {
                 if &cell.buffer != buffer || seen.contains(cell) {
                     continue;
                 }
-                if let Some((_, record)) = newest_at(history, *bound) {
-                    seen.push(cell.clone());
-                    rows.push(Ok((cell.clone(), record.clone())));
+                if let Some((_, event)) = newest_at(history, *bound) {
+                    segment.push(cell.clone());
+                    rows.push(inner.event(event));
                 }
             }
+            seen.extend(segment);
         }
         Ok(Box::pin(futures_util::stream::iter(rows)))
     }
 
-    async fn read_layer(&self, layer: LayerId) -> Result<CellStream> {
+    async fn read_layer(&self, layer: LayerId) -> Result<EventStream> {
         let inner = self.inner.lock().unwrap();
         let rows: Vec<_> = inner
-            .layer_contents
+            .members
             .get(&layer)
-            .cloned()
-            .unwrap_or_default()
             .into_iter()
-            .map(Ok)
+            .flat_map(|membership| &membership.events)
+            .map(|id| inner.event(*id))
             .collect();
         Ok(Box::pin(futures_util::stream::iter(rows)))
     }
@@ -242,14 +341,15 @@ impl StorageProvider for MemoryStorage {
 
     async fn open_layer(&self, branch: BranchId, id: LayerId) -> Result<Box<dyn OpenLayer>> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.staged.contains_key(&id) || inner.layer_contents.contains_key(&id) {
+        if inner.staged.contains_key(&id) || inner.members.contains_key(&id) {
             return Err(BorgError::Storage(format!("layer {id} already exists")));
         }
         inner.staged.insert(
             id,
             StagedLayer {
                 branch,
-                writes: Vec::new(),
+                members: Vec::new(),
+                authored: Vec::new(),
                 defs: Vec::new(),
                 sealed: false,
             },
@@ -292,15 +392,50 @@ impl StorageProvider for MemoryStorage {
                 layer.id
             )));
         }
-        let branch_cells = inner.committed.entry(staged.branch).or_default();
-        for (cell, record) in &staged.writes {
-            branch_cells
-                .entry((cell.clone(), record.version))
-                .or_default()
-                .push((layer.id, record.clone()));
+        for event in staged.authored {
+            inner.store(event);
         }
-        inner.layer_contents.insert(layer.id, staged.writes);
+        // The read index is updated in membership order, so that a layer writing one cell twice
+        // resolves to its later event — and so that a merge's included events index identically to
+        // authored ones, since by here the two are indistinguishable.
+        //
+        // Split-borrowed rather than fetching each event through `Inner::event`, which clones: a
+        // layer may hold millions of members, and cloning a derived event to index it would copy
+        // its whole read-set per write for the sake of three fields.
+        let Inner { events, reads, .. } = &mut *inner;
+        for id in &staged.members {
+            let event = events
+                .get(id.0 as usize - 1)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| BorgError::Storage(format!("unknown event {id}")))?;
+            index(reads, staged.branch, layer.id, event);
+        }
+        inner.members.insert(
+            layer.id,
+            Membership {
+                branch: staged.branch,
+                events: staged.members,
+            },
+        );
         inner.def_contents.insert(layer.id, staged.defs);
+        Ok(())
+    }
+
+    async fn rebuild_read_index(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reads.clear();
+        // Layer ids are registry-unique and monotonic, so id order is replay order across every
+        // branch — the same ordering `Registry::open` replays the log in.
+        let mut layers: Vec<LayerId> = inner.members.keys().copied().collect();
+        layers.sort_by_key(|id| id.0);
+        for layer in layers {
+            let membership = &inner.members[&layer];
+            let branch = membership.branch;
+            for id in membership.events.clone() {
+                let event = inner.event(id)?;
+                index(&mut inner.reads, branch, layer, &event);
+            }
+        }
         Ok(())
     }
 }
@@ -327,11 +462,10 @@ mod tests {
         )
     }
 
-    fn record(value: Value, at: LayerId) -> CellRecord {
-        CellRecord {
+    fn draft(value: Value) -> EventDraft {
+        EventDraft {
             value,
             version: V1,
-            written_at: at,
             origin: Origin::Source,
             derivation: None,
         }
@@ -341,11 +475,11 @@ mod tests {
         storage: &MemoryStorage,
         branch: BranchId,
         id: LayerId,
-        writes: &[(CellRef, CellRecord)],
+        writes: &[(CellRef, EventDraft)],
     ) -> Result<()> {
         let mut layer = storage.open_layer(branch, id).await?;
-        for (cell, rec) in writes {
-            layer.put_cell(cell, rec.clone()).await?;
+        for (cell, draft) in writes {
+            layer.author_event(cell, draft.clone()).await?;
         }
         let sealed = layer.seal().await?;
         storage.commit_layer(sealed).await
@@ -390,7 +524,7 @@ mod tests {
             &storage,
             MAIN,
             LayerId(1),
-            &[(prop(1, "website"), record(Value::Ref(on_main), LayerId(1)))],
+            &[(prop(1, "website"), draft(Value::Ref(on_main)))],
         )
         .await?;
 
@@ -399,10 +533,7 @@ mod tests {
             &storage,
             FEATURE,
             LayerId(2),
-            &[(
-                prop(2, "website"),
-                record(Value::Ref(on_feature), LayerId(2)),
-            )],
+            &[(prop(2, "website"), draft(Value::Ref(on_feature)))],
         )
         .await?;
 
@@ -415,7 +546,7 @@ mod tests {
                     V1
                 )
                 .await?
-                .map(|r| r.value),
+                .map(|found| found.event.value),
             storage
                 .get_cell(
                     &ReadPath::new(vec![(FEATURE, LayerId(9))]),
@@ -423,7 +554,7 @@ mod tests {
                     V1
                 )
                 .await?
-                .map(|r| r.value),
+                .map(|found| found.event.value),
             "the two branches reference one and the same value"
         );
         assert_eq!(

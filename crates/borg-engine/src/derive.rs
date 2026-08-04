@@ -186,8 +186,8 @@ impl ProducerCtx for RecordingCtx<'_> {
         if !self.read_set.contains(&read) {
             self.read_set.push(read);
         }
-        let record = self.storage.get_cell(&self.path, cell, version).await?;
-        Ok(record.map(|r| r.value))
+        let found = self.storage.get_cell(&self.path, cell, version).await?;
+        Ok(found.map(|found| found.event.value))
     }
 
     async fn get_input(&mut self, cell: &CellRef) -> Result<Option<Value>> {
@@ -573,9 +573,9 @@ impl DerivationEngine {
         let mut stream = self.storage.read_layer(layer).await?;
         let mut cells = Vec::new();
         while let Some(row) = stream.next().await {
-            let (cell, record) = row?;
-            let by = record.derivation.as_ref().map(|d| d.producer);
-            cells.push((CellAt::new(cell, record.version), by));
+            let event = row?;
+            let by = event.derivation.as_ref().map(|d| d.producer);
+            cells.push((CellAt::new(event.cell, event.version), by));
         }
         Ok(cells)
     }
@@ -622,7 +622,7 @@ impl DerivationEngine {
         let mut stream = self.storage.scan_buffer(&path, &def.source).await?;
         let mut candidates = Vec::new();
         while let Some(row) = stream.next().await {
-            let (cell, _) = row?;
+            let cell = row?.cell;
             if !candidates.contains(&cell) {
                 candidates.push(cell);
             }
@@ -631,9 +631,10 @@ impl DerivationEngine {
         let mut found = Vec::new();
         for cell in candidates {
             if let Some(role) = &role {
-                let record = self.storage.get_cell(&path, &cell, role.input).await?;
-                let usable = record.is_some_and(|record| {
-                    record
+                let found = self.storage.get_cell(&path, &cell, role.input).await?;
+                let usable = found.is_some_and(|found| {
+                    found
+                        .event
                         .derivation
                         .is_none_or(|by| !role.step.contains(&by.producer))
                 });
@@ -834,7 +835,7 @@ impl DerivationEngine {
             let path = self.branches.read_path(branch, None)?;
             let defs = self.defs.view(&path).await?;
 
-            let Some(record) = self.storage.get_cell(&path, &cell, version).await? else {
+            let Some(found) = self.storage.get_cell(&path, &cell, version).await? else {
                 // Nothing is materialized at this version. What is owed is a migration, and the
                 // hops that owe it are exactly the ones the reader's reachability check walks
                 // (SPEC.md §10.4) — the resolver computes that path already and, until now, never
@@ -859,7 +860,7 @@ impl DerivationEngine {
             };
 
             // Source data is ground truth; there is nothing to compute and nothing behind it.
-            let Some(derivation) = record.derivation else {
+            let Some(derivation) = found.event.derivation else {
                 return Ok(());
             };
             // Inputs first, so that the run below reads a settled world and can honestly claim to

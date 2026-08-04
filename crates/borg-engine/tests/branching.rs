@@ -107,7 +107,7 @@ impl Harness {
             .storage
             .get_cell(&path, cell, V1)
             .await?
-            .map(|record| record.value))
+            .map(|found| found.event.value))
     }
 
     async fn read_at(
@@ -121,7 +121,7 @@ impl Harness {
             .storage
             .get_cell(&path, cell, V1)
             .await?
-            .map(|record| record.value))
+            .map(|found| found.event.value))
     }
 }
 

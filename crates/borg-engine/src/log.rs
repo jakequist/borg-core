@@ -11,7 +11,7 @@
 use crate::seams::LayerSequencer;
 use crate::touch::CellTouchIndex;
 use borg_core::{
-    BorgError, Branch, BranchId, CellRecord, CellRef, Guard, Layer, LayerAuthor, LayerId,
+    BorgError, Branch, BranchId, CellRef, EventDraft, EventId, Guard, Layer, LayerAuthor, LayerId,
     LayerKind, LayerState, Origin, ReadPath, Result,
 };
 use borg_storage::{OpenLayer, StorageProvider};
@@ -36,16 +36,24 @@ impl LayerHandle {
         self.layer.guards.push(guard);
     }
 
-    /// Append one cell write. Called an unbounded number of times — a producer run writes *all* of
-    /// its output into this one layer.
+    /// Author one event into this layer. Called an unbounded number of times — a producer run writes
+    /// *all* of its output into this one layer.
     ///
     /// **Crate-private on purpose.** This is the log's raw append, and it knows nothing about
     /// definitions; every write from outside the engine goes through `WriteSession`, which validates
     /// against the branch's def-view first (§5.1, §8). Making it public again would make that check
-    /// a convention rather than a property. The one caller here that legitimately skips validation
-    /// is merge replay — see `BranchManager::merge`.
-    pub(crate) async fn put(&mut self, cell: &CellRef, record: CellRecord) -> Result<()> {
-        self.open.put_cell(cell, record).await
+    /// a convention rather than a property.
+    pub(crate) async fn put(&mut self, cell: &CellRef, draft: EventDraft) -> Result<EventId> {
+        self.open.author_event(cell, draft).await
+    }
+
+    /// Name an event that already exists as a member of this layer. SPEC.md §13.
+    ///
+    /// The merge path, and the only caller. Nothing is validated here because nothing is *written*:
+    /// the event was validated against the def-view it was authored under, on the branch that
+    /// authored it, and this records only that the layer it landed in on the parent contains it.
+    pub(crate) async fn include(&mut self, event: EventId) -> Result<()> {
+        self.open.include_event(event).await
     }
 
     /// Append a def mutation. A layer holds value events *xor* def events (SPEC.md §6.2), so a
@@ -214,7 +222,7 @@ impl LayerManager {
                     .storage
                     .get_cell(&path, cell, borg_core::ClientVersion(LayerId(0)))
                     .await?
-                    .is_some_and(|record| record.origin == Origin::Derived);
+                    .is_some_and(|found| found.event.origin == Origin::Derived);
                 if derived || self.is_derived_anywhere(&path, cell).await? {
                     return Err(BorgError::GuardOnDerivedCell { cell: cell.clone() });
                 }
@@ -236,7 +244,7 @@ impl LayerManager {
                 .storage
                 .get_cell(path, cell, version)
                 .await?
-                .is_some_and(|record| record.origin == Origin::Derived)
+                .is_some_and(|found| found.event.origin == Origin::Derived)
             {
                 return Ok(true);
             }
@@ -379,7 +387,7 @@ impl LayerManager {
             let mut stream = self.storage.read_layer(layer.id).await?;
             let mut cells = Vec::new();
             while let Some(row) = stream.next().await {
-                cells.push(row?.0);
+                cells.push(row?.cell);
             }
             self.touches.record(layer.branch, layer.id, &cells)?;
         }

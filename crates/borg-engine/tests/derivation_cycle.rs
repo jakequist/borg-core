@@ -5,7 +5,7 @@
 //! queued anywhere.
 
 use borg_core::{
-    BranchId, BufferId, CellAt, CellRecord, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId,
+    BranchId, BufferId, CellAt, CellRef, ClientVersion, DefEvent, Event, LayerAuthor, LayerId,
     Origin, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
     ValueType, Writer,
 };
@@ -127,13 +127,14 @@ impl Harness {
         session.commit().await
     }
 
-    async fn read(&self, cell: &CellRef) -> Option<CellRecord> {
+    async fn read(&self, cell: &CellRef) -> Option<Event> {
         let head = self.layers.head(BRANCH).unwrap();
         let path = self.branches.read_path(BRANCH, Some(head)).unwrap();
         self.storage
             .get_cell(&path, cell, ClientVersion(LayerId(1)))
             .await
             .unwrap()
+            .map(|found| found.event)
     }
 }
 

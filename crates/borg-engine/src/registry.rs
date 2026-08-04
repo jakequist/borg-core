@@ -132,28 +132,31 @@ impl Registry {
         ordered.sort_by_key(|layer| layer.id.0);
 
         for layer in ordered {
+            // A layer's *membership*, which for a merge layer is the child's events — so the touch
+            // index learns that those cells were touched on the parent at the merge layer, which is
+            // where a guard re-evaluated on the parent must see them.
             let mut stream = self.storage.read_layer(layer.id).await?;
-            let mut cells = Vec::new();
+            let mut events = Vec::new();
             while let Some(row) = stream.next().await {
-                cells.push(row?);
+                events.push(row?);
             }
 
             match layer.author {
                 // Guards may name source cells only, so the touch index only ever needed these.
                 LayerAuthor::Source => {
-                    let refs: Vec<_> = cells.into_iter().map(|(cell, _)| cell).collect();
+                    let refs: Vec<_> = events.into_iter().map(|event| event.cell).collect();
                     touches.record(layer.branch, layer.id, &refs)?;
                 }
                 LayerAuthor::Derived { producer, reflects } => {
-                    for (cell, record) in cells {
-                        let Some(derivation) = record.derivation else {
+                    for event in events {
+                        let Some(derivation) = event.derivation else {
                             continue;
                         };
                         let invocation = Invocation {
                             producer,
-                            input: *cell.pid(),
+                            input: *event.cell.pid(),
                         };
-                        let written = [CellAt::new(cell, record.version)];
+                        let written = [CellAt::new(event.cell, event.version)];
                         index.record(layer.branch, &invocation, &derivation.read_set, &written)?;
                     }
                     self.frontier.advance(layer.branch, producer, reflects);
