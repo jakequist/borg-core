@@ -31,7 +31,13 @@ to be current at the call site instead of taking the lag, a client can wait for 
 its own write, and a report can read the whole branch at the point everything agrees. The automation
 is pausable per branch, and a paused branch reports its lag in the vocabulary that already existed.
 
-What remains before "Act 1 is the modern ORM" is true: concurrency — the second half of D.
+**And it runs concurrently.** A round discovers a wave of invocations and runs them at once; the
+ceiling that lets one producer see another's output within a round is committed state rather than a
+value threaded through a loop; and a producer's workers are a pool rather than one process behind a
+lock. The invariants that were written to permit this were checked rather than assumed, and three of
+them were not true as implemented — see the decisions below.
+
+Act 1 is the modern ORM.
 
 ---
 
@@ -131,8 +137,16 @@ store. `frontier.reaches()` and settled-frontier reads exist and are exposed as
 `scenarios/090-freshness-controls` is the proof, and 040 now demonstrates lag by pausing rather than
 by declining to derive. Three decisions came out of it, below.
 
-**Concurrency is not.** `settle()` is still sequential and its round-ceiling still assumes derivation
-is the only writer.
+**Concurrency is done too.** `settle()` alternates a sequential *discovery* pass with a concurrent
+*execution* pass — one wave of invocations at a time, bounded by `set_parallelism` (default: one per
+core, `BORG_DERIVE_PARALLELISM` in the CLI). The ceiling is committed state raised by every layer the
+round commits, rather than a value threaded through a loop. `ProcessExecutor` holds a pool per
+command instead of one worker behind a lock.
+
+Turning it on found three things that were untrue, and one that cannot be made true without a design
+change; all four are below. `crates/borg-engine/tests/concurrency.rs` is the proof — seven scenarios,
+each replayed 30–120 times at sixteen-way parallelism, asserting the settled result and never the
+schedule. §6.2, §7.3, §16.3, §16.4, §16.5 and §17.3 are updated.
 
 ### Deferred, still
 
@@ -384,6 +398,136 @@ were set but which was never explicitly created is invisible to every pipeline.
 Only when absent, never on every write: the existence cell lives in the buffer producers subscribe
 to, so rewriting it would make any property write look like a new entity.
 
+### A round is a sequence of waves, not a stream of invocations
+
+`settle()` alternates a **sequential discovery pass** with a **concurrent execution pass**: turn the
+layers in front of you into a set of invocations, run all of them, then turn the layers *they*
+committed into the next set. Discovery stays sequential because it runs no user code — it is a walk
+over changesets and index lookups, and running it concurrently would buy contention on the one index
+mutex in exchange for nothing measurable.
+
+The barrier between waves is not incidental, it is what makes §16.5's self-correction true. A
+producer records its read-set before its own layer commits, so a run that read an input its upstream
+had not written yet is already subscribed to that cell by the time any later wave scans the layer
+that supplied it. Overlap the waves and the correcting trigger can be missed: the upstream's layer is
+scanned, finds nobody subscribed, and the downstream then commits a value computed from nothing.
+
+The bound on a wave is one invocation per core by default, `set_parallelism` in the engine and
+`BORG_DERIVE_PARALLELISM` in the CLI. An environment variable rather than a flag or a sidecar: it is
+not log data and it is not a fact about the store — the same store derived on a laptop and on a build
+box wants different numbers — so there is nothing to record, and every command that derives would
+otherwise need the same flag.
+
+Discovery also deduplicates within a wave. Two layers in one wave can dirty the same invocation, and
+running it twice at once would put two layers of one round on one cell and two `record` calls racing
+to describe one run. Deferring the duplicate is free, because this wave's own output re-triggers it
+if it is still dirty.
+
+### The round ceiling is committed state, and cannot be exactly §16.5
+
+The sequential engine threaded the ceiling through its loop. That was not merely awkward to
+parallelise: it made the value depend on the order the loop happened to visit producers in, and the
+order is not prescribed. It is now a monotonic maximum raised by every layer the round commits —
+same rule, different owner.
+
+**The exact formulation is not implementable behind the current `ReadPath`.** §16.5 says the ceiling
+is *"the highest layer that is either ≤ L, or is a derived layer with `reflects == L`"* — a filter.
+A `ReadPath` bound is one layer id — a prefix. They coincide while derivation is the only writer, and
+diverge when a client commits a source layer `L'` mid-round below one of this round's ids: the prefix
+admits `L'`, so output labelled `fresh_as_of: L` may have incorporated `L'`.
+
+The strict repair was implemented and is worse. Advancing only over a contiguous run of ids the round
+itself produced means a ceiling stalled below `L'` **never rises again**, so every re-run of a
+downstream producer reads the same absent input and the round stops converging — a lost update, found
+by a test that pushed a source layer while a round was settling. The stale label, by contrast, is
+transient and self-correcting: settling `L'` re-runs everything that read what `L'` wrote, and until
+then `validate` reports the value `Stale` because its dependency was written above its `fresh_as_of`.
+The only observable residue is a time-travel read pinned at exactly `L`.
+
+Closing it properly needs a `ReadPath` that carries admitted layers beside its bound, or a `reflects`
+column storage may filter on — and the second teaches the provider line about derivation, which
+invariant 1 forbids. **That is a design change and is not made here**; §16.5 records the consequence.
+
+### Three invariants were not true as implemented
+
+Turning concurrency on was supposed to test four claims. Three of them needed fixing first, and none
+of the three was a design problem — all were places where a sequential engine had made a shortcut
+invisible.
+
+- **A branch's head was the last commit, not the highest.** `LayerManager::commit` assigned
+  `heads[branch] = id` unconditionally. Ids are assigned at open and order is established at commit
+  (§7.3), so a layer opened first and committed second walked the head *backwards* — and the head
+  bounds every read path and every producer's work gap. Now a maximum (§7.3).
+- **`MemoryStorage` read a cell's history in commit order and assumed id order.** It walked backwards
+  to the first write at or below the bound; out-of-order commits made that the *older* of two writes.
+  Now a maximum. SQLite never had the bug — it says `ORDER BY written_at DESC`.
+- **`catch_up` settled layers whatever state they were in.** A layer only becomes a changeset at
+  commit (§9.6), and with a client writing concurrently the loop could reach one still open. On
+  SQLite that reads rows which may yet be abandoned. It now stops at the first uncommitted layer of
+  the branch and waits — available only because there is no queue to stall — and a layer found
+  uncommitted when a store is reopened is aborted, since an open layer is exclusive to a process that
+  no longer exists (§6.2).
+
+The fourth claim, single-writer-per-field, **held** — but it is a statement about fields, and what
+extends it to invocations is v1 pipelines being per-entity maps. A producer that wrote across
+entities would have two invocations racing one cell, and nothing enforces that it does not. Recorded
+in §16.3 beside idempotency, where the other unenforced obligation on producer authors already lives.
+
+### Workers are a pool per command
+
+`ProcessExecutor` kept one worker behind a mutex, which serialised every invocation through one
+subprocess whatever the scheduler decided — the queue, reintroduced below the seam. It now holds a
+pool per command, bounded by a permit, with idle workers handed back rather than respawned.
+
+A worker whose conversation ended in anything but a clean `Done` is **discarded rather than
+returned**. The protocol is request/response over a pipe, so a failed invocation leaves it at an
+unknown offset and reusing it would answer the next invocation with the last one's reply. A worker
+that reported `Error` is kept, because it answered: raising on one entity is not a broken process.
+
+### The def-view fold was O(all layers), and it hid the parallelism
+
+Not planned work, and done because without it the milestone's own measurement said nothing.
+`DefRegistry::def_layers` found def layers by filtering every layer the log knew about. Every write
+session folds two def-views (§8.0) and every producer run is a write session, so a fan-out of `n`
+invocations — each of which commits a layer — cost `O(n²)`, and at 32k it was **44s of the 45s the
+fan-out took**. Parallelism against that measured as a slowdown, because the contention it added was
+all there was left to add.
+
+`LayerManager` now indexes committed def layers per branch. Def layers are rare by construction: a
+schema changes far less often than data does.
+
+`scale.rs`, one shared upstream cell flipped under `n` companies, release build, four cores. `p` is
+the degree of parallelism; the first column is the engine as it stood before this milestone.
+
+| `n` | before | `p=1` | `p=2` | `p=4` | `p=8` |
+|---|---|---|---|---|---|
+| 1,000 | 44.8ms | 11.4ms | 6.9ms | 6.0ms | 5.3ms |
+| 8,000 | 2.48s | 112ms | 63.8ms | 60.2ms | 67.4ms |
+| 32,000 | 42.4s | 460ms | 298ms | 271ms | 270ms |
+| 128,000 | 1278s | 2.00s | 1.25s | 1.17s | 1.16s |
+
+Read it as two separate results. The `before → p=1` column is the def-view fix, and it is where the
+order of magnitude is: 640× at 128k, and quadratic to linear — the fan-out was 21µs per invocation
+at 1k and 10ms per invocation at 128k, and is now 16µs at both. **Parallelism is the smaller
+number**: 1.7× at two, and flat after that. Not a disappointment so much as a measurement of what is
+left — with the fold gone, essentially all of the remaining work is under `MemoryStorage`'s single
+mutex and `LayerManager`'s, so the second core saturates them and the third and fourth wait. Sharding
+either is the next thing worth doing, and both already sit behind an interface that permits it
+(§17.2). A deployment whose producers do real work rather than three comparisons will see more, which
+is exactly what Amdahl says and not an excuse.
+
+### The CLI exits quietly when its reader goes away
+
+`borg get … | head -1` closes the pipe as soon as it has its line, Rust turns the `EPIPE` into a
+panic, and `println!` crashed the process. It is in three scenarios and it failed about one run in
+forty — but only under load, which is why twenty quiet runs of `./check.sh` had never shown it. That
+is precisely the frequency the C backfill bug taught us to treat as a bug and not a flake, and it was
+found by stress-testing the concurrency work rather than by it.
+
+Not fixed with a signal disposition, which needs `unsafe` and the workspace forbids it. One macro
+that writes, and exits `0` if nobody is listening — which is what a Unix tool does. Errors keep going
+to stderr, which the pipe did not close.
+
 ---
 
 ## Tests we owe
@@ -404,3 +548,18 @@ Paid off in D: the three read modes distinguished from each other, inline comput
 through a chain and terminating on a cyclic read-set, an inline run proved not to advance a
 watermark, the settled frontier read against the ragged head, and `reaches` in all three of its
 cases (`freshness.rs`) — plus a migration hop computed on demand (`migration.rs`).
+
+Paid off in D's second half (`concurrency.rs`): a three-hop chain racing itself, the same scenario
+proved identical at one invocation at a time and at sixteen, two producers on sibling fields of one
+object, a migration pair in one wave, a client write landing mid-round, and a constructed interleaving
+where the upstream is *held* until its downstream has read past it. Each is replayed 30–120 times,
+because a concurrency bug that shows up one run in six reads as a flake and is not one. The first
+unit tests in `borg-engine` itself arrived with them, on the round ceiling — the interleavings that
+distinguish a prefix from a maximum are exactly the ones an integration test cannot provoke on
+purpose.
+
+And `borg-exec-process` got its first tests at all (`pool.rs`): concurrent invocations served by
+concurrent processes, the pool bounded by its size, and a worker reused when nothing overlaps. They
+are not a scenario because the CLI writes one layer per `borg set`, so a wave driven through the CLI
+is one invocation wide — the pool only matters where one source layer dirties many, which is a
+fan-out flip, a migration backfill, or a producer pushed over existing data.

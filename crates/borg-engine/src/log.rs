@@ -72,6 +72,14 @@ struct State {
     /// Branches live here rather than in `BranchManager` so that guard validation, which needs the
     /// ancestry, does not require the log to depend on the branch layer above it.
     branches: HashMap<BranchId, Branch>,
+    /// Committed **def** layers per branch, in id order.
+    ///
+    /// An index over `layers`, held because folding the def-view is on the hot path — every write
+    /// session opens by folding two of them (§8.0), and every producer run is a write session. Found
+    /// by filtering `layers`, that fold is `O(all layers)`, and a producer run commits a layer, so a
+    /// fan-out of `n` invocations costs `O(n²)` before any producer code runs. Def layers are rare
+    /// by construction: a schema changes far less often than data does.
+    def_layers: HashMap<BranchId, Vec<LayerId>>,
 }
 
 impl LayerManager {
@@ -97,7 +105,15 @@ impl LayerManager {
     }
 
     /// Reinstate a layer read back from storage, without re-running the state machine.
-    pub fn restore(&self, layer: Layer) {
+    ///
+    /// A layer that comes back **not committed has no owner**: an open layer is exclusive to the
+    /// process holding it (§6.2), and that process is gone. It never became visible, so it is
+    /// aborted rather than left in a state that would make derivation wait forever for a commit
+    /// nobody is going to make.
+    pub fn restore(&self, mut layer: Layer) {
+        if !matches!(layer.state, LayerState::Committed | LayerState::Aborted) {
+            layer.state = LayerState::Aborted;
+        }
         let mut state = self.state.lock().unwrap();
         if layer.state == LayerState::Committed {
             let head = state.heads.entry(layer.branch).or_insert(layer.id);
@@ -105,7 +121,33 @@ impl LayerManager {
                 *head = layer.id;
             }
         }
+        if layer.state == LayerState::Committed && layer.kind == LayerKind::Def {
+            state
+                .def_layers
+                .entry(layer.branch)
+                .or_default()
+                .push(layer.id);
+        }
         state.layers.insert(layer.id, layer);
+    }
+
+    /// The committed def layers on a branch at or below a bound, oldest first.
+    ///
+    /// Sorted on the way out rather than on the way in: restore replays in id order and commit only
+    /// ever appends a higher id, so this is almost always already sorted, and a def-version chain is
+    /// short enough that being sure costs nothing.
+    pub fn def_layers_of(&self, branch: BranchId, bound: LayerId) -> Vec<LayerId> {
+        let state = self.state.lock().unwrap();
+        let mut found: Vec<LayerId> = state
+            .def_layers
+            .get(&branch)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|id| id.0 <= bound.0)
+            .collect();
+        found.sort_by_key(|id| id.0);
+        found
     }
 
     pub fn branches(&self) -> Vec<Branch> {
@@ -311,11 +353,25 @@ impl LayerManager {
         self.storage.put_layer_meta(&durable).await?;
         self.storage.commit_layer(sealed).await?;
         self.transition(layer.id, LayerState::Sealed, LayerState::Committed)?;
-        self.state
-            .lock()
-            .unwrap()
-            .heads
-            .insert(layer.branch, layer.id);
+        // **Monotonic, because layers commit out of order.** Ids are assigned at open and the order
+        // within a branch is established at commit (§7.3), so a layer opened earlier can land after
+        // one opened later — which is the ordinary case once a round runs its invocations
+        // concurrently. Assigning the head unconditionally would walk it *backwards*, and the head
+        // is what bounds every subsequent read path and every producer's work gap.
+        {
+            let mut state = self.state.lock().unwrap();
+            let head = state.heads.entry(layer.branch).or_insert(layer.id);
+            if layer.id.0 > head.0 {
+                *head = layer.id;
+            }
+            if layer.kind == LayerKind::Def {
+                state
+                    .def_layers
+                    .entry(layer.branch)
+                    .or_default()
+                    .push(layer.id);
+            }
+        }
 
         // Feed the touch index by streaming the committed layer. Source layers only: guards may name
         // source cells only, and derived layers are the enormous ones.

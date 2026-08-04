@@ -469,6 +469,11 @@ transaction alongside several producer runs — because the single-writer rule (
 producers can ever target the same cell, so committed derived layers can never conflict and may
 commit in any order.
 
+`open` is exclusive to its owner, and that ownership does not survive the owner. A layer found in
+`open` or `sealed` when a store is reopened belongs to a process that no longer exists; it never
+became visible, so it is **aborted on recovery** rather than left in a state the scheduler would wait
+on forever (§16.4).
+
 **A layer can be enormous.** One producer run writes all of its output into exactly one layer, so a
 flip of `school.is_top_ten` may produce a single layer containing 100k mutations. Layer commit must
 therefore **stream**; a layer can never be assembled in memory and flushed. This is the single
@@ -549,6 +554,12 @@ Storage is handed the read path and never has to know what a branch *is* — whi
 Layers are totally ordered within a branch, but that order is established **at commit**, not at open.
 Many layers may be open on a branch simultaneously (§6.2); sequence is assigned as each seals and
 commits.
+
+Ids, however, are assigned at open, so a layer opened first may commit second — the ordinary case
+once a round runs its invocations concurrently (§16.5). **A branch's head is therefore the highest
+committed layer, not the most recently committed one.** The head bounds every read path and every
+producer's work gap, so a head that walked backwards would hide the layer that overtook it from every
+subsequent read.
 
 ### 7.4 Fork cost
 
@@ -1280,7 +1291,11 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 ### 16.3 Load-bearing invariants
 
 1. **Single-writer per field ⇒ derived layers never conflict.** This is what permits many producer
-   layers to be open at once and to commit in any order.
+   layers to be open at once and to commit in any order. It is a statement about *fields*, and
+   v1 pipelines being per-entity maps (§9.2) is what extends it to invocations: one invocation writes
+   its own entity's cells, so two invocations of one producer cannot collide either. A producer that
+   wrote across entities would break that, and nothing enforces it — it sits with idempotency (§9.2)
+   as an obligation on the author rather than a property of the engine.
 2. **Layer commit is the only invalidation trigger.** Buffers carry no observation machinery, which
    keeps `StorageProvider` small and swappable.
 3. **Commit streams.** A layer may hold millions of mutations and can never be buffered whole.
@@ -1313,6 +1328,21 @@ remembered anywhere, and a paused branch resumed a week later derives exactly th
 have derived a week earlier. The same is true of a `current` read, which invokes producers without
 enqueueing anything.
 
+**The degree of parallelism does not qualify it either.** The scheduler discovers a *wave* of
+invocations from the layers in front of it and runs them concurrently, bounded by a number that is
+deployment configuration and nothing more (v1: one per core, overridable). It is a bound on what is
+in flight, not a queue of what is outstanding: nothing is remembered between waves, and a worker
+killed mid-wave leaves the same gap it started from. Setting it to `1` is the sequential scheduler,
+and §9.6 requires the two to settle on the same result.
+
+Discovery stops at the first layer on the branch that has not committed. A layer *is* the changeset
+(§9.6) and means nothing before commit, so settling one would derive from writes that may yet be
+abandoned, and stepping over one would advance every watermark past a layer nothing had incorporated.
+Waiting is the only honest option, and it is available precisely because there is no queue to stall.
+An **aborted** layer is not waited for — it will never commit — and a layer found uncommitted when a
+store is reopened is aborted, because an open layer is exclusive to a process that no longer exists
+(§6.2).
+
 ### 16.5 A source layer settles as a closure
 
 A committed layer triggers producers; their output commits further layers, which trigger more.
@@ -1331,14 +1361,42 @@ it — while the output is labelled with the source layer. Without that separati
 producer could never see its upstream's output, because that output lives in a derived layer with a
 *higher* id than the source layer they both reflect.
 
-Ordering within a round is not prescribed. If a downstream producer happens to run before its
-upstream, it computes from an absent input, the upstream then commits, and the downstream's
+Ordering within a round is not prescribed, and **a round runs its invocations concurrently**. The
+invocations discovered from one layer cannot collide: single-writer-per-field (§16.3) means no two of
+them target the same cell, so their layers commit in any order. If a downstream producer runs before
+its upstream, it computes from an absent input, the upstream then commits, and the downstream's
 dependency on that cell brings it back round. The fixpoint self-corrects; only the settled result is
 guaranteed.
+
+**A round alternates discovery with execution, and the alternation is load-bearing.** One wave of
+invocations is discovered, run to completion, and only then are the layers it produced turned into
+the next wave's work. That barrier is what makes "the fixpoint self-corrects" true rather than
+hopeful: a producer records its read-set *before* its layer commits, so a run that missed an input is
+already subscribed to it by the time any later wave scans the layer that supplied it. Without the
+barrier a run could commit after the layer it needed had already been scanned, and the correction
+would never be triggered.
 
 > The ceiling is safe because derivation is the only writer while a round settles. Under concurrent
 > source writes the precise formulation is *"the highest layer that is either ≤ L, or is a derived
 > layer with `reflects == L`"* — same meaning, expressed without relying on quiescence.
+
+**That formulation is a filter, and a `ReadPath` bound is a prefix.** They coincide exactly while
+derivation is the only writer on the branch. They diverge when a client commits a source layer `L'`
+mid-round and is assigned an id below one this round goes on to commit: the prefix then admits `L'`,
+and output labelled `fresh_as_of: L` may have incorporated data from `L'`.
+
+v1 takes the prefix and states the consequence rather than pretending the case away. The alternative
+— advance only over a contiguous run of ids the round itself produced — is worse, because a ceiling
+stalled below `L'` never rises again, every re-run of a downstream producer reads the same absent
+input, and the round stops converging at all. A stale label is transient and self-correcting:
+settling `L'` re-runs everything that read what `L'` wrote, and until then `validate` reports such a
+value `Stale`, because its dependency was written above its own `fresh_as_of` (§10.2). The one
+observable residue is a **time-travel read pinned at exactly `L`**, which may see a value that
+reflects `L'`.
+
+Closing that gap needs a `ReadPath` that carries admitted layers beside its bound, or a `reflects`
+column the provider is allowed to filter on — and the second would teach the storage interface about
+derivation, which §17.1 forbids. Either is a design change, not a fix.
 
 ### 16.6 Cycle detection
 
@@ -1463,6 +1521,15 @@ lookups, never "iterate everything." Identical single-node, shardable later.
 The contract is *"run this code, mediating every cell access through me"* — not merely "run this
 code." That mediation is what makes dependency capture free (§9.4) and is equally satisfiable by an
 in-process call and a socket round-trip.
+
+**Workers are stateless, so a provider holds a pool and not a worker.** A round runs invocations
+concurrently (§16.5), and one reused worker behind a lock would serialize every one of them through
+one process whatever the scheduler decided — the queue, reintroduced below the seam. Reuse is an
+optimization over spawning per entity, never a semantic: deterministic output PIDs (§9.5) mean two
+workers racing one invocation produce identical output, and a stateless scheduler (§16.4) makes a
+lost worker cost a retry. A worker whose conversation ended in anything but a clean `Done` is
+**discarded rather than returned**, because a request/response stream left at an unknown offset would
+answer the next invocation with the last one's reply.
 
 ```rust
 #[async_trait]

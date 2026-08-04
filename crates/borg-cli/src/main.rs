@@ -20,6 +20,27 @@ use std::time::{Duration, Instant};
 
 const ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(0);
 
+/// `println!`, for a reader that is allowed to stop listening.
+///
+/// `borg get … | head -1` closes the pipe as soon as it has its line, and Rust turns the resulting
+/// `EPIPE` into a **panic** — so a perfectly ordinary shell idiom crashed the process, whenever the
+/// writer happened to lose the race. It was found by running the scenario suite under load, where it
+/// failed about one run in forty; at rest it never failed at all, which is exactly the shape of bug
+/// that gets filed as a flake.
+///
+/// Exiting quietly is what a Unix tool does when its reader goes away: the output was wanted up to
+/// the point it was read, and nothing after that is anybody's business. Errors keep going to stderr,
+/// which the pipe did not close.
+macro_rules! outln {
+    () => { outln!("") };
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if writeln!(std::io::stdout(), $($arg)*).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
 struct Args {
     store: PathBuf,
     branch: Option<String>,
@@ -271,7 +292,7 @@ async fn init(args: &Args) -> Result<()> {
     }
     let registry = open(args).await?;
     let id = registry.branches.create_root(Some("main".into())).await?;
-    println!("initialised {} (branch main = {id})", args.store.display());
+    outln!("initialised {} (branch main = {id})", args.store.display());
     Ok(())
 }
 
@@ -295,7 +316,7 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
         session.abort().await?;
         return Err(rejection);
     }
-    println!("{}", session.commit().await?);
+    outln!("{}", session.commit().await?);
     drop(registry);
     auto_derive(args, branch).await
 }
@@ -348,13 +369,13 @@ async fn get(args: &Args, cell: &str) -> Result<()> {
 
     if args.value_only {
         if let Some(value) = rendered {
-            println!("{value}");
+            outln!("{value}");
         }
         return Ok(());
     }
 
-    println!("{cell}");
-    println!(
+    outln!("{cell}");
+    outln!(
         "  value:       {}",
         rendered.as_deref().unwrap_or("<absent>")
     );
@@ -365,20 +386,20 @@ async fn get(args: &Args, cell: &str) -> Result<()> {
         .as_ref()
         .and_then(|v| registry.values.content_pid(v))
     {
-        println!("  interned:    @{pid}");
+        outln!("  interned:    @{pid}");
     }
-    println!(
+    outln!(
         "  origin:      {}",
         match resolved.origin {
             Origin::Source => "source",
             Origin::Derived => "derived",
         }
     );
-    println!("  state:       {}", state_name(resolved.state));
-    println!("  written at:  {}", resolved.written_at);
-    println!("  fresh as of: {}", resolved.fresh_as_of);
+    outln!("  state:       {}", state_name(resolved.state));
+    outln!("  written at:  {}", resolved.written_at);
+    outln!("  fresh as of: {}", resolved.fresh_as_of);
     if let Some(producer) = resolved.by {
-        println!("  produced by: {producer}");
+        outln!("  produced by: {producer}");
     }
     Ok(())
 }
@@ -404,19 +425,19 @@ async fn explain(args: &Args, cell: &str) -> Result<()> {
         .explain(branch, &cell, None, version)
         .await?
     else {
-        println!("{cell}: nothing stored");
+        outln!("{cell}: nothing stored");
         return Ok(());
     };
 
-    println!("{cell}");
+    outln!("{cell}");
     match lineage.produced_by {
-        Some(producer) => println!("  produced by {producer} at {}", lineage.written_at),
-        None => println!("  source, written at {}", lineage.written_at),
+        Some(producer) => outln!("  produced by {producer} at {}", lineage.written_at),
+        None => outln!("  source, written at {}", lineage.written_at),
     }
     if !lineage.from.is_empty() {
-        println!("  from");
+        outln!("  from");
         for edge in lineage.from {
-            println!(
+            outln!(
                 "    {}  {}  @{}",
                 edge.cell.cell,
                 match edge.origin {
@@ -437,8 +458,8 @@ async fn branch_list(args: &Args) -> Result<()> {
     for branch in branches {
         let name = branch.name.unwrap_or_else(|| "<unnamed>".into());
         match branch.origin {
-            Some(origin) => println!("{:<6} {name:<16} forked at {origin}", branch.id.to_string()),
-            None => println!("{:<6} {name:<16} root", branch.id.to_string()),
+            Some(origin) => outln!("{:<6} {name:<16} forked at {origin}", branch.id.to_string()),
+            None => outln!("{:<6} {name:<16} root", branch.id.to_string()),
         }
     }
     Ok(())
@@ -455,7 +476,7 @@ async fn branch_fork(args: &Args, parent: &str, tail: &[&str]) -> Result<()> {
     let name = flag(tail, "--name").map(str::to_string);
 
     let id = registry.branches.fork(parent_id, at, name).await?;
-    println!("{id}");
+    outln!("{id}");
     Ok(())
 }
 
@@ -468,7 +489,7 @@ async fn branch_merge(args: &Args, child: &str, tail: &[&str]) -> Result<()> {
         MergeMode::DefAndData
     };
     let replayed = registry.branches.merge(child_id, mode).await?;
-    println!("{} layer(s) replayed", replayed.len());
+    outln!("{} layer(s) replayed", replayed.len());
 
     // The branch that gained layers is the one that owes derivation, and it is not the one the
     // command names — a merge replays a child onto its parent, so the parent is read back off the
@@ -596,7 +617,7 @@ async fn def_push(args: &Args, file: &str) -> Result<()> {
         .collect();
 
     let layer = registry.defs.push(branch, events).await?;
-    println!("{layer}");
+    outln!("{layer}");
     drop(registry);
     // A def push commits no data, and still creates work: a producer newer than the data it maps
     // over owes its whole source buffer (§9.6), and a `MutateField` appoints migrations that owe
@@ -614,11 +635,11 @@ async fn def_show(args: &Args, name: &str) -> Result<()> {
     let Some(def) = view.object(&name) else {
         return Err(BorgError::Storage(format!("no struct named `{name}`")));
     };
-    println!("{name}");
+    outln!("{name}");
     for (field, def) in &def.fields {
         // Ownership is shown because it is now enforced: this line is the answer to "why was my
         // write rejected" (§8).
-        println!(
+        outln!(
             "  {field:<16} {:<10} {:<24} repo {:<4} v{}",
             def.ty.to_string(),
             def.ownership
@@ -637,7 +658,7 @@ async fn def_version(args: &Args) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let path = registry.branches.read_path(branch, None)?;
-    println!("{}", registry.defs.head(&path));
+    outln!("{}", registry.defs.head(&path));
     Ok(())
 }
 
@@ -653,7 +674,7 @@ async fn layer_list(args: &Args) -> Result<()> {
                 format!("derived by {producer}, reflects {reflects}")
             }
         };
-        println!(
+        outln!(
             "{:<6} {:<6} {author}",
             layer.id.to_string(),
             match layer.kind {
@@ -668,7 +689,7 @@ async fn layer_list(args: &Args) -> Result<()> {
 async fn layer_head(args: &Args) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
-    println!("{}", registry.layers.head(branch).unwrap_or(LayerId(0)));
+    outln!("{}", registry.layers.head(branch).unwrap_or(LayerId(0)));
     Ok(())
 }
 
@@ -699,7 +720,7 @@ async fn frontier_reaches(args: &Args, layer: &str) -> Result<()> {
             .await
             .is_ok()
         {
-            println!("{target} reached");
+            outln!("{target} reached");
             return Ok(());
         }
         if remaining <= POLL {
@@ -731,13 +752,13 @@ async fn frontier(args: &Args) -> Result<()> {
             .iter()
             .find(|impl_| impl_.id == producer.id.0)
             .map_or_else(|| producer.id.to_string(), |impl_| impl_.name.clone());
-        println!(
+        outln!(
             "{name:<16} caught up through {} (head {head})",
             registry.frontier.watermark(branch, producer.id)
         );
     }
     if !any {
-        println!("no producers registered");
+        outln!("no producers registered");
     }
     Ok(())
 }
@@ -830,7 +851,7 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                 declaring_repo: repo,
             }));
             remember(&mut impls, id, &spec.name, &spec.source, command);
-            println!("{} -> {id}", spec.name);
+            outln!("{} -> {id}", spec.name);
         }
     }
 
@@ -917,7 +938,7 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                             up,
                             down,
                         });
-                        println!("{what} {} -> {}", existing.ty, field.ty);
+                        outln!("{what} {} -> {}", existing.ty, field.ty);
                     }
                     _ => {
                         let owner = match &field.derived_by {
@@ -934,7 +955,7 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                             repo,
                             ownership: ownership(owner),
                         });
-                        println!("{what} {}", field.ty);
+                        outln!("{what} {}", field.ty);
                     }
                 }
             }
@@ -1000,7 +1021,7 @@ fn read_repo_id(dir: &Path) -> Result<RepoId> {
 
 async fn producer_list(args: &Args) -> Result<()> {
     for producer in load_impls(args).producers {
-        println!(
+        outln!(
             "{:<20} {:<10} maps {:<12} {}",
             producer.name,
             format!("P{}", producer.id),
@@ -1032,14 +1053,20 @@ async fn open_deriving(args: &Args) -> Result<(Registry, Arc<borg_exec_process::
     let allocation = allocation_branch(&probe)?;
     drop(probe);
 
+    let parallelism = derive_parallelism();
     let executor = borg_exec_process::from_registrations(
         allocation,
         impls
             .producers
             .iter()
             .map(|p| (p.id, p.command.clone(), p.source.clone())),
-    );
+    )
+    // The pool matches the scheduler, because a pool smaller than the degree of parallelism would
+    // put the queue back that the pool exists to remove.
+    .with_pool_size(parallelism);
+    let executor = Arc::new(executor);
     let registry = Registry::open(storage, Arc::clone(&executor) as Arc<_>).await?;
+    registry.engine.set_parallelism(parallelism);
 
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let path = registry.branches.read_path(branch, None)?;
@@ -1047,6 +1074,22 @@ async fn open_deriving(args: &Args) -> Result<(Registry, Arc<borg_exec_process::
         registry.engine.register(def.clone());
     }
     Ok((registry, executor))
+}
+
+/// How many invocations a round runs at once, and how many worker processes back them.
+///
+/// An environment variable rather than a flag or a sidecar file. It is neither log data nor a fact
+/// about the store — the same store derived on a laptop and on a build box wants different numbers —
+/// so there is nothing to record, and every command that derives would otherwise need the same flag.
+/// Unset means one per core, which is what the engine picks for itself.
+fn derive_parallelism() -> usize {
+    std::env::var("BORG_DERIVE_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+        })
 }
 
 /// Run every producer forward to head.
@@ -1060,9 +1103,9 @@ async fn derive(args: &Args) -> Result<()> {
     workers.shutdown().await;
 
     if args.count_only {
-        println!("{executed}");
+        outln!("{executed}");
     } else {
-        println!("{executed} invocation(s)");
+        outln!("{executed} invocation(s)");
     }
     Ok(())
 }
@@ -1141,7 +1184,7 @@ async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
     std::fs::write(derivation_path(args), raw)
         .map_err(|err| BorgError::Storage(err.to_string()))?;
 
-    println!(
+    outln!(
         "auto-derivation {} on {branch}",
         if pause { "paused" } else { "resumed" }
     );
@@ -1157,10 +1200,10 @@ async fn derive_status(args: &Args) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let paused = paused_branches(args).contains(&branch.0);
-    println!(
+    outln!(
         "auto-derivation {} on {branch}",
         if paused { "paused" } else { "running" }
     );
-    println!("settled through {}", registry.settled(branch).await?);
+    outln!("settled through {}", registry.settled(branch).await?);
     Ok(())
 }

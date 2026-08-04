@@ -462,14 +462,7 @@ impl DefRegistry {
         let mut found: Vec<LayerId> = path
             .segments
             .iter()
-            .flat_map(|(branch, bound)| {
-                self.layers
-                    .layers_of(*branch)
-                    .into_iter()
-                    .filter(|layer| layer.kind == LayerKind::Def)
-                    .filter(move |layer| layer.id.0 <= bound.0)
-                    .map(|layer| layer.id)
-            })
+            .flat_map(|(branch, bound)| self.layers.def_layers_of(*branch, *bound))
             .collect();
         found.sort_by_key(|id| id.0);
         found

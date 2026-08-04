@@ -6,6 +6,20 @@
 //!
 //! The scheduler is **stateless**. Work is derived from the gap between a producer's watermark and
 //! the branch head, rather than queued, which bounds memory and makes crash recovery free.
+//!
+//! ## A round runs in waves
+//!
+//! Settling a source layer is a fixpoint, and the invocations discovered from one layer are
+//! independent of each other by construction: the single-writer rule (§8) means no two of them can
+//! target the same cell, so their layers may commit in any order (§16.3.1). They are therefore run
+//! **concurrently**, bounded by [`DerivationEngine::with_parallelism`].
+//!
+//! What is *not* concurrent is one wave with the next. Scheduling is sequential and cheap — it runs
+//! no user code — and each wave joins before the layers it produced are turned into the next wave's
+//! work. That barrier is load-bearing rather than incidental: it is what makes the racy ceiling
+//! below cost a re-run instead of a lost update. A producer that reads an input before its upstream
+//! commits records a dependency on the absent cell *before* its own layer lands, so the upstream's
+//! layer — which is only ever scanned in a later wave — always finds it.
 
 use crate::defs::DefView;
 use crate::index::{DependencyIndexProvider, Invocation};
@@ -25,11 +39,85 @@ use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 /// How many times one invocation may re-run at a fixed branch head before it is judged to be
 /// cycling. SPEC.md §16.5.
 const CYCLE_RERUN_LIMIT: u32 = 8;
+
+/// How many invocations run at once when nothing says otherwise.
+///
+/// One per core. Producer work is arbitrary user code — a native producer is CPU-bound in this
+/// process and a subprocess worker is a pipe round-trip away — so the core count is the one bound
+/// that is right for the first case and not badly wrong for the second. Anything larger only helps
+/// when producers block, and that is the executor's business to oversubscribe (see
+/// `borg-exec-process`), not the scheduler's.
+fn default_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+}
+
+/// The round's ceiling. SPEC.md §16.5.
+///
+/// Reads inside a round resolve at *"the highest layer that is either ≤ L, or is a derived layer
+/// with `reflects == L`"*, so that a producer can consume a peer's output before the round ends.
+/// This is that, maintained as **committed state** — every layer the round commits raises it — in
+/// place of the value the sequential engine threaded through its loop. Threading it was not merely
+/// inconvenient to parallelise: it made the value a function of the order the loop happened to visit
+/// producers in, and the whole point of the fixpoint is that no such order is prescribed.
+///
+/// It is a monotonic maximum, and the previous engine's `if derived > ceiling` was the same policy;
+/// nothing about the *rule* has changed, only where the number lives and who may raise it.
+///
+/// ## Where this is not exactly §16.5, and why it is not a prefix instead
+///
+/// A `ReadPath` bound is one layer id — a **prefix**, where §16.5's formulation is a **filter**. The
+/// two coincide exactly while derivation is the only writer on the branch, which §16.5 states as its
+/// own condition. They diverge when a client commits a source layer `L'` mid-round and gets an id
+/// below one of this round's: the bound then admits `L'`, and output labelled `fresh_as_of: L` may
+/// have incorporated data from `L'`.
+///
+/// The obvious repair — advance only over a contiguous run of ids the round itself produced — was
+/// implemented, measured against the fixpoint, and **is worse**. A ceiling stalled below `L'` never
+/// advances again, so every re-run of a downstream producer reads the same absent input and produces
+/// the same nothing: the round does not converge at all, rather than converging on a value whose
+/// label is a layer optimistic. Non-convergence is a lost update; the label is transient and
+/// self-correcting, since settling `L'` re-runs everything that read what `L'` wrote, and `validate`
+/// reports such a value `Stale` in the meantime because its dependency was written above its
+/// `fresh_as_of` (§10.2).
+///
+/// Closing the gap properly needs a `ReadPath` that can carry admitted layers alongside its bound,
+/// or a `reflects` column storage is allowed to filter on — and the second teaches the provider line
+/// about derivation, which invariant 1 forbids. Either is a design change rather than a fix; it is
+/// recorded in `ROADMAP.md` and not made here.
+struct RoundCeiling {
+    ceiling: Mutex<LayerId>,
+}
+
+impl RoundCeiling {
+    fn new(source_layer: LayerId) -> Self {
+        Self {
+            ceiling: Mutex::new(source_layer),
+        }
+    }
+
+    fn get(&self) -> LayerId {
+        *self.ceiling.lock().unwrap()
+    }
+
+    /// This round committed `layer`, so everything in it is part of the round's own world.
+    ///
+    /// Only commits raise it. An abandoned layer contains nothing a reader could see, and raising
+    /// the bound over its id would admit whatever else happens to sit below it.
+    fn committed(&self, layer: LayerId) {
+        let mut ceiling = self.ceiling.lock().unwrap();
+        if layer.0 > ceiling.0 {
+            *ceiling = layer;
+        }
+    }
+}
 
 /// Which layers one producer run is pinned to.
 ///
@@ -165,6 +253,9 @@ pub struct DerivationEngine {
     /// Producers poisoned by a runtime failure. Scoped to the producer, never the branch — which is
     /// why main never breaks because someone merged a bad pipeline (SPEC.md §14).
     broken: Mutex<HashMap<(BranchId, ProducerId), String>>,
+    /// How many invocations of one wave run at once. Deployment configuration, not a semantic —
+    /// see [`DerivationEngine::set_parallelism`].
+    parallelism: AtomicUsize,
 }
 
 impl DerivationEngine {
@@ -190,7 +281,34 @@ impl DerivationEngine {
             branches,
             producers: Mutex::new(HashMap::new()),
             broken: Mutex::new(HashMap::new()),
+            parallelism: AtomicUsize::new(default_parallelism()),
         }
+    }
+
+    /// How many invocations may run at once while a round settles.
+    ///
+    /// Scheduling policy cannot affect correctness, only latency (SPEC.md §9.6), so this is a knob
+    /// and not a semantic: `1` is the sequential engine, and any larger value must settle on the
+    /// same result. Exposed because the right number is a property of the deployment — how many
+    /// cores there are, how much a producer blocks — and of a test that wants to force contention.
+    ///
+    /// Clamped to at least one: zero would be a scheduler that never ran anything.
+    pub fn set_parallelism(&self, invocations: usize) {
+        self.parallelism
+            .store(invocations.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// [`set_parallelism`](Self::set_parallelism) as a builder, for callers holding the engine
+    /// before it goes behind an `Arc`.
+    #[must_use]
+    pub fn with_parallelism(self, invocations: usize) -> Self {
+        self.set_parallelism(invocations);
+        self
+    }
+
+    #[must_use]
+    pub fn parallelism(&self) -> usize {
+        self.parallelism.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn register(&self, def: ProducerDef) {
@@ -227,7 +345,7 @@ impl DerivationEngine {
     ///
     /// Work is discovered, never queued: the layers between a producer's watermark and head are the
     /// complete statement of what remains to do (SPEC.md §16.4).
-    pub async fn catch_up(&self, branch: BranchId) -> Result<usize> {
+    pub async fn catch_up(self: &Arc<Self>, branch: BranchId) -> Result<usize> {
         let Some(head) = self.layers.head(branch) else {
             return Ok(0);
         };
@@ -244,10 +362,30 @@ impl DerivationEngine {
             let Some(layer) = self.layers.layer(source_layer) else {
                 continue;
             };
+            if layer.branch != branch {
+                continue;
+            }
             // Only *source* layers open a round. Derived layers are consequences, and are picked up
             // inside the closure below rather than driving one of their own.
-            if layer.branch != branch || !matches!(layer.author, LayerAuthor::Source) {
+            if !matches!(layer.author, LayerAuthor::Source) {
                 continue;
+            }
+            // **Stop at a source layer that is still open, rather than settling it or stepping over
+            // it.** A layer becomes the changeset at commit (§6.2, §9.6) and means nothing before
+            // then; settling it would derive from writes that may yet be abandoned, and skipping it
+            // would advance every watermark past a layer nothing had incorporated. Neither is
+            // available once a client can be writing while derivation runs, which is the whole point
+            // of this being concurrent. An *aborted* layer is different — it will never commit, so
+            // there is nothing to wait for.
+            //
+            // The wait is scoped to source layers deliberately. A derived layer is skipped above
+            // whatever state it is in, so an abandoned one — a round whose task was cancelled by a
+            // panicking peer — costs a layer id and nothing else. Waiting on those would let one
+            // panic stall every future round in the process.
+            match layer.state {
+                borg_core::LayerState::Committed => {}
+                borg_core::LayerState::Aborted => continue,
+                borg_core::LayerState::Open | borg_core::LayerState::Sealed => break,
             }
             executed += self.settle(branch, source_layer).await?;
         }
@@ -260,28 +398,120 @@ impl DerivationEngine {
     /// more. All of it carries the same `reflects`, because it is all the consequence of one source
     /// layer. The watermark advances only once this settles — which is precisely what makes the
     /// watermark mean *"replay the world at this layer and you get exactly this."*
-    async fn settle(&self, branch: BranchId, source_layer: LayerId) -> Result<usize> {
+    ///
+    /// Alternating *schedule the whole wave, then run the whole wave* is what makes this safe to
+    /// parallelise; see the module header. It also removes an order-dependence the sequential
+    /// version had and nobody had noticed: work used to be discovered one producer at a time, in
+    /// `HashMap` iteration order, so which producer got to run first was already unspecified.
+    async fn settle(self: &Arc<Self>, branch: BranchId, source_layer: LayerId) -> Result<usize> {
         // Folded once per round. Definitions cannot move inside one: a layer holds value events xor
         // def events (§6.2) and derivation only ever commits value layers.
-        let defs = self
-            .defs
-            .view(&self.branches.read_path(branch, None)?)
-            .await?;
+        //
+        // Behind an `Arc` because every invocation in the wave needs it and it is read-only.
+        let defs = Arc::new(
+            self.defs
+                .view(&self.branches.read_path(branch, None)?)
+                .await?,
+        );
+        let ceiling = Arc::new(RoundCeiling::new(source_layer));
+        let permits = Arc::new(Semaphore::new(self.parallelism()));
 
         let mut executed = 0;
-        let mut frontier_of_change = vec![source_layer];
-        // Everything committed so far as a consequence of this source layer. Producers read here, so
-        // that one can consume another's output within the round. Safe because derivation is the
-        // only writer while a round is settling.
-        let mut ceiling = source_layer;
+        let mut wave = vec![source_layer];
         // Scoped to this round: a cycle is an invocation that keeps re-running while the branch head
         // is otherwise fixed (SPEC.md §16.5).
         let mut reruns: HashMap<Invocation, u32> = HashMap::new();
         // Producers already given their whole source buffer as work in this round — see `backfill`.
-        let mut seeded: std::collections::HashSet<ProducerId> = std::collections::HashSet::new();
+        let mut seeded: HashSet<ProducerId> = HashSet::new();
 
-        while let Some(layer) = frontier_of_change.pop() {
-            let cells = self.cells_of(layer).await?;
+        while !wave.is_empty() {
+            let work = self
+                .schedule(
+                    branch,
+                    &wave,
+                    source_layer,
+                    &defs,
+                    &ceiling,
+                    &mut reruns,
+                    &mut seeded,
+                )
+                .await?;
+            wave.clear();
+
+            let mut running = JoinSet::new();
+            for (def, invocation) in work {
+                let engine = Arc::clone(self);
+                let defs = Arc::clone(&defs);
+                let ceiling = Arc::clone(&ceiling);
+                let permits = Arc::clone(&permits);
+                running.spawn(async move {
+                    // The permit is taken inside the task rather than before spawning, so the whole
+                    // wave is described up front and the bound applies to what is *running* rather
+                    // than to what is known.
+                    let _permit = permits.acquire_owned().await;
+                    let at = RunAt {
+                        fresh_as_of: source_layer,
+                        reflects: source_layer,
+                        // Read at the ceiling *as it stands now*, not as it stood when the wave was
+                        // scheduled: a peer that has already committed is exactly what this run
+                        // should be able to see.
+                        read_at: ceiling.get(),
+                    };
+                    let outcome = engine
+                        .run(branch, &def, &defs, invocation.input, at, Some(&ceiling))
+                        .await;
+                    (def.id, outcome)
+                });
+            }
+
+            while let Some(joined) = running.join_next().await {
+                // A panicking producer is a failure of that producer, not of the round: the same
+                // shape as an error, poisoned the same way. Which one panicked is unknowable from
+                // the `JoinError`, so the round reports it rather than mislabelling a producer.
+                let (producer, outcome) = joined.map_err(|err| {
+                    BorgError::Execution(format!("a producer run did not finish: {err}"))
+                })?;
+                match outcome {
+                    Ok(derived) => {
+                        executed += 1;
+                        wave.push(derived);
+                    }
+                    Err(err) => self.poison(branch, producer, err),
+                }
+            }
+        }
+
+        for producer in self.producer_ids() {
+            self.frontier.advance(branch, producer, source_layer);
+        }
+        Ok(executed)
+    }
+
+    /// Turn one wave of committed layers into the invocations they dirty.
+    ///
+    /// Runs no user code and commits nothing, which is why it stays sequential: it is a walk over
+    /// changesets and index lookups, and making it concurrent would buy contention on the one index
+    /// mutex in exchange for nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn schedule(
+        &self,
+        branch: BranchId,
+        wave: &[LayerId],
+        source_layer: LayerId,
+        defs: &DefView,
+        ceiling: &RoundCeiling,
+        reruns: &mut HashMap<Invocation, u32>,
+        seeded: &mut HashSet<ProducerId>,
+    ) -> Result<Vec<(ProducerDef, Invocation)>> {
+        let mut work = Vec::new();
+        // One run per invocation per wave. Two layers in one wave can dirty the same invocation, and
+        // running it twice concurrently would put two layers in the same round writing the same
+        // cell and two `record` calls racing to describe one run. Deferring the duplicate to the
+        // next wave is free: this wave's own output re-triggers it if it is still dirty.
+        let mut scheduled: HashSet<Invocation> = HashSet::new();
+
+        for layer in wave {
+            let cells = self.cells_of(*layer).await?;
 
             for def in self.producer_defs() {
                 if self.is_broken(branch, def.id).is_some() {
@@ -302,18 +532,21 @@ impl DerivationEngine {
                     continue;
                 }
                 // Migrations materialize only for versions that have live clients (SPEC.md §5.5).
-                if !self.is_materialized_version(&defs, &def) {
+                if !self.is_materialized_version(defs, &def) {
                     continue;
                 }
-                let mut work = self.invalidated_by(branch, &cells, &def, &defs)?;
+                let mut candidates = self.invalidated_by(branch, &cells, &def, defs)?;
                 if seeded.insert(def.id) {
-                    for invocation in self.backfill(branch, &def, &defs, ceiling).await? {
-                        if !work.contains(&invocation) {
-                            work.push(invocation);
+                    for invocation in self.backfill(branch, &def, defs, ceiling.get()).await? {
+                        if !candidates.contains(&invocation) {
+                            candidates.push(invocation);
                         }
                     }
                 }
-                for invocation in work {
+                for invocation in candidates {
+                    if !scheduled.insert(invocation.clone()) {
+                        continue;
+                    }
                     let runs = reruns.entry(invocation.clone()).or_insert(0);
                     *runs += 1;
                     if *runs > CYCLE_RERUN_LIMIT {
@@ -327,33 +560,11 @@ impl DerivationEngine {
                         );
                         break;
                     }
-
-                    let at = RunAt {
-                        fresh_as_of: source_layer,
-                        reflects: source_layer,
-                        read_at: ceiling,
-                    };
-                    match self.run(branch, &def, &defs, invocation.input, at).await {
-                        Ok(derived) => {
-                            executed += 1;
-                            if derived.0 > ceiling.0 {
-                                ceiling = derived;
-                            }
-                            frontier_of_change.push(derived);
-                        }
-                        Err(err) => {
-                            self.poison(branch, def.id, err);
-                            break;
-                        }
-                    }
+                    work.push((def.clone(), invocation));
                 }
             }
         }
-
-        for producer in self.producer_ids() {
-            self.frontier.advance(branch, producer, source_layer);
-        }
-        Ok(executed)
+        Ok(work)
     }
 
     /// A committed layer's changeset: each cell at the version it was written at, and which
@@ -504,6 +715,9 @@ impl DerivationEngine {
     }
 
     /// Execute one invocation into its own layer.
+    ///
+    /// `round` is the ceiling this run's output joins, where there is a round at all. An inline
+    /// computation (§10.5) has none: its layer belongs to nobody's round and raises nobody's bound.
     async fn run(
         &self,
         branch: BranchId,
@@ -511,6 +725,7 @@ impl DerivationEngine {
         defs: &DefView,
         input: Pid,
         at: RunAt,
+        round: Option<&RoundCeiling>,
     ) -> Result<LayerId> {
         // A migration's ClientVersion is the version it produces: it reads the world at that view
         // and writes that version. Its own source cell is the one exception, reached through
@@ -563,13 +778,20 @@ impl DerivationEngine {
 
         match outcome {
             Ok(()) => {
+                // Recorded *before* the layer commits, and that ordering is what a concurrent round
+                // rests on. A peer scanning this layer in the next wave must find this run already
+                // subscribed to everything it read, or a write it missed would go unnoticed.
                 let invocation = Invocation {
                     producer: def.id,
                     input,
                 };
                 self.index
                     .record(branch, &invocation, &read_set, &write_set)?;
-                session.commit().await
+                let layer = session.commit().await?;
+                if let Some(round) = round {
+                    round.committed(layer);
+                }
+                Ok(layer)
             }
             Err(err) => {
                 // The layer never becomes visible, so a failed run leaves no trace.
@@ -690,7 +912,8 @@ impl DerivationEngine {
         // while settling a round; a failure here is the answer to one client's request, and the
         // client that asked to pay for a fresh value is the one entitled to hear why it could not
         // have one (SPEC.md §14).
-        self.run(branch, &def, defs, input, at).await?;
+        // No round, so no ceiling: this run's layer is nobody's prefix.
+        self.run(branch, &def, defs, input, at, None).await?;
         Ok(())
     }
 }
@@ -706,5 +929,31 @@ impl InlineDerivation for DerivationEngine {
         let mut computing = HashSet::new();
         self.refresh(branch, cell.clone(), version, &mut computing)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ceiling begins where the round does and only ever rises.
+    ///
+    /// Monotonicity is what makes it safe to read without holding anything: a run can see a bound
+    /// that was true a moment ago, never one that was never true. §16.5 licenses the first — a run
+    /// that misses a peer's output pays a re-run — and nothing licenses the second.
+    #[test]
+    fn the_ceiling_starts_at_the_source_layer_and_only_rises() {
+        let ceiling = RoundCeiling::new(LayerId(10));
+        assert_eq!(ceiling.get(), LayerId(10));
+
+        // Committed out of order, which is the ordinary case once ids are assigned at open and the
+        // order within a branch is established at commit (§7.3).
+        ceiling.committed(LayerId(13));
+        ceiling.committed(LayerId(11));
+        assert_eq!(
+            ceiling.get(),
+            LayerId(13),
+            "a layer landing after a higher one must not pull the bound back down"
+        );
     }
 }

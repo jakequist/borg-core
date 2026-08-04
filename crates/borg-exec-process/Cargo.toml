@@ -15,3 +15,8 @@ borg-protocol.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "rt", "sync", "macros"] }
 serde_json.workspace = true
+
+[dev-dependencies]
+# The pool is about processes running at once, so its tests need a runtime that can actually run
+# them at once.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

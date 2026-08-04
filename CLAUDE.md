@@ -16,6 +16,15 @@ bash scenarios/run-all.sh   # end-to-end CLI scenarios only (needs `cargo build 
 cargo fmt
 ```
 
+```
+cargo test --release -p borg-engine --test scale -- --ignored --nocapture
+```
+
+**Run the fan-out benchmark whenever you touch derivation, definitions or the write path.** It is
+`--ignored`, so `check.sh` does not run it — and that is how an `O(n²)` regression once hid for two
+milestones, until measuring made a 32k fan-out take 44 seconds instead of 0.3. Correctness tests
+cannot see this class of bug; only the curve can.
+
 **`./check.sh` must pass before any work is reported complete.** Not "the tests I added pass" — all
 of it. A `justfile` mirrors these steps for anyone who has `just`, but `check.sh` is the one that
 always works and the one to call.
@@ -46,9 +55,11 @@ These are load-bearing. Breaking one is a design change, not a refactor, and nee
    events, layers and a `ReadPath`. It never learns about derivation, dependencies or watermarks.
 2. **Commit streams.** A layer may hold millions of mutations and can never be buffered whole.
    Visibility is a join, not a per-row rewrite (§6.2, §17.1).
-3. **Locks are per-layer, never per-branch.** A branch-wide write lock serialises derivation.
+3. **Locks are per-layer, never per-branch.** A branch-wide write lock serialises derivation. This
+   includes a provider holding one worker behind a mutex, which is the same lock wearing a disguise.
 4. **Single writer per field.** This is what lets derived layers commit concurrently without
-   conflicting.
+   conflicting. It reaches invocations only because v1 pipelines are per-entity maps; a producer
+   writing across entities breaks it and nothing checks (§16.3).
 5. **No membership test in the dependency index may be a linear scan** (§16.3). A widely-shared cell
    accumulates one dependent per invocation and each retracts itself on re-run; a `Vec` makes fan-out
    quadratic. This was measured, not guessed.
@@ -88,7 +99,10 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - Auto-derivation happens in the process that commits a layer, not in a scheduler of its own. A
   write therefore pays for the derivation it causes; §9.6 says that is a latency property, not a
   semantic one, and a server moves the same call behind a signal.
-- `settle()` is sequential; parallel workers need its round-ceiling reworked.
+- A round's ceiling is a `ReadPath` bound, which is a prefix, where §16.5's formulation is a filter.
+  Under a *concurrent source write* a round can therefore read a layer above the one it reflects. The
+  strict alternative was tried and stops the fixpoint converging; §16.5 and `ROADMAP.md` record the
+  consequence and what closing it would cost.
 - `scan_buffer` and `read_layer` materialise results before streaming them.
 - SQLite `Registry::open` rebuilds indexes by replaying the log — `O(log)` per CLI invocation.
 - Writes to list and untyped-container cells are **not** validated: there is no `ListDef` event to

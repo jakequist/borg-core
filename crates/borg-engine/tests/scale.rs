@@ -7,6 +7,10 @@
 //! This fixture is the worst case on purpose — `N` companies all hopping to **one** shared `School`,
 //! so flipping it invalidates every one of them.
 //!
+//! It is also where parallel derivation is measured, because it is the only fixture with real
+//! contention: one shared upstream cell, `N` independent invocations, and a dependency index every
+//! one of them writes to.
+//!
 //! Run the large case with:
 //!   cargo test --release -p borg-engine --test scale -- --ignored --nocapture
 
@@ -116,7 +120,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn new() -> Self {
+    async fn new(parallelism: usize) -> Self {
         let storage = Arc::new(MemoryStorage::new());
         let layers = Arc::new(LayerManager::new(
             storage.clone(),
@@ -128,15 +132,18 @@ impl Harness {
         let executor = Arc::new(NativeExecutor::new());
         executor.register(SCORE, invest_pipeline());
 
-        let engine = Arc::new(DerivationEngine::new(
-            storage,
-            layers.clone(),
-            Arc::new(MemoryDependencyIndex::new()),
-            executor,
-            Arc::new(FrontierTracker::new()),
-            defs.clone(),
-            branches.clone(),
-        ));
+        let engine = Arc::new(
+            DerivationEngine::new(
+                storage,
+                layers.clone(),
+                Arc::new(MemoryDependencyIndex::new()),
+                executor,
+                Arc::new(FrontierTracker::new()),
+                defs.clone(),
+                branches.clone(),
+            )
+            .with_parallelism(parallelism),
+        );
         engine.register(ProducerDef {
             id: SCORE,
             kind: ProducerKind::Pipeline,
@@ -235,8 +242,8 @@ fn fixture(n: u64) -> Vec<(CellRef, Value)> {
 }
 
 /// Build `n` companies, derive them, then flip the one shared school and re-derive.
-async fn measure(n: u64) -> Result<()> {
-    let h = Harness::new().await;
+async fn measure(n: u64, parallelism: usize) -> Result<()> {
+    let h = Harness::new(parallelism).await;
 
     let writes = fixture(n);
     let cells = writes.len();
@@ -262,24 +269,36 @@ async fn measure(n: u64) -> Result<()> {
     assert_eq!(again as u64, n, "every company recomputes");
 
     eprintln!(
-        "n={n:>6}  cells={cells:>7}  push={push:>9.2?}  derive={derive:>9.2?}  \
-         fan-out={refan:>9.2?}  ({:>7.0} inv/s)",
+        "n={n:>6}  p={parallelism:>2}  cells={cells:>7}  push={push:>9.2?}  \
+         derive={derive:>9.2?}  fan-out={refan:>9.2?}  ({:>7.0} inv/s)",
         n as f64 / refan.as_secs_f64()
     );
     Ok(())
 }
 
-#[tokio::test]
+/// The fan-out is the same size however many invocations run at once.
+///
+/// Scheduling policy cannot affect correctness, only latency (SPEC.md §9.6), and the concrete form
+/// of that claim here is that the invocation count is identical: no invocation is lost to a race and
+/// none is run twice because two workers found the same work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fan_out_stays_correct_at_a_modest_size() -> Result<()> {
     // Small enough for the normal suite; guards the behaviour the big runs measure.
-    measure(200).await
+    for parallelism in [1, 8] {
+        measure(200, parallelism).await?;
+    }
+    Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "measurement, not a correctness check — run with --release --ignored --nocapture"]
 async fn fan_out_scaling_curve() -> Result<()> {
+    // `p=1` is the sequential engine, in the same binary: the honest before-and-after for a change
+    // whose whole claim is that the bound is a knob.
     for n in [1_000, 8_000, 32_000, 128_000] {
-        measure(n).await?;
+        for parallelism in [1, 2, 4, 8] {
+            measure(n, parallelism).await?;
+        }
     }
     Ok(())
 }

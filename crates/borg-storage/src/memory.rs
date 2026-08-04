@@ -18,9 +18,23 @@ use std::sync::{Arc, Mutex};
 
 type Committed = HashMap<BranchId, HashMap<(CellRef, ClientVersion), Vec<(LayerId, CellRecord)>>>;
 
+/// The newest write to a cell at or below a bound.
+///
+/// A `max_by_key`, not the last entry that fits. Layers commit out of order — ids are assigned at
+/// open and order is established at commit (SPEC.md §7.3) — so this history is in *commit* order,
+/// not id order, and "walk backwards to the first one that fits" would serve a superseded value
+/// whenever two layers on one cell landed in the other order.
+fn newest_at(history: &[(LayerId, CellRecord)], bound: LayerId) -> Option<&(LayerId, CellRecord)> {
+    history
+        .iter()
+        .filter(|(written_at, _)| written_at.0 <= bound.0)
+        .max_by_key(|(written_at, _)| written_at.0)
+}
+
 #[derive(Default)]
 struct Inner {
-    /// Per cell, the history of writes in layer order. Time travel is a binary search over this.
+    /// Per cell, the history of writes — in **commit** order, which is not id order (§7.3). Time
+    /// travel is [`newest_at`] over this.
     committed: Committed,
     /// Open and sealed layers, invisible to readers until commit.
     staged: HashMap<LayerId, StagedLayer>,
@@ -125,13 +139,7 @@ impl StorageProvider for MemoryStorage {
                 .committed
                 .get(branch)
                 .and_then(|cells| cells.get(&(cell.clone(), version)))
-                .and_then(|history| {
-                    history
-                        .iter()
-                        .rev()
-                        .find(|(written_at, _)| written_at.0 <= bound.0)
-                        .map(|(_, record)| record.clone())
-                });
+                .and_then(|history| newest_at(history, *bound).map(|(_, record)| record.clone()));
             if found.is_some() {
                 return Ok(found);
             }
@@ -165,11 +173,7 @@ impl StorageProvider for MemoryStorage {
                 if &cell.buffer != buffer || seen.contains(cell) {
                     continue;
                 }
-                if let Some((_, record)) = history
-                    .iter()
-                    .rev()
-                    .find(|(written_at, _)| written_at.0 <= bound.0)
-                {
+                if let Some((_, record)) = newest_at(history, *bound) {
                     seen.push(cell.clone());
                     rows.push(Ok((cell.clone(), record.clone())));
                 }

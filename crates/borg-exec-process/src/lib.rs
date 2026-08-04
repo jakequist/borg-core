@@ -9,14 +9,33 @@
 //!
 //! ## Workers are stateless
 //!
-//! A worker holds nothing between invocations, which is what makes it safe to spawn, kill and
-//! eventually run several at once. Two things already in the design cash that in: deterministic
-//! output PIDs (§9.5) mean two workers racing the same invocation produce identical output, and
-//! the scheduler is stateless (§16.4), so a lost worker costs a retry and nothing else.
+//! A worker holds nothing between invocations, which is what makes it safe to spawn, kill and run
+//! several at once. Two things already in the design cash that in: deterministic output PIDs (§9.5)
+//! mean two workers racing the same invocation produce identical output, and the scheduler is
+//! stateless (§16.4), so a lost worker costs a retry and nothing else.
 //!
-//! Reuse across invocations is therefore an *optimisation*, not a semantic. This provider keeps one
-//! worker alive because spawning a process per entity would dominate everything else, and it may
-//! discard it at any point without consequence.
+//! Reuse across invocations is therefore an *optimisation*, not a semantic. This provider keeps
+//! workers alive because spawning a process per entity would dominate everything else, and it may
+//! discard any of them at any point without consequence.
+//!
+//! ## Workers are a pool, not a worker
+//!
+//! One worker behind a lock would serialise every invocation through one subprocess whatever the
+//! scheduler did, so the pool is the point rather than a refinement. Each command gets its own pool:
+//! a permit bounds how many of its processes exist, and idle workers are handed back rather than
+//! respawned.
+//!
+//! **A worker that errored is dropped rather than returned.** The protocol is a request/response
+//! stream over a pipe, so a failed invocation leaves it at an unknown offset; reusing it would feed
+//! one invocation's reply to the next one. Spawning a replacement is the cheap, obviously-correct
+//! answer, and it costs nothing that is not already being paid on an error path.
+//!
+//! **The pipe is read with blocking I/O on the async runtime.** That was invisible while one worker
+//! served everything and is worth naming now that several do: a pool of `n` occupies `n` runtime
+//! threads waiting on `read`, which costs latency for anything else scheduled there. It cannot
+//! deadlock — a blocked read is waiting on a subprocess, which needs nothing from this runtime to
+//! proceed — and the fix is the same one that makes a socket transport worth having, so it is
+//! deferred to that rather than paid for twice.
 //!
 //! ## stdout belongs to the protocol
 //!
@@ -36,8 +55,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Codecs this engine offers, best first.
 const OFFERED: [Codec; 2] = [Codec::Msgpack, Codec::Json];
@@ -130,12 +149,80 @@ impl Worker {
     }
 }
 
+/// How many processes one command may have alive at once when nothing says otherwise.
+///
+/// One per core, matching the scheduler's own default: a pool smaller than the degree of parallelism
+/// would reintroduce the queue the pool exists to remove, and a larger one only buys anything for a
+/// worker that spends its time waiting on something other than us.
+fn default_pool_size() -> usize {
+    std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+}
+
+/// The live processes for one command: a permit bounding how many exist, and the idle ones.
+struct Pool {
+    /// Holding a permit is the right to *have* a process, not the right to use a shared one — which
+    /// is the difference between this and the single-worker mutex it replaces.
+    permits: Arc<Semaphore>,
+    idle: Mutex<Vec<Worker>>,
+}
+
+impl Pool {
+    /// Take a worker, spawning one if the pool is under its bound and has none idle.
+    async fn checkout(self: &Arc<Self>, command: &Path) -> Result<Checkout> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(exec)?;
+        let idle = self.idle.lock().unwrap().pop();
+        let worker = match idle {
+            Some(worker) => worker,
+            None => Worker::spawn(command)?,
+        };
+        Ok(Checkout {
+            pool: Arc::clone(self),
+            worker: Some(worker),
+            _permit: permit,
+        })
+    }
+}
+
+/// A worker checked out of a pool. Killed on drop unless it was released first.
+struct Checkout {
+    pool: Arc<Pool>,
+    worker: Option<Worker>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Checkout {
+    fn worker(&mut self) -> &mut Worker {
+        self.worker.as_mut().expect("held until released")
+    }
+
+    /// Give the worker back for the next invocation.
+    fn release(mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.pool.idle.lock().unwrap().push(worker);
+        }
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        // Reached only when `release` was not called — an error path. The stream is at an unknown
+        // offset, so the process is killed rather than handed to the next invocation.
+        if let Some(worker) = self.worker.take() {
+            worker.shutdown();
+        }
+    }
+}
+
 pub struct ProcessExecutor {
     /// Producer id → the executable that implements it, and the struct it maps over. This mapping
     /// is the provider's own business: the log records only that a producer exists (§9.2).
     commands: HashMap<u64, (PathBuf, String)>,
-    /// One worker per command, reused across invocations.
-    workers: Mutex<HashMap<PathBuf, Worker>>,
+    /// One pool per command.
+    pools: Mutex<HashMap<PathBuf, Arc<Pool>>>,
+    pool_size: usize,
     branch: BranchId,
 }
 
@@ -146,19 +233,44 @@ impl ProcessExecutor {
     pub fn new(branch: BranchId) -> Self {
         Self {
             commands: HashMap::new(),
-            workers: Mutex::new(HashMap::new()),
+            pools: Mutex::new(HashMap::new()),
+            pool_size: default_pool_size(),
             branch,
         }
+    }
+
+    /// How many processes one command may have alive at once.
+    #[must_use]
+    pub fn with_pool_size(mut self, workers: usize) -> Self {
+        self.pool_size = workers.max(1);
+        self
     }
 
     pub fn register(&mut self, producer: u64, command: PathBuf, source: String) {
         self.commands.insert(producer, (command, source));
     }
 
+    fn pool(&self, command: &Path) -> Arc<Pool> {
+        Arc::clone(
+            self.pools
+                .lock()
+                .unwrap()
+                .entry(command.to_path_buf())
+                .or_insert_with(|| {
+                    Arc::new(Pool {
+                        permits: Arc::new(Semaphore::new(self.pool_size)),
+                        idle: Mutex::new(Vec::new()),
+                    })
+                }),
+        )
+    }
+
     /// Stop every worker. Called when the engine is finished with them.
     pub async fn shutdown(&self) {
-        for (_, worker) in self.workers.lock().await.drain() {
-            worker.shutdown();
+        for (_, pool) in self.pools.lock().unwrap().drain() {
+            for worker in pool.idle.lock().unwrap().drain(..) {
+                worker.shutdown();
+            }
         }
     }
 }
@@ -178,38 +290,41 @@ impl ExecutionProvider for ProcessExecutor {
             ))
         })?;
 
-        let mut workers = self.workers.lock().await;
-        if !workers.contains_key(&command) {
-            workers.insert(command.clone(), Worker::spawn(&command)?);
-        }
-        let worker = workers.get_mut(&command).expect("just inserted");
+        let pool = self.pool(&command);
+        let mut checkout = pool.checkout(&command).await?;
 
         // The worker is handed the *entity* in the canonical text form and appends field names to
         // it — so `Company:o-1234abcd` is exactly the prefix it needs, and it never has to know
         // which branch it is running on.
-        worker.send(&ToWorker::Invoke {
+        checkout.worker().send(&ToWorker::Invoke {
             producer: producer.id.0,
             input: borg_core::CellRef::existence(source.into(), input).to_string(),
         })?;
 
         // Service the worker's cell access until it says it is finished. Every read and write goes
         // through `ctx`, so dependency capture is exactly as automatic here as it is in-process.
+        //
+        // The `?`s below all leave the loop without releasing the checkout, so the process is killed
+        // on the way out: a conversation abandoned half way through is not one the next invocation
+        // can inherit. Only the two deliberate returns hand the worker back.
         loop {
-            match worker.receive()? {
+            match checkout.worker().receive()? {
                 // Text in both directions, and interning is the engine's business, not the
                 // worker's: a string cell answers with `acme.ai` rather than `@s-1a2b3c` plus a
                 // round trip to resolve it, and a worker writing `acme.ai` is finished (§3.4).
                 FromWorker::Get(cell) => {
                     let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
                     let value = ctx.get(&cell).await?;
-                    worker.send(&ToWorker::Value(render(ctx, value).await?))?;
+                    let rendered = render(ctx, value).await?;
+                    checkout.worker().send(&ToWorker::Value(rendered))?;
                 }
                 // The one message a migration needs and a pipeline never sends: the same cell at the
                 // version this producer reads from, whichever side of the step that is (§9.3).
                 FromWorker::GetInput(cell) => {
                     let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
                     let value = ctx.get_input(&cell).await?;
-                    worker.send(&ToWorker::Value(render(ctx, value).await?))?;
+                    let rendered = render(ctx, value).await?;
+                    checkout.worker().send(&ToWorker::Value(rendered))?;
                 }
                 // The text goes across untouched: parsing it needs the field's declared type, which
                 // lives on the other side of `ctx` (§3.4). Guessing here would give a worker a
@@ -217,10 +332,16 @@ impl ExecutionProvider for ProcessExecutor {
                 FromWorker::Set { cell, value } => {
                     let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
                     ctx.set_text(&cell, &value).await?;
-                    worker.send(&ToWorker::Ok {})?;
+                    checkout.worker().send(&ToWorker::Ok {})?;
                 }
-                FromWorker::Done {} => return Ok(()),
+                FromWorker::Done {} => {
+                    checkout.release();
+                    return Ok(());
+                }
                 FromWorker::Error { message } => {
+                    // The worker reported failure rather than desynchronising, so it is still usable
+                    // — a producer that raises on one entity is not a broken process.
+                    checkout.release();
                     return Err(BorgError::ProducerFailed {
                         producer: producer.id,
                         message,
@@ -246,10 +367,10 @@ async fn render(
 pub fn from_registrations(
     branch: BranchId,
     registrations: impl IntoIterator<Item = (u64, PathBuf, String)>,
-) -> Arc<ProcessExecutor> {
+) -> ProcessExecutor {
     let mut executor = ProcessExecutor::new(branch);
     for (producer, command, source) in registrations {
         executor.register(producer, command, source);
     }
-    Arc::new(executor)
+    executor
 }

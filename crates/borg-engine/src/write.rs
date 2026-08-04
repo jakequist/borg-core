@@ -116,6 +116,12 @@ impl WriteSession {
         })
     }
 
+    /// The layer this session writes into. Reserved at open, which is why it can be named before
+    /// anyone knows whether the session will commit or abort (SPEC.md §7.3).
+    pub const fn layer(&self) -> LayerId {
+        self.handle.id()
+    }
+
     /// Make this layer contingent on a condition, validated at seal (SPEC.md §12).
     pub fn guard(&mut self, guard: borg_core::Guard) {
         self.handle.guard(guard);
