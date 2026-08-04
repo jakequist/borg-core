@@ -12,9 +12,12 @@ random access, migrations as producers, branching and merge, guards doubling as 
 detector, definitions travelling the log, a SQLite backend behind a clean seam, and pipelines running
 as subprocesses over a wire protocol — demonstrated by a pipeline written in bash.
 
+Values are real: `String`, `Binary` and `BigInt` are interned on the way in and resolved on the way
+out, invisibly, so a pipeline can finally read `company.website.ends_with('.ai')`.
+
 The **definition half is decorative.** Definitions can be pushed, folded and read, but the write path
-never consults them. `ValueType` has never rejected a write. And there is no way to write a
-`String`, `Binary` or `BigInt` at all, because content-addressed interning was never built.
+never consults them. `ValueType` has never rejected a write — which is also why value parsing has to
+guess at a type from the text alone, and why the text `true` cannot yet be a string.
 
 That gap is what the next three milestones close, and it is why "Act 1 is the modern ORM" is not yet
 true.
@@ -25,13 +28,16 @@ true.
 
 ### A — values become real
 
-Content-addressed interning for `String`, `Binary` and `BigInt`: the hashing, the buffers, and
+Content-addressed interning for `String`, `Binary` and `BigInt`: the hashing, the storage, and
 support in the CLI and the wire protocol.
 
-Everything is blocked behind this. No realistic scenario can exist while every field is an integer —
-the spec's own motivating example is `company.website.ends_with('.ai')`, which is unwritable today.
-Mostly filling in a shape already drawn: `PidKind::String` exists, `StringBuffer` is specified,
-§3.1 defines the hashing rule.
+Everything was blocked behind this. No realistic scenario could exist while every field was an
+integer — the spec's own motivating example is `company.website.ends_with('.ai')`.
+
+**Done.** Interning existed in storage and nothing called it; it is now wired to the client surface
+end to end. The value text form is normative in `SPEC.md` §3.4 and the `BigInt` byte encoding in
+§3.1. Three decisions came out of it, below. `scenarios/050-values` is the proof, and 030's bash
+pipeline now reads a real string and a real number.
 
 ### A′ — the PID text form
 
@@ -109,6 +115,50 @@ staying shell-safe by construction.
 
 `Company#1` remains accepted **on input only**, as a documented convenience for hand-authored data,
 meaning "root branch, allocator 0, counter 1". Output is always canonical.
+
+### `BufferId` has no interning variants
+
+`String`, `Binary` and `BigInt` were dropped from `BufferId`. §4.2 already said the interning stores
+hold *values, not cells* — an interned value has no version, no origin and no writing layer, so every
+field of a `CellRecord` is meaningless for it. A `BufferId` variant therefore named a cell partition
+that cannot exist, and would have been the first place a branch or a layer crept back into a scheme
+whose entire value is having neither.
+
+`AnyObject` and `AnyArray` stay. Those are mutable containers, so their contents genuinely are cells,
+even though nothing implements them yet.
+
+Dropping them forced `CellRef`'s `Display` to become total, which it should always have been: the old
+`{:?}` fallthrough emitted an unparseable second dialect in exactly the places — panics, lineage
+output, error messages — where a pasteable address matters most.
+
+### Bare values parse as strings
+
+`borg set Company#1.website acme.ai`. No quotes and no prefix: a shell worker is the target audience,
+and a form that needs quoting is one that will eventually be typed unquoted. `0x…` is `Binary`, a
+trailing `n` on digits is `BigInt`, and everything unmatched is a `String` — which makes value
+parsing infallible, since every input names some value.
+
+The cost is real and is documented rather than hidden (§3.4): `true` is a `Bool`, so a string field
+cannot yet hold the text "true"; likewise `42`, `0xff`, `7n`, and a malformed `@…` that quietly
+becomes data instead of an error. **Milestone B resolves this properly** by making parsing
+type-directed against the declared `FieldDef` — a field declared `String` reads `true` as four
+characters. Quoting was the alternative and it buys the same thing at the cost of the shell-first
+stance.
+
+### Interning is invisible to workers
+
+A pipeline reading `company.website` receives `acme.ai`, never `@s-1a2b3c`. A worker writing a string
+sends the text and is finished; the engine interns it. No second round trip in either direction, and
+nothing above the storage line needs to know that content addressing exists — the same call as
+batching being a runtime concern rather than a user concern (§17.1).
+
+Where the conversion lives took some deciding. It is **not** the resolver: resolution deals in
+`Value`, the engine's internal currency, and rendering there would push every internal consumer
+through a string round trip to serve the two edges that actually want text. It is **not**
+`ProducerCtx` alone either, because `borg set` writes source cells with no `ProducerCtx` in sight, and
+a second implementation there is how two dialects start. It is one engine-level type beside storage
+(`borg_engine::values`), which `ProducerCtx` exposes and delegates to — the exposure being necessary
+because a producer runtime holds no store handle and must not acquire one.
 
 ### Field ownership is declared, not discovered
 

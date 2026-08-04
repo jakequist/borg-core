@@ -74,8 +74,14 @@ strings are stored exactly once registry-wide. Interning storage therefore has n
 layer and no def-version — there is nothing here for two branches to disagree about.
 
 The hash is **SHA-256 of the value's canonical byte encoding** — UTF-8 for `String`, the octets
-themselves for `Binary`. *Canonical* is load-bearing: two encodings of one value would intern as two
+themselves for `Binary`, and for `BigInt` **two's-complement big-endian, minimal length, with the
+empty slice being zero**. *Canonical* is load-bearing: two encodings of one value would intern as two
 values and defeat the deduplication that is interning's entire purpose.
+
+Minimal length is what does the work in the `BigInt` case. Without it `1` could be spelled `01`,
+`0001`, or any longer run of leading zeros, and every spelling would hash differently — one number
+stored under arbitrarily many names. The empty slice for zero falls out of the same rule and settles
+`0` and `-0` as one value rather than two.
 
 The kind is **not** part of the preimage. It is a field of the PID in its own right, so `String("x")`
 and `Binary("x")` are already distinct PIDs without paying for domain separation, and the hash stays
@@ -125,6 +131,50 @@ They are stored inline in the cell that holds them.
 `Set<T>` and `Map<K,V>` are **deferred**. When introduced they will dedupe by a JVM-style
 `hashCode`/`equals` contract on the element type, not by PID.
 
+### 3.4 Values in text
+
+A value has one text form, and it is the one the CLI accepts, the one a worker sends and receives
+(§17.4), and the one errors quote back:
+
+```
+42                     Int
+1.5                    Double
+true / false           Bool
+~                      a tombstone (§8.1)
+@o-1234abcd            a reference — a bare PID (§3.1)
+@Company:o-1234abcd    the same reference, named through a cell it identifies
+0xdeadbeef             Binary — whole octets only
+-129n                  BigInt — decimal digits with a trailing `n`
+acme.ai                String — anything that matched none of the above
+```
+
+**A bare word is a string.** No quoting, because a shell worker is the target audience and a form
+that needs quotes is one that will eventually be typed unquoted.
+
+**But `@` and `0x` are reserved sigils.** Having introduced one, a malformed remainder is an *error*,
+not a string. A mistyped reference quietly becoming data that looks almost right is the worst
+available outcome — nothing complains and the value is wrong. For the same reason an integer literal
+too large for `Int` is an error naming `n`, rather than silently landing in `Double` as a number
+nobody typed.
+
+The cost is that a string genuinely beginning with `@` cannot be written yet. That is a symptom of
+parsing without knowing the target type; once parsing is **type-directed** against the declared
+field, a `String` field simply takes `@jake` as those five characters and the reservation lifts.
+
+**Interning is invisible.** A `String`, `Binary` or `BigInt` written in this form is interned by the
+engine, and a cell holding a reference to a *content-addressed* PID renders back as its content — so
+a pipeline reading `company.website` receives `acme.ai`, never `@s-1a2b3c` plus a round trip to
+resolve it. A reference to an *allocated* PID still renders as `@o-…`, because there is nothing
+behind it to render. Clients therefore never learn that interning exists, in the same way they never
+learn that a provider batches writes (§17.1): a runtime concern, not a user concern.
+
+> **The known ambiguity.** The forms above win, so their spellings are not strings: a string field
+> cannot yet hold the text `true`, `42`, `0xff` or `7n`, and a malformed `@…` becomes a string rather
+> than an error. This is what parsing without a declared type costs, and it is recorded rather than
+> hidden. **Type-directed parsing resolves it**: once a write is validated against its `FieldDef`
+> (§5.1), a field declared `String` reads `true` as four characters and a field declared `Object`
+> rejects a malformed reference outright.
+
 ---
 
 ## 4. Storage Model
@@ -173,8 +223,7 @@ new field key and touches none of Repo#1's storage.
 
 A **buffer** is a partition of cells, and the partition key is a def:
 
-> **One buffer per def.** Values that have no def — interned and untyped ones — get exactly one
-> buffer each.
+> **One buffer per def.** Values that have no def — the untyped ones — get exactly one buffer each.
 
 | Buffer | One per | Holds |
 |---|---|---|
@@ -182,19 +231,20 @@ A **buffer** is a partition of cells, and the partition key is a def:
 | `ObjectPropBuffer` | `FieldDef` | property cells for that one field |
 | `ListBuffer` | `ListDef` | list existence cells |
 | `ListElemBuffer` | `ListDef` | element cells |
-| `StringBuffer` | — | interned strings, keyed by content hash |
-| `BinaryBuffer` | — | interned binary |
-| `BigIntBuffer` | — | interned bigints |
 | `AnyObjectBuffer` | — | untyped object cells |
 | `AnyArrayBuffer` | — | untyped array cells |
 
-The interning buffers are singular by necessity: registry-wide deduplication is their entire purpose.
-The `Any*` buffers are singular because untyped values have no def to partition by.
+The `Any*` buffers are singular because untyped values have no def to partition by. They are genuine
+cell partitions all the same: an `Any` container is mutable, so its contents are cells with versions
+and origins like any other.
 
-The interning buffers hold **values, not cells**. An interned value has no def-version, no origin and
-no writing layer — a `CellRecord`'s fields are all meaningless for it — so it is reached through
-`intern` / `read_interned` (§17.1) rather than through a cell read, and a `BufferId` never has to be
-named: the PID already carries its kind (§3.1).
+**Interning is not a buffer.** The interning stores hold **values, not cells**. An interned value has
+no def-version, no origin and no writing layer — a `CellRecord`'s fields are all meaningless for it —
+so it is reached through `intern` / `read_interned` (§17.1) rather than through a cell read, and a
+`BufferId` is never named: the PID already carries its kind (§3.1). `BufferId` therefore has **no**
+`String`, `Binary` or `BigInt` variant. Naming one would promise a cell partition that cannot exist,
+and would be the first place a branch or a layer crept back into a scheme whose whole value is having
+neither.
 
 **Why this granularity.** Buffers are expected to do a great deal of work, and partitioning them
 finely is what makes scaling them horizontally possible later (§17.2). Per-field partitioning also
@@ -1108,7 +1158,16 @@ def-version, because a content PID has none (§3.1); a provider that scoped it w
 exactly the conflict the scheme exists to eliminate. Nor is it written into a layer: interning takes
 effect immediately, since an interned value nobody references is garbage rather than corruption, and
 an aborted layer stranding one costs only space. `read_interned` answering `None` is a legitimate
-result — a PID travels further than the bytes behind it.
+result — a PID travels further than the bytes behind it, and rendering such a value as its bare PID
+is then the honest answer rather than a failure.
+
+**Nothing above this line calls these directly, and no client calls them at all.** The engine interns
+on the way in and resolves on the way out, at whatever surface accepts or emits value text (§3.4).
+Two placements were considered and rejected: `ProducerCtx` alone, which is not the only writer —
+`borg set` writes source cells with no `ProducerCtx` in sight — and the read path, whose currency is
+`Value` and which would have to push every internal consumer through a string round trip to serve the
+two edges that want text. `ProducerCtx` does *expose* interning, because a producer runtime holds no
+store handle of its own and must not acquire one, but it delegates rather than reimplementing.
 
 **Streaming commit is the binding constraint** (§6.2). Any provider that cannot accept an unbounded
 write stream into an uncommitted, invisible layer is disqualified.
@@ -1190,11 +1249,18 @@ the same serde impls on the same types, so no mapping document exists between th
 Two shapes were forced by targeting a shell worker first, and both are better than what they replaced:
 
 - **Cells and values travel as text** — `"Company:o-1234abcd.website"`, `"9"`, `"@o-5678wxyz"`,
-  `"~"` (§3.1, §4.1) — the same forms the CLI accepts. A worker cannot reasonably assemble the structural JSON of a cell
+  `"~"`, `"acme.ai"` (§3.1, §3.4, §4.1) — the same forms the CLI accepts. A worker cannot reasonably
+  assemble the structural JSON of a cell
   address, and a protocol only usable through a generated client library is one whose complexity is
   hidden rather than absent. Text also removes the `Int`/`Double` ambiguity a bare JSON number has.
 - **Every message is a single-key object**, including the payload-free ones. A worker dispatches on
   one key without special cases.
+
+**Strings on the wire are strings.** A `Get` of a string cell is answered `{"value":"acme.ai"}`, not
+with the `@s-…` that is physically stored, and a `Set` carrying `"acme.ai"` is complete — the engine
+interns it before the write lands. A worker therefore never makes a second round trip to resolve or
+create a string, and never has to know that content addressing exists (§3.4). Anything else would put
+an extra round trip on the hottest path in the protocol in exchange for exposing a storage detail.
 
 **`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting

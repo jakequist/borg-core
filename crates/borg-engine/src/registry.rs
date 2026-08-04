@@ -23,6 +23,7 @@ use crate::log::LayerManager;
 use crate::resolve::{FrontierTracker, Resolver};
 use crate::seams::InProcessSequencer;
 use crate::touch::CellTouchIndex;
+use crate::values::Values;
 use borg_core::{BranchId, CellAt, LayerAuthor, LayerId, LayerState, Result};
 use borg_exec::ExecutionProvider;
 use borg_storage::StorageProvider;
@@ -37,6 +38,10 @@ pub struct Registry {
     pub engine: Arc<DerivationEngine>,
     pub resolver: Resolver,
     pub frontier: Arc<FrontierTracker>,
+    /// Text ↔ value, for the surfaces that speak text. Every client-facing write goes through
+    /// `intern` and every client-facing read through `render`, so a string is a string on the way in
+    /// and on the way out (§3.4).
+    pub values: Arc<Values>,
 }
 
 impl Registry {
@@ -71,6 +76,7 @@ impl Registry {
             highest_branch(&known) + 1,
         ));
         let defs = Arc::new(DefRegistry::new(Arc::clone(&layers), Arc::clone(&storage)));
+        let values = Arc::new(Values::new(Arc::clone(&storage)));
 
         let engine = Arc::new(DerivationEngine::new(
             Arc::clone(&storage),
@@ -95,6 +101,7 @@ impl Registry {
             defs,
             engine,
             frontier,
+            values,
         };
         registry
             .rebuild_caches(&known, index.as_ref(), &touches)

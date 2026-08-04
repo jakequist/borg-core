@@ -58,7 +58,11 @@ borg — an event-sourced data backend
 Cells are written Struct:pid.field, Struct:pid, Element[]:pid or Element[]:pid[n], where a pid
 looks like o-1234abcd and names the whole identity. Struct#100 is accepted on input as a
 shorthand for counter 100 on the root branch; what borg prints is always the canonical form.
-Values are 42, 1.5, true, false, ~ (tombstone) or @o-1234abcd (a reference).
+
+Values are 42, 1.5, true, false, ~ (tombstone), @o-1234abcd (a reference), 0xdeadbeef (binary),
+-129n (a bigint), and anything else is a string. Strings, binary and bigints are interned by
+content, which borg does for you — you write the text and read the text back. Note the corollary:
+the forms above win, so a string field cannot yet hold the text `true` or `42`.
 
 Options:
   --store <path>   store file (default ./borg.db)
@@ -178,7 +182,12 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
+    // A string, blob or bigint is content-addressed and has no identity until the store has seen it
+    // (§3.1). Interning here, rather than asking the caller to do it, is what makes `borg set
+    // Company#1.website acme.ai` the whole story — there is no PID to create first and none to
+    // quote back (§3.4).
     let value = parse::value(value, allocation_branch(&registry)?, ALLOCATOR)?;
+    let value = registry.values.intern(value).await?;
 
     let mut layer = registry
         .layers
@@ -264,9 +273,17 @@ async fn get(args: &Args, cell: &str) -> Result<()> {
         )
         .await?;
 
+    // Interned content reads back as content, so a string field prints `acme.ai` rather than the
+    // `@s-…` that is physically stored (§3.4). What `borg get --value` prints is what `borg set`
+    // accepts, which is the property a shell pipeline actually relies on.
+    let rendered = match &resolved.value {
+        Some(value) => Some(registry.values.render(value).await?),
+        None => None,
+    };
+
     if args.value_only {
-        if let Some(value) = &resolved.value {
-            println!("{}", parse::render(value));
+        if let Some(value) = rendered {
+            println!("{value}");
         }
         return Ok(());
     }
@@ -274,11 +291,17 @@ async fn get(args: &Args, cell: &str) -> Result<()> {
     println!("{cell}");
     println!(
         "  value:       {}",
-        resolved
-            .value
-            .as_ref()
-            .map_or_else(|| "<absent>".into(), parse::render)
+        rendered.as_deref().unwrap_or("<absent>")
     );
+    // Shown only when there is one: it is the proof that equal content is stored once, registry-wide
+    // and branch-independently (§3.1), and there is nothing to show for a primitive.
+    if let Some(pid) = resolved
+        .value
+        .as_ref()
+        .and_then(|v| registry.values.content_pid(v))
+    {
+        println!("  interned:    @{pid}");
+    }
     println!(
         "  origin:      {}",
         match resolved.origin {

@@ -196,14 +196,21 @@ impl ExecutionProvider for ProcessExecutor {
         // through `ctx`, so dependency capture is exactly as automatic here as it is in-process.
         loop {
             match worker.receive()? {
+                // Text in both directions, and interning is the engine's business, not the
+                // worker's: a string cell answers with `acme.ai` rather than `@s-1a2b3c` plus a
+                // round trip to resolve it, and a worker writing `acme.ai` is finished (§3.4).
                 FromWorker::Get(cell) => {
                     let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
-                    let value = ctx.get(&cell).await?;
-                    worker.send(&ToWorker::Value(value.as_ref().map(parse::render)))?;
+                    let text = match ctx.get(&cell).await? {
+                        Some(value) => Some(ctx.render(&value).await?),
+                        None => None,
+                    };
+                    worker.send(&ToWorker::Value(text))?;
                 }
                 FromWorker::Set { cell, value } => {
                     let cell = parse::cell_ref(&cell, self.branch, AllocatorId(0))?;
-                    let value = parse::value(&value, self.branch, AllocatorId(0))?;
+                    let input = parse::value(&value, self.branch, AllocatorId(0))?;
+                    let value = ctx.intern(input).await?;
                     ctx.set(&cell, value).await?;
                     worker.send(&ToWorker::Ok {})?;
                 }

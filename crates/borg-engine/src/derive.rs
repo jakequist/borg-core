@@ -11,11 +11,12 @@ use crate::index::{DependencyIndexProvider, Invocation};
 use crate::log::{LayerHandle, LayerManager};
 use crate::resolve::FrontierTracker;
 use crate::seams::WorkGap;
+use crate::values::Values;
 use async_trait::async_trait;
 use borg_core::{
     BorgError, BranchId, CellAt, CellRecord, CellRef, ClientVersion, Derivation, LayerAuthor,
     LayerId, LayerKind, Origin, Pid, ProducerDef, ProducerId, ProducerKind, ReadPath, Result,
-    Value,
+    Value, ValueInput,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_storage::StorageProvider;
@@ -33,6 +34,9 @@ const CYCLE_RERUN_LIMIT: u32 = 8;
 /// there is nothing for a producer author to declare or mis-declare (SPEC.md §9.4).
 struct RecordingCtx<'a> {
     storage: &'a dyn StorageProvider,
+    /// Interning and content resolution, shared with every other surface that accepts or emits
+    /// value text — see `crate::values` for why they are one implementation and not two.
+    values: &'a Values,
     index: &'a dyn DependencyIndexProvider,
     branch: BranchId,
     /// This round's ancestry, resolved once rather than per read.
@@ -102,6 +106,14 @@ impl ProducerCtx for RecordingCtx<'_> {
         };
         self.layer.put(cell, record).await
     }
+
+    async fn intern(&mut self, input: ValueInput) -> Result<Value> {
+        self.values.intern(input).await
+    }
+
+    async fn render(&mut self, value: &Value) -> Result<String> {
+        self.values.render(value).await
+    }
 }
 
 /// Drives the cycle. SPEC.md §16.
@@ -113,6 +125,7 @@ pub struct DerivationEngine {
     frontier: Arc<FrontierTracker>,
     defs: Arc<crate::defs::DefRegistry>,
     branches: Arc<crate::branch::BranchManager>,
+    values: Values,
     producers: Mutex<HashMap<ProducerId, ProducerDef>>,
     /// Producers poisoned by a runtime failure. Scoped to the producer, never the branch — which is
     /// why main never breaks because someone merged a bad pipeline (SPEC.md §14).
@@ -130,6 +143,9 @@ impl DerivationEngine {
         branches: Arc<crate::branch::BranchManager>,
     ) -> Self {
         Self {
+            // Built here rather than passed in: `Values` is a pure function of the store, and the
+            // engine already holds it. One type, not one instance — there is no state to share.
+            values: Values::new(Arc::clone(&storage)),
             storage,
             layers,
             index,
@@ -377,6 +393,7 @@ impl DerivationEngine {
         };
         let mut ctx = RecordingCtx {
             storage: self.storage.as_ref(),
+            values: &self.values,
             index: self.index.as_ref(),
             branch,
             // This round's ceiling — the source layer plus every derived layer already committed as

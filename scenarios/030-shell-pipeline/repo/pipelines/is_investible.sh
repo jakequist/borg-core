@@ -50,13 +50,26 @@ while IFS= read -r msg; do
     company="$(jq -r '.invoke.input' <<<"$msg")"
 
     score=0
+
+    # A string arrives as its content — `acme.ai`, not `@s-1a2b3c`. Strings are content-addressed
+    # and interned (§3.1), but that is the engine's business: this script never sees a PID, never
+    # asks a second time to resolve one, and would work identically if interning did not exist.
     get "$company.website"
     website="$CELL"
-    if [ -n "$website" ] && [ "$website" -gt 3 ]; then
-        score=$((score + 6))
+    case "$website" in
+        *.ai) score=$((score + 6)) ;;
+    esac
+
+    # …and a number arrives as a number. One text form, several types behind it.
+    get "$company.headcount"
+    headcount="$CELL"
+    if [ -n "$headcount" ] && [ "$headcount" -gt 10 ]; then
+        score=$((score + 2))
     fi
 
-    if [ "$score" -gt 5 ]; then investible=true; else investible=false; fi
+    # Deliberately needs both: either field moving can flip the answer, which is what makes
+    # field-granular invalidation worth demonstrating.
+    if [ "$score" -ge 7 ]; then investible=true; else investible=false; fi
     set_cell "$company.is_investible" "$investible"
 
     say '{"done":{}}'

@@ -17,14 +17,20 @@ pub type FieldName = Arc<str>;
 
 /// Identifies a buffer — a partition of cells. SPEC.md §4.2.
 ///
-/// **One buffer per def.** Values with no def — interned and untyped ones — get exactly one buffer
-/// each. Partitioning this finely is what makes horizontal scaling possible later, and it matches
-/// the real access pattern: producers read specific fields and hop, rather than materializing whole
-/// objects.
+/// **One buffer per def.** Values with no def — untyped ones — get exactly one buffer each.
+/// Partitioning this finely is what makes horizontal scaling possible later, and it matches the real
+/// access pattern: producers read specific fields and hop, rather than materializing whole objects.
 ///
 /// This is a *logical* partition key, not a placement decision. A placement policy is free to
 /// co-locate all of a struct's field buffers on one node; keeping the two separate preserves that
 /// option.
+///
+/// **The interning buffers are deliberately absent.** §4.2 calls `StringBuffer`, `BinaryBuffer` and
+/// `BigIntBuffer` buffers, but they hold *values, not cells*: an interned value has no version, no
+/// origin and no writing layer, so a `CellRecord`'s fields are all meaningless for it and there is
+/// no cell for a `BufferId` to partition. They are reached through `intern` / `read_interned`
+/// (§17.1), which need no buffer argument because a PID already carries its kind (§3.1). Naming
+/// them here would promise a cell partition that cannot exist.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BufferId {
     /// One per `ObjectDef`. Holds existence cells — and so *is* the set of instances of one struct,
@@ -35,11 +41,9 @@ pub enum BufferId {
     /// One per `ListDef`.
     List(ObjectTypeName),
     ListElem(ObjectTypeName),
-    /// Singular by necessity — registry-wide deduplication is the whole purpose of interning.
-    String,
-    Binary,
-    BigInt,
-    /// Singular because untyped values have no def to partition by.
+    /// Singular because untyped values have no def to partition by. Unlike the interning buffers,
+    /// these are genuine cell partitions: an `Any` container is mutable, so its contents are cells
+    /// with versions and origins like any other.
     AnyObject,
     AnyArray,
 }
@@ -125,6 +129,22 @@ impl CellRef {
     }
 }
 
+impl BufferId {
+    /// The name this buffer wears in a cell address, and whether that name takes `[]`.
+    ///
+    /// The untyped buffers have no def and therefore no name of their own, so they borrow `Any`.
+    /// Nothing is lost: their PID kind (`j`, `y`) is what tells them apart on the way back in, which
+    /// is the same rule §4.2 relies on to dispatch without a schema lookup.
+    pub(crate) fn address(&self) -> (&str, bool) {
+        match self {
+            BufferId::Object(name) | BufferId::ObjectProp(name, _) => (name, false),
+            BufferId::List(name) | BufferId::ListElem(name) => (name, true),
+            BufferId::AnyObject => ("Any", false),
+            BufferId::AnyArray => ("Any", true),
+        }
+    }
+}
+
 impl fmt::Debug for BufferId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -132,9 +152,6 @@ impl fmt::Debug for BufferId {
             BufferId::ObjectProp(name, field) => write!(f, "{name}.{field}"),
             BufferId::List(name) => write!(f, "List<{name}>"),
             BufferId::ListElem(name) => write!(f, "List<{name}>[]"),
-            BufferId::String => f.write_str("String"),
-            BufferId::Binary => f.write_str("Binary"),
-            BufferId::BigInt => f.write_str("BigInt"),
             BufferId::AnyObject => f.write_str("AnyObject"),
             BufferId::AnyArray => f.write_str("AnyArray"),
         }
@@ -154,6 +171,8 @@ impl fmt::Debug for CellRef {
 /// Company:o-1234abcd.website    a property cell
 /// Founder[]:l-5678wxyz          a list's own cell — its length
 /// Founder[]:l-5678wxyz[0]       a list element
+/// Any:j-9abcdef0                an untyped object
+/// Any[]:y-9abcdef0[0]           an untyped array's element
 /// ```
 ///
 /// This exists because of shell pipelines. A worker speaking the wire protocol has to name cells,
@@ -168,19 +187,25 @@ impl fmt::Debug for CellRef {
 /// The id after the colon is the whole PID (see [`Pid`]'s `Display`), so a rendered address names
 /// exactly one cell on exactly one branch. `borg_core::parse::cell_ref` also accepts the older
 /// `Company#100` shorthand **on input**; nothing renders it.
+/// Composed rather than matched pairwise, so that **every** buffer renders as an address a human can
+/// paste back. A `{:?}` fallthrough for the combinations the constructors never build would leak a
+/// second, unparseable dialect into exactly the places — panics, lineage output, error messages —
+/// where a readable address matters most.
 impl fmt::Display for CellRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.buffer, &self.key) {
-            (BufferId::Object(name), CellKey::Pid(pid)) => write!(f, "{name}:{pid}"),
-            (BufferId::ObjectProp(name, field), CellKey::Pid(pid)) => {
-                write!(f, "{name}:{pid}.{field}")
-            }
-            (BufferId::List(elem), CellKey::Pid(pid)) => write!(f, "{elem}[]:{pid}"),
-            (BufferId::ListElem(elem), CellKey::Elem(pid, i)) => {
-                write!(f, "{elem}[]:{pid}[{i}]")
-            }
-            (buffer, key) => write!(f, "{buffer:?}/{key:?}"),
+        let (name, list) = self.buffer.address();
+        f.write_str(name)?;
+        if list {
+            f.write_str("[]")?;
         }
+        write!(f, ":{}", self.pid())?;
+        if let CellKey::Elem(_, index) = self.key {
+            write!(f, "[{index}]")?;
+        }
+        if let BufferId::ObjectProp(_, field) = &self.buffer {
+            write!(f, ".{field}")?;
+        }
+        Ok(())
     }
 }
 

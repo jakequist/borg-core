@@ -14,8 +14,14 @@
 //!
 //! ## Cells and values travel as text
 //!
-//! A cell is `"Company:o-1234abcd.website"` and a value is `"9"`, `"true"`, `"@o-5678wxyz"` or
-//! `"~"` — exactly the forms the CLI accepts, parsed and rendered by `borg_core::parse`.
+//! A cell is `"Company:o-1234abcd.website"` and a value is `"9"`, `"true"`, `"@o-5678wxyz"`, `"~"`
+//! or `"acme.ai"` — exactly the forms the CLI accepts, parsed and rendered by `borg_core::parse`.
+//!
+//! **A string is a string here.** `Get` on a string cell answers `{"value":"acme.ai"}`, not the
+//! `@s-…` that is physically stored, and `Set` with `"acme.ai"` is complete — the engine interns it
+//! before the write lands (SPEC.md §3.4). A worker never makes a second round trip to resolve or
+//! create a string, and never learns that content addressing exists. Doing otherwise would put an
+//! extra round trip on the hottest path in the protocol in exchange for exposing a storage detail.
 //!
 //! The cell form uses a colon rather than parentheses because a worker is expected to be a shell
 //! script: `Company(o-1234abcd)` would need quoting everywhere it appeared, and a form that needs

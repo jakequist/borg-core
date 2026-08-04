@@ -6,14 +6,15 @@ source "$HERE/../lib.sh"
 setup
 
 borg repo push "$HERE"/../030-shell-pipeline/repo
-borg set 'Company#1.website' 9
+borg set 'Company#1.website' acme.ai
+borg set 'Company#1.headcount' 40
 borg derive
 
 assert_eq "$(borg get 'Company#1.is_investible' --value)" "true" "derived once caught up"
 assert_field "$(borg get 'Company#1.is_investible')" "state" "current" "and reported as current"
 
 # Now change an input and deliberately do NOT derive.
-borg set 'Company#1.website' 1
+borg set 'Company#1.headcount' 3
 
 out="$(borg get 'Company#1.is_investible')"
 assert_field "$out" "state" "stale" \

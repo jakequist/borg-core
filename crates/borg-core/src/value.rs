@@ -3,7 +3,7 @@
 //! A cell holds either an inline primitive or a PID. Primitives have no PID because the identifier
 //! would cost more than the payload; everything else is referenced by PID and lives in a buffer.
 
-use crate::pid::Pid;
+use crate::pid::{Pid, PidKind};
 use serde::{Deserialize, Serialize};
 
 /// What a cell can hold.
@@ -40,6 +40,54 @@ impl Value {
 
     pub const fn is_tombstone(&self) -> bool {
         matches!(self, Value::Tombstone)
+    }
+}
+
+/// A value on its way in, before the store has seen it. SPEC.md §3.1, §3.4.
+///
+/// `String`, `Binary` and `BigInt` are content-addressed: their PID *is* the hash of their content,
+/// so text cannot become a [`Value`] without a store to intern into. Parsing therefore stops one
+/// step short and hands back this; the engine turns it into a `Value`.
+///
+/// **This is why interning is invisible to clients.** A worker or a CLI user writes the text of a
+/// string and is done — it never learns that a PID was allocated, never makes a second round trip to
+/// create one, and never sees `@s-…` come back. Interning is a runtime concern in exactly the way
+/// batching is.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ValueInput {
+    /// Already a value: a primitive, a reference, or a tombstone.
+    Immediate(Value),
+    /// Content that must be interned before it can be stored.
+    Content { kind: PidKind, bytes: Vec<u8> },
+}
+
+impl ValueInput {
+    pub fn string(text: &str) -> Self {
+        Self::Content {
+            kind: PidKind::String,
+            bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    pub const fn binary(bytes: Vec<u8>) -> Self {
+        Self::Content {
+            kind: PidKind::Binary,
+            bytes,
+        }
+    }
+
+    /// The value, when this needed no interning.
+    pub const fn immediate(&self) -> Option<Value> {
+        match self {
+            Self::Immediate(value) => Some(*value),
+            Self::Content { .. } => None,
+        }
+    }
+}
+
+impl From<Value> for ValueInput {
+    fn from(value: Value) -> Self {
+        Self::Immediate(value)
     }
 }
 

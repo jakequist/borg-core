@@ -6,16 +6,18 @@ setup
 
 # A cell is addressed as Struct:pid.field. `Company#100` is a documented input shorthand meaning
 # "the root branch, allocator 0, counter 100" — convenient to type, and never printed back.
-borg set 'Company#100.website' 9
+# A bare word is a string. Strings are content-addressed and interned (§3.1), which borg does for
+# you: what you write is what you read back, and no PID is ever handed to you.
+borg set 'Company#100.website' acme.ai
 
-assert_eq "$(borg get 'Company#100.website' --value)" "9" \
+assert_eq "$(borg get 'Company#100.website' --value)" "acme.ai" \
     "a value written is a value read"
 
 # What comes back names the whole PID: kind, branch, allocator and counter. The shorthand carried
 # only the counter, so it meant a different object depending on what you assumed.
 canonical="$(borg get 'Company#100.website' | head -1)"
 assert_contains "$canonical" "Company:o-" "a cell reads back canonically, not in the shorthand"
-assert_eq "$(borg get "$canonical" --value)" "9" \
+assert_eq "$(borg get "$canonical" --value)" "acme.ai" \
     "and the canonical address is itself a cell address you can read"
 
 # Reads never return a bare value. Source data is ground truth, so it is always current.

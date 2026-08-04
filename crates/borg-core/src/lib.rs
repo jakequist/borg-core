@@ -5,6 +5,7 @@
 //!
 //! See `SPEC.md` at the repository root — every type here cites the section it implements.
 
+pub mod bigint;
 pub mod cell;
 pub mod content;
 pub mod def;
@@ -24,4 +25,4 @@ pub use ids::{AllocatorId, BranchId, ClientVersion, LayerId, ProducerId, RepoId}
 pub use layer::{Branch, Guard, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
 pub use parse::ParseError;
 pub use pid::{Pid, PidAllocator, PidKind};
-pub use value::{ObjectTypeName, Value, ValueType};
+pub use value::{ObjectTypeName, Value, ValueInput, ValueType};

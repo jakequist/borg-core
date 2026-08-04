@@ -8,7 +8,7 @@
 //! equally satisfiable by an in-process call and by a socket round-trip to a container.
 
 use async_trait::async_trait;
-use borg_core::{CellRef, ClientVersion, Pid, ProducerId, Result, Value};
+use borg_core::{CellRef, ClientVersion, Pid, ProducerId, Result, Value, ValueInput};
 
 /// Which producer to run, and the def-view its code was authored against.
 ///
@@ -43,6 +43,24 @@ pub trait ProducerCtx: Send {
     /// Write a cell. Checked against field ownership: every field has exactly one writer, and a
     /// violation poisons this producer rather than the branch (SPEC.md §8, §14).
     async fn set(&mut self, cell: &CellRef, value: Value) -> Result<()>;
+
+    /// Turn a parsed value into a storable one, interning `String`, `Binary` and `BigInt` content.
+    ///
+    /// Mediated for the same reason cell access is: a producer runtime holds no store handle, and
+    /// content-addressed values have no identity until a store has seen them (SPEC.md §3.1). A
+    /// runtime that reached around this to intern for itself would be a second writer into the
+    /// store, which is precisely what the `ExecutionProvider` contract exists to prevent.
+    ///
+    /// **Not recorded as a dependency.** Interning is unscoped — no branch, no layer, no version
+    /// (§17.1) — so there is nothing here that could later change and invalidate anything.
+    async fn intern(&mut self, input: ValueInput) -> Result<Value>;
+
+    /// Render a value as the text a worker reads, resolving interned content back to its bytes.
+    ///
+    /// This is what makes interning invisible to producers (§3.4): a pipeline asking for
+    /// `company.website` is handed `acme.ai`, never `@s-1a2b3c` plus a second round trip to resolve
+    /// it. Nothing above this line needs to know that strings are content-addressed at all.
+    async fn render(&mut self, value: &Value) -> Result<String>;
 }
 
 #[async_trait]

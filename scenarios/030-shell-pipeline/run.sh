@@ -9,8 +9,12 @@ borg repo push "$HERE"/../030-shell-pipeline/repo
 assert_contains "$(borg producer list)" "invest" \
     "the script described itself, and the server recorded a producer definition"
 
-borg set 'Company#1.website' 9
-borg set 'Company#2.website' 1
+# The spec's own motivating example: `company.website.ends_with('.ai')`, plus a headcount threshold.
+# The script reads a string and a number, and never learns that one of them is interned.
+borg set 'Company#1.website' acme.ai
+borg set 'Company#1.headcount' 40
+borg set 'Company#2.website' example.com
+borg set 'Company#2.headcount' 40
 borg derive
 
 assert_eq "$(borg get 'Company#1.is_investible' --value)" "true" \
@@ -27,11 +31,16 @@ website="$(borg get 'Company#1.website' | head -1)"
 assert_contains "$(borg explain 'Company#1.is_investible')" "$website" \
     "lineage shows what the script actually read, without it declaring anything"
 
-# The invalidation story, end to end through a subprocess.
-borg set 'Company#2.website' 99
+# The invalidation story, end to end through a subprocess — driven by the *string* field.
+borg set 'Company#2.website' rival.ai
 assert_eq "$(borg derive --count)" "1" \
     "changing one input re-runs exactly one invocation"
 assert_eq "$(borg get 'Company#2.is_investible' --value)" "true" "and the output follows"
+
+# The numeric field it also reads, to show the two are tracked alike.
+borg set 'Company#2.headcount' 3
+assert_eq "$(borg derive --count)" "1" "the number it read is a tracked dependency too"
+assert_eq "$(borg get 'Company#2.is_investible' --value)" "false" "and it flips the answer back"
 
 borg set 'Company#1.employees' 40
 assert_eq "$(borg derive --count)" "0" \
