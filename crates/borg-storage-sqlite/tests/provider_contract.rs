@@ -8,7 +8,7 @@
 //! than of the interface.
 
 use borg_core::{
-    BranchId, BufferId, CellKey, CellRef, ClientVersion, DefEvent, EventDraft, EventId, LayerId,
+    BranchId, BufferId, CellKey, CellRef, DefEvent, DefVersion, EventDraft, EventId, LayerId,
     Origin, Pid, PidKind, ReadPath, RepoId, Result, Value, ValueType,
 };
 use borg_storage::{MemoryStorage, StorageProvider};
@@ -17,8 +17,8 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 
 const MAIN: BranchId = BranchId(1);
-const V1: ClientVersion = ClientVersion(LayerId(1));
-const V9: ClientVersion = ClientVersion(LayerId(9));
+const V1: DefVersion = DefVersion(LayerId(1));
+const V9: DefVersion = DefVersion(LayerId(9));
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -49,7 +49,7 @@ fn prop(n: u64, field: &str) -> CellRef {
 }
 
 /// An event before the log gives it one — no id, and no layer, which is the whole point (§4.3).
-fn draft(value: Value, version: ClientVersion) -> EventDraft {
+fn draft(value: Value, version: DefVersion) -> EventDraft {
     EventDraft {
         value,
         version,

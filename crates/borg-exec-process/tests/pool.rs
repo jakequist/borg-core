@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use borg_core::{
-    BranchId, CellRef, ClientVersion, LayerId, Pid, PidKind, ProducerId, Result, Value,
+    BranchId, CellRef, ClientVersion, DefVersion, LayerId, Pid, PidKind, ProducerId, Result, Value,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_exec_process::ProcessExecutor;
@@ -59,7 +59,7 @@ impl ProducerCtx for Silent {
     async fn get(&mut self, _cell: &CellRef) -> Result<Option<Value>> {
         Ok(None)
     }
-    async fn get_at(&mut self, _cell: &CellRef, _version: ClientVersion) -> Result<Option<Value>> {
+    async fn get_at(&mut self, _cell: &CellRef, _version: DefVersion) -> Result<Option<Value>> {
         Ok(None)
     }
     async fn get_input(&mut self, _cell: &CellRef) -> Result<Option<Value>> {

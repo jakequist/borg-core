@@ -5,8 +5,8 @@
 //! *what a write is allowed to be*, which is why they are all phrased as one.
 
 use borg_core::{
-    BorgError, BranchId, BufferId, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId,
-    Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    BorgError, BranchId, BufferId, CellRef, ClientVersion, DefEvent, DefVersion, LayerAuthor,
+    LayerId, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
     ValueType, WriteRejection, Writer,
 };
 use borg_engine::{
@@ -23,6 +23,10 @@ const INVEST: ProducerId = ProducerId(1);
 const OTHER: ProducerId = ProducerId(2);
 /// Every actor in these tests is authored against the store's initial def-view (SPEC.md §5.4).
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 
 fn company(n: u64) -> Pid {
     Pid::Allocated {
@@ -304,7 +308,7 @@ async fn a_string_field_holds_the_text_of_a_form_that_used_to_win() -> Result<()
         let stored = h
             .layers
             .storage()
-            .get_cell(&path, &cell, V1)
+            .get_cell(&path, &cell, AT_V1)
             .await?
             .expect("just written")
             .event;
@@ -378,7 +382,7 @@ async fn an_old_client_goes_on_writing_the_shape_its_own_def_view_declares() -> 
         .get_cell(
             &h.layers.read_path(h.branch, None)?,
             &prop(company(1), "headcount"),
-            V1,
+            AT_V1,
         )
         .await?
         .expect("just written")

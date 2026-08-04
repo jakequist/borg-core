@@ -1,0 +1,9 @@
+# One pipeline, one input, one output. The smallest thing that can have a dependency at all — the
+# scenario is about whether that dependency survives an unrelated schema change, so anything more
+# would only add places for it to fail for a different reason.
+[repo]
+id = 1
+name = "atlas"
+
+[[pipelines]]
+command = "pipelines/score.sh"

@@ -26,10 +26,17 @@
 //! on the branch**, and asks each a different question (§5.4, §8.0).
 //!
 //! *Shape* — is the struct declared, is the field declared, does the value fit — is asked of the
-//! writer's own view. Writes are stored at their author's ClientVersion and never coerced, so a
-//! client authored before a schema change goes on writing the old shape, and a `down` migration's
-//! entire output is old-shaped by construction (§9.3). Checking either against the branch's current
-//! view would reject exactly the writes that backwards compatibility consists of.
+//! writer's own view. Writes are never coerced, so a client authored before a schema change goes on
+//! writing the old shape, and a `down` migration's entire output is old-shaped by construction
+//! (§9.3). Checking either against the branch's current view would reject exactly the writes that
+//! backwards compatibility consists of.
+//!
+//! **That same view also decides where the record is keyed.** A cell is stored at the *def-version
+//! of its field* — `DefView::version_of`, asked of the writer's own view — and not at the writer's
+//! whole-schema ClientVersion (§5.3, §5.4). The two coincide only when every def push touches every
+//! field: key by the second and declaring an unrelated field moves every write after it to a
+//! version no reader looks for and no migration leads to, which hides the data and severs every
+//! dependency recorded against it.
 //!
 //! *Permission* — may this writer write this field at all — is asked of the branch. Ownership is a
 //! fact about the schema as it stands, and the migration exemption especially so: the declaration
@@ -70,7 +77,6 @@ pub struct WriteSession {
     /// The ancestry this session's *data* reads resolve through, bounded by the round's ceiling
     /// where there is one.
     path: ReadPath,
-    version: ClientVersion,
     writer: Writer,
     handle: LayerHandle,
     /// Existence cells this session has already written, so the implied-existence write below
@@ -109,7 +115,6 @@ impl WriteSession {
             defs: view,
             authority,
             path,
-            version,
             writer,
             handle,
             touched: HashSet::new(),
@@ -120,6 +125,15 @@ impl WriteSession {
     /// anyone knows whether the session will commit or abort (SPEC.md §7.3).
     pub const fn layer(&self) -> LayerId {
         self.handle.id()
+    }
+
+    /// The writer's own def-view — the schema its code was authored against.
+    ///
+    /// Exposed for one reason: a producer's *reads* must resolve at the same def-versions its
+    /// *writes* are keyed at, and the session is where that view already lives. Handing out the
+    /// view rather than folding a second one is what makes the two impossible to disagree.
+    pub const fn defs(&self) -> &DefView {
+        &self.defs
     }
 
     /// Make this layer contingent on a condition, validated at seal (SPEC.md §12).
@@ -191,7 +205,7 @@ impl WriteSession {
         // the one fact a writer must not be able to assert about itself (§4.3).
         let draft = EventDraft {
             value,
-            version: self.version,
+            version: self.defs.version_of(cell),
             origin: self.writer.origin(),
             derivation,
         };
@@ -248,9 +262,14 @@ impl WriteSession {
         if !self.touched.insert(existence.clone()) || existence == *cell {
             return Ok(());
         }
+        // Unversioned, both to probe and to write. An existence cell has no `FieldDef` and so no
+        // def-version (§5.2); versioning it by the writer's schema view would make every def push
+        // look like a fresh entity to every producer mapping over the buffer, and re-derive the
+        // world on a declaration that said nothing about it.
+        let version = self.defs.version_of(&existence);
         if self
             .storage
-            .get_cell(&self.path, &existence, self.version)
+            .get_cell(&self.path, &existence, version)
             .await?
             .is_some()
         {
@@ -258,7 +277,7 @@ impl WriteSession {
         }
         let draft = EventDraft {
             value: Value::Bool(true),
-            version: self.version,
+            version,
             origin: self.writer.origin(),
             derivation: None,
         };

@@ -11,9 +11,9 @@
 //! tracking either survives this or the design does not work.
 
 use borg_core::{
-    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, LayerAuthor, LayerId,
-    ObjectTypeName, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result,
-    Value, ValueType, Writer,
+    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, DefEvent, DefVersion, Event,
+    LayerAuthor, LayerId, ObjectTypeName, Ownership, Pid, PidKind, ProducerDef, ProducerId,
+    ProducerKind, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -26,6 +26,10 @@ use std::sync::Arc;
 
 const SCORE: ProducerId = ProducerId(1);
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 
 fn obj(kind: PidKind, n: u64) -> Pid {
     Pid::Allocated {
@@ -207,7 +211,7 @@ impl Harness {
         let path = self.branches.read_path(self.branch, None)?;
         Ok(self
             .storage
-            .get_cell(&path, cell, V1)
+            .get_cell(&path, cell, AT_V1)
             .await?
             .map(|found| found.event))
     }

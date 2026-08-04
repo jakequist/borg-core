@@ -9,10 +9,10 @@
 
 use crate::log::LayerManager;
 use borg_core::{
-    BorgError, BranchId, BufferId, CellRef, ClientVersion, DefEvent, FieldDef, FieldName,
-    LayerAuthor, LayerId, LayerKind, MigrationDirection, ObjectDef, ObjectTypeName, Ownership,
-    ProducerDef, ProducerId, ProducerKind, ReadPath, Result, Value, ValueType, WriteRejection,
-    Writer,
+    BorgError, BranchId, BufferId, CellRef, ClientVersion, DefEvent, DefVersion, FieldDef,
+    FieldName, LayerAuthor, LayerId, LayerKind, MigrationDirection, ObjectDef, ObjectTypeName,
+    Ownership, ProducerDef, ProducerId, ProducerKind, ReadPath, Result, Value, ValueType,
+    WriteRejection, Writer,
 };
 use borg_storage::StorageProvider;
 use std::collections::BTreeMap;
@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 /// One step in a field's def-version chain, and the migrations that bridge it.
 #[derive(Clone, Copy, Debug)]
 pub struct VersionStep {
-    pub from: ClientVersion,
-    pub to: ClientVersion,
+    pub from: DefVersion,
+    pub to: DefVersion,
     /// Carries values forward. Required for a shape-changing def-mutation (SPEC.md §6.1).
     pub up: ProducerId,
     /// Carries values back, so clients on older versions keep reading. v1 trusts these
@@ -36,8 +36,8 @@ pub struct VersionStep {
 pub struct MigrationHop {
     pub producer: ProducerId,
     pub direction: MigrationDirection,
-    pub from: ClientVersion,
-    pub to: ClientVersion,
+    pub from: DefVersion,
+    pub to: DefVersion,
 }
 
 /// One migration's place in a field's version chain, resolved from the definitions in force rather
@@ -49,10 +49,11 @@ pub struct MigrationHop {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MigrationRole {
     /// The def-version it reads its input at — the older version for `up`, the newer for `down`.
-    pub input: ClientVersion,
-    /// The def-version it writes, which is also its own ClientVersion: a migration is the lens for
-    /// the version it produces, and sees the rest of the world the way a client on that version does.
-    pub output: ClientVersion,
+    pub input: DefVersion,
+    /// The def-version it writes. It is also what its ClientVersion is folded to: a migration is
+    /// the lens for the version it produces, and sees the rest of the world the way a client on
+    /// that version does (§5.4).
+    pub output: DefVersion,
     /// Both halves of this step. Neither triggers the other — `up` and `down` are two projections of
     /// one value, not two producers disturbing each other's inputs (SPEC.md §9.3).
     pub step: Vec<ProducerId>,
@@ -81,6 +82,27 @@ impl DefView {
             return None;
         };
         self.objects.get(struct_name)?.fields.get(field)
+    }
+
+    /// **The def-version of a cell, as this view names it.** SPEC.md §5.3.
+    ///
+    /// This is the one bridge from a whole-schema view to a per-definition version, and the only
+    /// way a `DefVersion` is ever obtained. Every stored record is keyed by it, so an actor writes
+    /// and reads a field at whatever version *its own* def-view puts that field at — which is why a
+    /// def push touching some other field moves nothing here, and why a migration, whose view is
+    /// folded to the version it produces, keys its output exactly where the chain says it should
+    /// (§9.3).
+    ///
+    /// Cells with no definition are [`DefVersion::UNVERSIONED`]: an existence cell, a list, an
+    /// untyped container. Nothing about their shape can change, so they sit on no chain and must
+    /// stay findable across every def push.
+    ///
+    /// An **undeclared** field is unversioned too. The write path rejects it a moment later by name
+    /// (§8.0), and a rejected write must fail as a schema problem rather than as an unanswerable
+    /// question about a version.
+    pub fn version_of(&self, cell: &CellRef) -> DefVersion {
+        self.field(cell)
+            .map_or(DefVersion::UNVERSIONED, |def| DefVersion(def.version))
     }
 
     /// Where a migration sits in its field's version chain. SPEC.md §5.3, §9.3.
@@ -325,7 +347,7 @@ impl DefView {
                         field: field.to_string(),
                     });
                 }
-                let from = ClientVersion(existing.version);
+                let from = DefVersion(existing.version);
                 existing.ty = ty.clone();
                 existing.version = at;
                 self.chains
@@ -333,7 +355,7 @@ impl DefView {
                     .or_default()
                     .push(VersionStep {
                         from,
-                        to: ClientVersion(at),
+                        to: DefVersion(at),
                         up: *up,
                         down: *down,
                     });
@@ -384,8 +406,8 @@ impl DefView {
     pub fn path(
         &self,
         buffer: &BufferId,
-        from: ClientVersion,
-        to: ClientVersion,
+        from: DefVersion,
+        to: DefVersion,
     ) -> Option<Vec<MigrationHop>> {
         let BufferId::ObjectProp(struct_name, field) = buffer else {
             return (from == to).then(Vec::new);

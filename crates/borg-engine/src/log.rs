@@ -217,13 +217,10 @@ impl LayerManager {
             let since = since.unwrap_or(guard.since);
             for cell in &guard.cells {
                 // Guarding derived data would be checking a shadow: its value is a function of
-                // source data with a lag (SPEC.md §12).
-                let derived = self
-                    .storage
-                    .get_cell(&path, cell, borg_core::ClientVersion(LayerId(0)))
-                    .await?
-                    .is_some_and(|found| found.event.origin == Origin::Derived);
-                if derived || self.is_derived_anywhere(&path, cell).await? {
+                // source data with a lag (SPEC.md §12). Asked of every version this cell is
+                // materialized at, because the guard names a `CellRef` and derivedness is a fact
+                // about the field, not about one version of it.
+                if self.is_derived_anywhere(&path, cell).await? {
                     return Err(BorgError::GuardOnDerivedCell { cell: cell.clone() });
                 }
                 if let Some(mutated_at) = self.touches.touched_since(&path, cell, since)? {

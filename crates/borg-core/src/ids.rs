@@ -12,9 +12,9 @@ pub struct BranchId(pub u64);
 
 /// Identifies a layer. Registry-unique, not per-branch. SPEC.md §6.2.
 ///
-/// A `LayerId` also serves as a def-version and as a `ClientVersion`: a def-version *is* the
-/// def-layer that last mutated that definition, so no separate versioning scheme exists
-/// (SPEC.md §5.3, §5.4).
+/// A `LayerId` also underlies both version types below: a def-version *is* the def-layer that last
+/// mutated that definition, and a ClientVersion *is* the def-layer a view was folded to, so no
+/// separate versioning scheme exists (SPEC.md §5.3, §5.4).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LayerId(pub u64);
 
@@ -26,13 +26,45 @@ pub struct LayerId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventId(pub u64);
 
-/// The def-view an actor's code was authored against. SPEC.md §5.4.
+/// The def-view an actor's code was authored against — a **whole-schema** position. SPEC.md §5.4.
 ///
 /// A distinct type from [`LayerId`] despite the identical representation, because conflating "which
 /// layer am I reading at" with "which schema am I reading through" is the single easiest mistake to
 /// make in this system. They vary independently.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ClientVersion(pub LayerId);
+
+/// The version of **one definition**: the def-layer that last mutated it. SPEC.md §5.3.
+///
+/// ## Why this is not a `ClientVersion`
+///
+/// The two are both def-layer ids and they are not the same thing. A ClientVersion is a *whole
+/// schema* — every definition as one actor sees them — and it advances on every def push. A
+/// def-version belongs to one field, and advances only when that field is mutated. They coincide
+/// exactly when every push touches every field, which is to say almost never.
+///
+/// A stored record is keyed by the **def-version** of its field, and so are read-sets, the
+/// dependency index and the migration chains of §5.3. Keying them by the writer's ClientVersion
+/// instead made an unrelated declaration move every subsequent write to a version no reader was
+/// looking for and no migration led to — data reported `broken`, and, worse, dependencies that
+/// silently stopped matching, so invalidation stopped with nothing to show for it.
+///
+/// **The only way from a ClientVersion to a `DefVersion` is to ask a def-view**
+/// (`DefView::version_of`), because the answer is a fact about the schema and not arithmetic on
+/// ids. That is the whole reason this is a type rather than a convention.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DefVersion(pub LayerId);
+
+impl DefVersion {
+    /// The version of a cell that has no definition to version.
+    ///
+    /// Existence cells, lists and the untyped containers have no `FieldDef` — a struct exists
+    /// because someone declared a field *on* it (§5.2), and there is no `ListDef` event to declare
+    /// a list with (§8). Nothing about them can change shape, so nothing can migrate them and there
+    /// is no chain for them to sit on. One fixed version keeps them findable across every def push,
+    /// which is what "unversioned" has to mean in a store whose record key includes a version.
+    pub const UNVERSIONED: Self = Self(LayerId(0));
+}
 
 /// Identifies a PID-allocating authority. SPEC.md §3.1, §17.2.
 ///
@@ -80,6 +112,18 @@ impl fmt::Debug for ClientVersion {
 }
 
 impl fmt::Display for ClientVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+impl fmt::Debug for DefVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v@{}", self.0)
+    }
+}
+
+impl fmt::Display for DefVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }

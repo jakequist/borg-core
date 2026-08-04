@@ -20,9 +20,9 @@
 //! which §9.6 says is precisely the thing that may vary.
 
 use borg_core::{
-    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId,
-    LayerKind, MigrationDirection, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind,
-    RepoId, Result, Value, ValueType, Writer,
+    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, DefEvent, DefVersion, LayerAuthor,
+    LayerId, LayerKind, MigrationDirection, Ownership, Pid, PidKind, ProducerDef, ProducerId,
+    ProducerKind, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -45,6 +45,10 @@ const RACING: usize = 16;
 
 const BRANCH: BranchId = BranchId(1);
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 
 const FIRST: ProducerId = ProducerId(1);
 const SECOND: ProducerId = ProducerId(2);
@@ -144,7 +148,7 @@ impl Harness {
         session.commit().await
     }
 
-    async fn read(&self, cell: &CellRef, version: ClientVersion) -> Option<Value> {
+    async fn read(&self, cell: &CellRef, version: DefVersion) -> Option<Value> {
         let path = self.branches.read_path(BRANCH, None).unwrap();
         self.storage
             .get_cell(&path, cell, version)
@@ -238,7 +242,7 @@ async fn a_downstream_producer_racing_its_upstream_settles_on_the_same_values() 
         h.engine.catch_up(BRANCH).await?;
         for i in 0..8u64 {
             assert_eq!(
-                h.read(&prop(company(i), "c"), V1).await,
+                h.read(&prop(company(i), "c"), AT_V1).await,
                 Some(Value::Int(i as i64 + 3)),
                 "run {run}: the far end of a three-hop chain is computed from the near end"
             );
@@ -262,8 +266,8 @@ async fn parallelism_changes_the_schedule_and_not_the_result() -> Result<()> {
         for i in 0..24u64 {
             for field in ["a", "b", "c"] {
                 assert_eq!(
-                    parallel.read(&prop(company(i), field), V1).await,
-                    sequential.read(&prop(company(i), field), V1).await,
+                    parallel.read(&prop(company(i), field), AT_V1).await,
+                    sequential.read(&prop(company(i), field), AT_V1).await,
                     "run {run}: {field} on company {i} differs from the sequential engine's answer"
                 );
             }
@@ -306,12 +310,12 @@ async fn two_producers_writing_sibling_fields_of_one_object_both_land() -> Resul
 
         for i in 0..16u64 {
             assert_eq!(
-                h.read(&prop(company(i), "left"), V1).await,
+                h.read(&prop(company(i), "left"), AT_V1).await,
                 Some(Value::Int(i as i64 + 10)),
                 "run {run}: the left sibling survived"
             );
             assert_eq!(
-                h.read(&prop(company(i), "right"), V1).await,
+                h.read(&prop(company(i), "right"), AT_V1).await,
                 Some(Value::Int(i as i64 + 20)),
                 "run {run}: and so did the right one"
             );
@@ -397,7 +401,7 @@ async fn an_upstream_that_always_commits_late_still_reaches_its_downstream() -> 
         );
         for i in 0..4u64 {
             assert_eq!(
-                h.read(&prop(company(i), "b"), V1).await,
+                h.read(&prop(company(i), "b"), AT_V1).await,
                 Some(Value::Int(i as i64 + 2)),
                 "run {run}: the downstream caught up after reading an absent input"
             );
@@ -446,7 +450,6 @@ async fn a_migration_pair_running_together_does_not_overwrite_its_own_input() ->
                 }],
             )
             .await?;
-        let v2 = ClientVersion(mutated);
 
         for (id, direction, factor) in [
             (UP, MigrationDirection::Up, true),
@@ -480,12 +483,14 @@ async fn a_migration_pair_running_together_does_not_overwrite_its_own_input() ->
         for i in 0..8u64 {
             let authored = i as i64 + 1;
             assert_eq!(
-                h.read(&prop(company(i), "website"), v1).await,
+                h.read(&prop(company(i), "website"), DefVersion(declared))
+                    .await,
                 Some(Value::Int(authored)),
                 "run {run}: the source value at the old version is untouched"
             );
             assert_eq!(
-                h.read(&prop(company(i), "website"), v2).await,
+                h.read(&prop(company(i), "website"), DefVersion(mutated))
+                    .await,
                 Some(Value::Int(authored * 10)),
                 "run {run}: and the new version is what `up` made of it"
             );
@@ -518,13 +523,13 @@ async fn a_client_write_landing_mid_round_still_settles() -> Result<()> {
         h.engine.catch_up(BRANCH).await?;
 
         assert_eq!(
-            h.read(&prop(company(0), "c"), V1).await,
+            h.read(&prop(company(0), "c"), AT_V1).await,
             Some(Value::Int(103)),
             "run {run}: the chain settled on the value written mid-round"
         );
         for i in 1..8u64 {
             assert_eq!(
-                h.read(&prop(company(i), "c"), V1).await,
+                h.read(&prop(company(i), "c"), AT_V1).await,
                 Some(Value::Int(i as i64 + 3)),
                 "run {run}: and the entities the interruption did not touch are still right"
             );

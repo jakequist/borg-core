@@ -5,9 +5,9 @@
 //! queued anywhere.
 
 use borg_core::{
-    BranchId, BufferId, CellAt, CellRef, ClientVersion, DefEvent, Event, LayerAuthor, LayerId,
-    Origin, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
-    ValueType, Writer,
+    BranchId, BufferId, CellAt, CellRef, ClientVersion, DefEvent, DefVersion, Event, LayerAuthor,
+    LayerId, Origin, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId,
+    Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -22,6 +22,10 @@ const BRANCH: BranchId = BranchId(1);
 const SCORE: ProducerId = ProducerId(1);
 const DOWNSTREAM: ProducerId = ProducerId(9);
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 
 /// The schema every test here writes against.
 ///
@@ -127,11 +131,17 @@ impl Harness {
         session.commit().await
     }
 
+    /// A raw record read, keyed the way the write path keys records: at the field's def-version,
+    /// and unversioned for an existence cell, which has no definition to version (SPEC.md §5.3).
     async fn read(&self, cell: &CellRef) -> Option<Event> {
         let head = self.layers.head(BRANCH).unwrap();
         let path = self.branches.read_path(BRANCH, Some(head)).unwrap();
+        let at = match cell.buffer {
+            BufferId::ObjectProp(..) => AT_V1,
+            _ => DefVersion::UNVERSIONED,
+        };
         self.storage
-            .get_cell(&path, cell, ClientVersion(LayerId(1)))
+            .get_cell(&path, cell, at)
             .await
             .unwrap()
             .map(|found| found.event)
@@ -183,7 +193,7 @@ async fn derives_on_create_and_tracks_at_field_granularity() -> Result<()> {
     assert_eq!(derivation.producer, SCORE);
     assert_eq!(
         derivation.read_set,
-        vec![CellAt::new(prop(acme, "website"), V1)],
+        vec![CellAt::new(prop(acme, "website"), AT_V1)],
         "the read-set is captured automatically, at the version read, and contains only what was \
          actually read"
     );

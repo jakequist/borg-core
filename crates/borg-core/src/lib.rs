@@ -26,7 +26,9 @@ pub use def::{
 };
 pub use error::{BorgError, MergeRejection, Result, WriteRejection};
 pub use freshness::{Freshness, FreshnessRequirement, Resolved, Watermark};
-pub use ids::{AllocatorId, BranchId, ClientVersion, EventId, LayerId, ProducerId, RepoId};
+pub use ids::{
+    AllocatorId, BranchId, ClientVersion, DefVersion, EventId, LayerId, ProducerId, RepoId,
+};
 pub use layer::{Branch, Guard, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
 pub use parse::ParseError;
 pub use pid::{Pid, PidAllocator, PidKind};

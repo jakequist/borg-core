@@ -6,9 +6,9 @@
 //! business, and these tests are what keep it that way.
 
 use borg_core::{
-    BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, LayerAuthor, LayerId, Ownership,
-    Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value, ValueInput,
-    ValueType, Writer,
+    BranchId, BufferId, CellRef, ClientVersion, DefEvent, DefVersion, Event, LayerAuthor, LayerId,
+    Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value,
+    ValueInput, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -22,6 +22,10 @@ use std::sync::Arc;
 const BRANCH: BranchId = BranchId(1);
 const SHOUT: ProducerId = ProducerId(1);
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 
 fn company(n: u64) -> Pid {
     Pid::Allocated {
@@ -104,7 +108,7 @@ impl Harness {
         let head = self.layers.head(BRANCH).unwrap();
         let path = self.branches.read_path(BRANCH, Some(head)).unwrap();
         self.storage
-            .get_cell(&path, cell, V1)
+            .get_cell(&path, cell, AT_V1)
             .await
             .unwrap()
             .map(|found| found.event)

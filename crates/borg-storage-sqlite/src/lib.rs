@@ -44,7 +44,7 @@
 
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, Branch, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Derivation, Event,
+    BorgError, Branch, BranchId, BufferId, CellRef, DefEvent, DefVersion, Derivation, Event,
     EventDraft, EventId, Landed, Layer, LayerId, Origin, Pid, PidKind, ReadPath, Result, Value,
     content,
 };
@@ -198,7 +198,7 @@ fn to_event(row: EventRow) -> Result<Event> {
             key: decode(&key)?,
         },
         value: decode::<Value>(&value)?,
-        version: ClientVersion(LayerId(version as u64)),
+        version: DefVersion(LayerId(version as u64)),
         origin: if origin == 0 {
             Origin::Source
         } else {
@@ -464,7 +464,7 @@ impl StorageProvider for SqliteStorage {
         &self,
         path: &ReadPath,
         cell: &CellRef,
-        version: ClientVersion,
+        version: DefVersion,
     ) -> Result<Option<Landed>> {
         let segments = path.segments.clone();
         let buffer = encode(&cell.buffer)?;
@@ -516,7 +516,7 @@ impl StorageProvider for SqliteStorage {
         .await
     }
 
-    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<ClientVersion>> {
+    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<DefVersion>> {
         let segments = path.segments.clone();
         let buffer = encode(&cell.buffer)?;
         let key = encode(&cell.key)?;
@@ -540,7 +540,7 @@ impl StorageProvider for SqliteStorage {
                     )
                     .map_err(sql)?;
                 for row in rows {
-                    let version = ClientVersion(LayerId(row.map_err(sql)? as u64));
+                    let version = DefVersion(LayerId(row.map_err(sql)? as u64));
                     if !versions.contains(&version) {
                         versions.push(version);
                     }

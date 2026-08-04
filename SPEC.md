@@ -278,13 +278,13 @@ Event {
   id:         EventId
   cell:       CellRef
   value:      Primitive | Pid
-  version:    LayerId        // the ClientVersion this value was written at
+  version:    LayerId        // the def-version of this cell's field (§5.3)
   origin:     Source | Derived
   authored:   LayerId        // where this event was FIRST committed
   // derived only:
   producer:   ProducerId
   freshAsOf:  LayerId
-  readSet:    CellRef[]
+  readSet:    CellAt[]        // cell *and* def-version (§9.4)
 }
 ```
 
@@ -309,8 +309,10 @@ and watermark validation all ask "was this visible here, by then", and an event 
 branch at a low layer id can land on this one arbitrarily late. Ordering by where an event was
 written would rank a freshly merged value beneath everything the branch has done since.
 
-**Every cell carries its own def-version tag.** A def-mutation touching one field does not stale the
-other fields of the object.
+**Every cell carries its own def-version tag** — the version of *its own field* as the writer's
+def-view named it (§5.3, §5.4), not the writer's whole-schema ClientVersion. A def-mutation touching
+one field therefore does not stale, move, or even mention the other fields of the object. Cells with
+no definition to version — existence cells, lists, untyped containers — are tagged unversioned.
 
 Source events carry only `value`, `version`, `origin`, `authored`. The heavy metadata — watermark,
 read-set, producer — attaches to derived events only, which in a normalized model are the minority.
@@ -403,6 +405,12 @@ Nothing about which two versions a migration bridges is recorded in the migratio
 a def-only merge replays that `MutateField` onto the parent as a *different* layer, and the same
 producer must then bridge the parent's versions rather than the ones it was pushed against (§13).
 
+**Per definition is what makes this a version at all.** A def-version is the record key of every
+stored cell (§4.3), the version half of every `CellAt` (§9.4), and the node a migration chain walks
+— and all three only work because it moves when *that* definition moves and at no other time. A
+whole-schema version in the same place would renumber every field on every push, breaking the chain
+that was never mutated. §5.4 is where the difference bites.
+
 ### 5.4 ClientVersion
 
 **Every actor that executes code carries a ClientVersion**: a LayerId identifying the def-view its
@@ -422,10 +430,36 @@ A migration's ClientVersion is **the version it produces**, in both directions: 
 that version, and sees the rest of the world as a client on that version does. The one cell it does
 *not* read there is the one it is translating, which it reads at the other end of its step (§9.3).
 
-**Writes are stored at the writing actor's ClientVersion and are never coerced or rewritten.** A v1
-client and a v5 client may read and write concurrently; the read path composes migrations in
-whichever direction is required. This is why `down` migrations matter — they are what keep old
-clients working.
+**Writes are stored at the def-version their author's view puts that field at, and are never coerced
+or rewritten.** A v1 client and a v5 client may read and write concurrently; the read path composes
+migrations in whichever direction is required. This is why `down` migrations matter — they are what
+keep old clients working.
+
+**Not at the actor's ClientVersion — at the field's def-version (§5.3).** The two are both def-layer
+ids and they are different quantities: a ClientVersion is a whole schema and moves on every push, a
+def-version belongs to one definition and moves only when that definition does. They coincide only
+if every push touches every field.
+
+Storing a cell at the writer's whole-schema version instead is wrong twice over, and both follow
+from the same fact — that a field nobody mutated has one version and would have acquired many:
+
+- **The value becomes unreadable.** A reader whose ClientVersion has moved past an unrelated push
+  asks for a version nothing was stored at, and §5.3 offers no route to it, because a field that
+  never changed shape has no chain and owes no migration. The honest report for that is `broken`
+  (§10.4) — a correct answer to a question that should never have been asked.
+- **Dependencies stop matching, silently.** A read-set entry is a `CellAt` — cell *plus* version
+  (§9.4) — so a source write landing at a version no producer recorded invalidates nothing.
+  Nothing fails: the derived value simply stops following its input and goes on labelling itself
+  current. That is the more serious half, because the first has a symptom and this one has none.
+
+A cell with no definition to version — an object's existence cell, a list, an untyped container — is
+stored **unversioned**. Nothing about their shape can change, so they sit on no chain, and a fixed
+version is what keeps them findable across every def push.
+
+The def-version a write is keyed at is asked of the **writer's own** def-view, which is what makes
+the rule uniform across every actor: a client on an old view keys where its view says, a pipeline
+where the schema it was built against says, and a migration — whose view is folded to the version it
+produces — exactly where the chain says its output belongs.
 
 **And validated at it.** The shape a write must fit — is the struct declared, is the field declared,
 does the value fit its type — is asked of the writer's *own* def-view, not of the branch's (§8.0).
@@ -1016,6 +1050,20 @@ to HEAD for the cost of a few index lookups.
 **Reads validate before reporting**, so the returned watermark is tight rather than pessimistically
 understated.
 
+**"Has this dependency changed?" is asked on the source stream**, because that is where a watermark
+points (§10.1) — and the two kinds of dependency answer it differently:
+
+| Dependency | Reflects |
+|---|---|
+| **source** | the layer it *landed* on this branch — landed, never authored, since a merge can carry an old event onto this branch late (§13) |
+| **derived** | its producer's watermark — never the derived layer it sits in |
+
+The second is the one that is easy to get wrong. A derived layer sits *above* the source layer it
+reflects, by construction (§6.3), so comparing where a derived dependency landed against a watermark
+compares a derived id with a source one. It is always larger, every chained value therefore looks
+permanently overtaken, and `current` becomes unreachable for any producer reading another producer's
+output.
+
 ### 10.3 Composition
 
 Watermarks propagate through chained producers:
@@ -1023,6 +1071,11 @@ Watermarks propagate through chained producers:
 ```
 W(B) = min(target, W(A), W(other deps...))
 ```
+
+This is what validation returns: not a yes/no but the composed layer, `target` where nothing bounds
+it. A source dependency bounds nothing — source data is ground truth and is correct at every layer
+after it lands. A derived dependency bounds `B` by whatever *it* validates to, recursively, so a
+chain is exactly as fresh as the hop behind it and no fresher.
 
 Any derived cell can therefore report an honest *transitive* freshness — the minimum over its entire
 derivation chain, migrations included. A v1 client reading a v3-produced field through a
@@ -1098,8 +1151,13 @@ read(pid, field, { freshness: 'any' | 'validated' | 'current' })
 mode, not a system architecture** — a client that needs a fresh answer pays for it at the call site;
 everyone else takes the lag.
 
-Three things follow from `current` being a *read*:
+Four things follow from `current` being a *read*:
 
+- **It validates before it computes, so it converges.** A value that already reaches the layer being
+  read is the answer; nothing runs. Without that check every such read recomputes forever, because
+  an inline computation deliberately advances no watermark (below) and so leaves nothing behind that
+  the next read would recognise — the work is done, and no cheaper operation can tell. Validation is
+  what can tell: it runs no user code (§10.2), and it is the same walk the read performs anyway.
 - **It computes what it needs, not what it is asked for.** A cell's inputs may themselves be behind,
   and computing from a stale input while labelling the result current is the one thing §10 does not
   permit. So the read-set is followed first, recursively, and the producers behind it run in

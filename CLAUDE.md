@@ -66,8 +66,11 @@ These are load-bearing. Breaking one is a design change, not a refactor, and nee
 6. **`CellRef` is the shard key; `CellAt` is the record key.** Read-sets, the dependency index and
    ownership all key on `CellAt`. Keying on `CellRef` makes a migration observe its own output as a
    change to its own input.
-7. **Writes are never coerced.** A value is stored at its author's ClientVersion, forever. Readers
-   migrate on the read path.
+7. **Writes are never coerced.** A value is stored at the **def-version of its own field** — as the
+   author's def-view names it, never the author's whole-schema ClientVersion — forever. Readers
+   migrate on the read path. The two versions coincide only when every def push touches every field
+   (§5.3, §5.4); `DefView::version_of` is the only bridge between them, and `DefVersion` is a
+   separate type so that it stays the only one.
 8. **Derived data is never presented as fresh.** Every read returns a provenance envelope. A stale
    value is served *and labelled*, never silently served or withheld.
 9. **A layer holds value events xor def events.** This is what makes "the def-version at layer L"
@@ -112,6 +115,12 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - `borg frontier reaches` polls the store between awaits, because the CLI is process-per-command and
   the frontier one process holds only moves if that process derives. The await inside the loop is
   the primitive; the loop is what an in-process deriver removes.
+- A watermark is a `LayerId` like any other, so nothing stops one being compared with a layer id
+  that is not a source layer. Four bugs have come from that family already; `ROADMAP.md`'s
+  *Deferred, still* records what a `Watermark` newtype would cost and why it is its own change.
+- `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
+  Correctness is unaffected; making it precise needs validation callable from the derivation engine
+  without handing the engine the resolver.
 - `Set`, `Map`, aggregation pipelines, mid-list insertion, container isolation and generated SDKs
   are all deferred (§18).
 

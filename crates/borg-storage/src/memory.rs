@@ -10,7 +10,7 @@
 use crate::{EventStream, OpenLayer, SealedLayer, StorageProvider};
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, Branch, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, EventDraft,
+    BorgError, Branch, BranchId, BufferId, CellRef, DefEvent, DefVersion, Event, EventDraft,
     EventId, Landed, Layer, LayerId, Pid, PidKind, ReadPath, Result, content,
 };
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 /// A projection of layer membership, kept because reads must stay a single lookup once events no
 /// longer carry a layer. [`MemoryStorage::rebuild_read_index`] regenerates it from the log, which
 /// is what makes it a cache rather than a second source of truth.
-type ReadIndex = HashMap<BranchId, HashMap<(CellRef, ClientVersion), Vec<(LayerId, EventId)>>>;
+type ReadIndex = HashMap<BranchId, HashMap<(CellRef, DefVersion), Vec<(LayerId, EventId)>>>;
 
 /// The newest landing at or below a bound.
 ///
@@ -220,7 +220,7 @@ impl StorageProvider for MemoryStorage {
         &self,
         path: &ReadPath,
         cell: &CellRef,
-        version: ClientVersion,
+        version: DefVersion,
     ) -> Result<Option<Landed>> {
         let inner = self.inner.lock().unwrap();
         // Walk outward. The first segment holding *any* record wins — including a tombstone, which
@@ -241,7 +241,7 @@ impl StorageProvider for MemoryStorage {
         Ok(None)
     }
 
-    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<ClientVersion>> {
+    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<DefVersion>> {
         let inner = self.inner.lock().unwrap();
         let mut versions = Vec::new();
         for (branch, bound) in &path.segments {
@@ -447,7 +447,7 @@ mod tests {
 
     const MAIN: BranchId = BranchId(1);
     const FEATURE: BranchId = BranchId(2);
-    const V1: ClientVersion = ClientVersion(LayerId(1));
+    const V1: DefVersion = DefVersion(LayerId(1));
 
     fn prop(n: u64, field: &str) -> CellRef {
         CellRef::prop(

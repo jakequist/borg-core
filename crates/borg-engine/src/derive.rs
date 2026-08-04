@@ -30,8 +30,8 @@ use crate::values::Values;
 use crate::write::WriteSession;
 use async_trait::async_trait;
 use borg_core::{
-    BorgError, BranchId, CellAt, CellRef, ClientVersion, Derivation, LayerAuthor, LayerId, Pid,
-    ProducerDef, ProducerId, ReadPath, Result, Value, ValueInput, Writer,
+    BorgError, BranchId, CellAt, CellRef, ClientVersion, DefVersion, Derivation, LayerAuthor,
+    LayerId, Pid, ProducerDef, ProducerId, ReadPath, Result, Value, ValueInput, Writer,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
 use borg_storage::StorageProvider;
@@ -154,13 +154,10 @@ struct RecordingCtx<'a> {
     /// reflect.
     fresh_as_of: LayerId,
     producer: ProducerId,
-    /// The def-view this producer's code was authored against. Reads resolve here and writes are
-    /// labelled with it. For a migration it is the version it *produces*: a migration is the lens
-    /// for its output version and sees the rest of the world as a client on that version does.
-    version: ClientVersion,
-    /// The version this producer takes its input at. Equal to `version` for a pipeline; for a
-    /// migration it is the other end of the step it bridges (SPEC.md §9.3).
-    input_version: ClientVersion,
+    /// The def-version this producer takes its **input** at, where that is not simply its own view.
+    /// `None` for a pipeline, whose input version *is* its ClientVersion; `Some` for a migration,
+    /// which reads the other end of the step it bridges (SPEC.md §9.3).
+    input_version: Option<DefVersion>,
     /// Output goes through the same validated write path as everything else, so a producer writing
     /// a field it does not own is rejected against the *declaration* rather than against whatever
     /// happened to write there first (SPEC.md §8).
@@ -169,14 +166,25 @@ struct RecordingCtx<'a> {
     write_set: Vec<CellAt>,
 }
 
+impl RecordingCtx<'_> {
+    /// Where this producer's own def-view puts this field (SPEC.md §5.3).
+    ///
+    /// Taken from the write session, so a producer reads a cell at exactly the version it would
+    /// write one — the property that makes a read-set entry and the client write it depends on name
+    /// the same record.
+    fn version_of(&self, cell: &CellRef) -> DefVersion {
+        self.session.defs().version_of(cell)
+    }
+}
+
 #[async_trait]
 impl ProducerCtx for RecordingCtx<'_> {
     async fn get(&mut self, cell: &CellRef) -> Result<Option<Value>> {
-        let version = self.version;
+        let version = self.version_of(cell);
         self.get_at(cell, version).await
     }
 
-    async fn get_at(&mut self, cell: &CellRef, version: ClientVersion) -> Result<Option<Value>> {
+    async fn get_at(&mut self, cell: &CellRef, version: DefVersion) -> Result<Option<Value>> {
         // Recorded before the lookup, so that a read finding *nothing* is still a dependency.
         // Absence is a legitimate input, and a later write to that cell must invalidate this run.
         //
@@ -191,7 +199,7 @@ impl ProducerCtx for RecordingCtx<'_> {
     }
 
     async fn get_input(&mut self, cell: &CellRef) -> Result<Option<Value>> {
-        let version = self.input_version;
+        let version = self.input_version.unwrap_or_else(|| self.version_of(cell));
         self.get_at(cell, version).await
     }
 
@@ -204,7 +212,7 @@ impl ProducerCtx for RecordingCtx<'_> {
         self.session.set_derived(cell, value, derivation).await?;
         // Recorded only after the write is accepted: a rejected write is not output, and claiming
         // it in the index would leave the producer owning a cell it never produced.
-        let written = CellAt::new(cell.clone(), self.version);
+        let written = CellAt::new(cell.clone(), self.version_of(cell));
         if !self.write_set.contains(&written) {
             self.write_set.push(written);
         }
@@ -223,7 +231,7 @@ impl ProducerCtx for RecordingCtx<'_> {
         self.session
             .set_text_derived(cell, text, derivation)
             .await?;
-        let written = CellAt::new(cell.clone(), self.version);
+        let written = CellAt::new(cell.clone(), self.version_of(cell));
         if !self.write_set.contains(&written) {
             self.write_set.push(written);
         }
@@ -623,8 +631,14 @@ impl DerivationEngine {
         let Some(role) = defs.migration_role(def) else {
             return true;
         };
+        // The set holds ClientVersions and `role.output` is one field's def-version (§5.3). They
+        // are compared as the def-layers they both are, which is exact when a client's view was
+        // built from the very push that moved this field and approximate otherwise. Nothing
+        // registers a client in v1, so the set is empty and the filter is switched off (§5.5);
+        // making this precise is part of the deferred reduction policies, which need a folded view
+        // per live version to answer it properly.
         let live = self.defs.live_versions();
-        live.is_empty() || live.contains(&role.output)
+        live.is_empty() || live.contains(&ClientVersion(role.output.0))
     }
 
     /// The whole of a producer's source buffer, as work, for a producer that has never run here.
@@ -771,11 +785,11 @@ impl DerivationEngine {
         // `ProducerCtx::get_input` (SPEC.md §9.3). Which two versions those are is a fact about the
         // branch's version chain, not about the producer's definition — see `migration_role`.
         let (version, input_version) = match defs.migration_role(def) {
-            Some(role) => (role.output, role.input),
-            None => {
-                let version = ClientVersion(def.version);
-                (version, version)
-            }
+            // A migration's ClientVersion is the version it produces (§5.4) — and that version is a
+            // def-version of one field, which is a def-layer like any other and so names a view.
+            // The conversion is explicit because it is the one place the two meanings meet.
+            Some(role) => (ClientVersion(role.output.0), Some(role.input)),
+            None => (ClientVersion(def.version), None),
         };
         // This round's ceiling — the source layer plus every derived layer already committed as a
         // consequence of it — bounds the ancestry the reads resolve through. Distinct from
@@ -805,7 +819,6 @@ impl DerivationEngine {
             path: self.branches.read_path(branch, Some(at.read_at))?,
             fresh_as_of: at.fresh_as_of,
             producer: def.id,
-            version,
             input_version,
             session,
             read_set: Vec::new(),
@@ -860,7 +873,7 @@ impl DerivationEngine {
         &'a self,
         branch: BranchId,
         cell: CellRef,
-        version: ClientVersion,
+        version: DefVersion,
         computing: &'a mut HashSet<CellAt>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
@@ -963,7 +976,7 @@ impl InlineDerivation for DerivationEngine {
         &self,
         branch: BranchId,
         cell: &CellRef,
-        version: ClientVersion,
+        version: DefVersion,
     ) -> Result<()> {
         let mut computing = HashSet::new();
         self.refresh(branch, cell.clone(), version, &mut computing)

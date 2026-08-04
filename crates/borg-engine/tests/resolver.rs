@@ -4,9 +4,9 @@
 //! via `explain` — where it came from.
 
 use borg_core::{
-    BranchId, BufferId, CellRef, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
-    LayerAuthor, LayerId, Origin, Ownership, Pid, PidKind, ProducerDef, ProducerId, ProducerKind,
-    RepoId, Result, Value, ValueType, Writer,
+    BranchId, BufferId, CellRef, ClientVersion, DefEvent, DefVersion, Freshness,
+    FreshnessRequirement, LayerAuthor, LayerId, Origin, Ownership, Pid, PidKind, ProducerDef,
+    ProducerId, ProducerKind, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -21,6 +21,10 @@ const BRANCH: BranchId = BranchId(1);
 const SCORE: ProducerId = ProducerId(1);
 /// The def-view every actor in these tests was authored against.
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 
 fn company(n: u64) -> Pid {
     Pid::Allocated {
@@ -287,7 +291,7 @@ async fn explain_walks_the_dependency_index_backwards() -> Result<()> {
     assert_eq!(lineage.from.len(), 1, "one input was read, so one edge");
     assert_eq!(lineage.from[0].cell.cell, prop(acme, "website"));
     assert_eq!(
-        lineage.from[0].cell.version, V1,
+        lineage.from[0].cell.version, AT_V1,
         "the edge records the version the producer read at"
     );
     assert_eq!(
@@ -418,5 +422,116 @@ async fn a_def_push_without_a_down_migration_is_unreachable_for_older_clients() 
         Freshness::Broken,
         "without a down migration the older client's view is unreachable, and is said so plainly"
     );
+    Ok(())
+}
+
+/// A def push that does not mention a field must not move where that field's data lives.
+///
+/// §5.3 defines a def-version **per definition** — the def-layer that last mutated *that*
+/// definition — while a ClientVersion is a whole-schema view that advances on every push (§5.4).
+/// The two coincide only when every push touches every field, so keying a stored record by the
+/// writer's ClientVersion made an unrelated declaration hide data that nothing had changed: the
+/// reader asked for a version nothing was stored at, found no migration route to it — correctly,
+/// since the field never changed shape and so has no chain — and reported the cell `broken`.
+#[tokio::test]
+async fn a_value_survives_a_def_push_that_does_not_mention_its_field() -> Result<()> {
+    let h = Harness::new().await?;
+    let acme = company(600);
+    h.push(vec![(prop(acme, "website"), Value::Int(9))]).await?;
+
+    // A second repo, a second field, on the same struct. `website` is not named by this event and
+    // its shape is unchanged, so no migration exists or is owed.
+    let after = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::DeclareField {
+                struct_name: "Company".into(),
+                field: "city".into(),
+                ty: ValueType::Int,
+                repo: RepoId(2),
+                ownership: Ownership::Source,
+            }],
+        )
+        .await?;
+
+    let read = h
+        .resolver
+        .resolve(
+            BRANCH,
+            &prop(acme, "website"),
+            None,
+            ClientVersion(after),
+            FreshnessRequirement::Validated,
+        )
+        .await?;
+    assert_eq!(
+        read.value,
+        Some(Value::Int(9)),
+        "a reader whose whole-schema view moved is still asking for the same version of this field"
+    );
+    assert_eq!(
+        read.state,
+        Freshness::Current,
+        "and nothing owes it a migration, so it is not behind either"
+    );
+    Ok(())
+}
+
+/// The severe half: a producer's recorded dependency must go on matching the client's writes.
+///
+/// Read-set entries are `CellAt` — cell *plus* version (§9.4) — and the dependency index keys on
+/// them. A source write landing at a different version from the one a producer recorded matches
+/// nothing, so invalidation stops silently: no error, no `stale`, no watermark left behind. The
+/// derived value simply freezes at whatever it last computed and goes on calling itself current.
+#[tokio::test]
+async fn a_def_push_does_not_sever_a_recorded_dependency() -> Result<()> {
+    let h = Harness::new().await?;
+    let acme = company(700);
+    h.push(vec![
+        (existence(acme), Value::Bool(true)),
+        (prop(acme, "website"), Value::Int(9)),
+    ])
+    .await?;
+    h.engine.catch_up(BRANCH).await?;
+
+    let after = h
+        .defs
+        .push(
+            BRANCH,
+            vec![DefEvent::DeclareField {
+                struct_name: "Company".into(),
+                field: "city".into(),
+                ty: ValueType::Int,
+                repo: RepoId(2),
+                ownership: Ownership::Source,
+            }],
+        )
+        .await?;
+
+    // The same client, now on the newer whole-schema view, moves the input the producer read.
+    h.push_at(
+        ClientVersion(after),
+        vec![(prop(acme, "website"), Value::Int(1))],
+    )
+    .await?;
+    h.engine.catch_up(BRANCH).await?;
+
+    let derived = h
+        .resolver
+        .resolve(
+            BRANCH,
+            &prop(acme, "is_investible"),
+            None,
+            ClientVersion(after),
+            FreshnessRequirement::Validated,
+        )
+        .await?;
+    assert_eq!(
+        derived.value,
+        Some(Value::Bool(false)),
+        "the write invalidated the invocation that read it, across the def push"
+    );
+    assert_eq!(derived.state, Freshness::Current);
     Ok(())
 }

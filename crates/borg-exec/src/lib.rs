@@ -8,7 +8,7 @@
 //! equally satisfiable by an in-process call and by a socket round-trip to a container.
 
 use async_trait::async_trait;
-use borg_core::{CellRef, ClientVersion, Pid, ProducerId, Result, Value, ValueInput};
+use borg_core::{CellRef, ClientVersion, DefVersion, Pid, ProducerId, Result, Value, ValueInput};
 
 /// Which producer to run, and the def-view its code was authored against.
 ///
@@ -27,8 +27,9 @@ pub struct ProducerRef {
 /// through the derivation engine afterwards is a far larger change than paying for it now.
 #[async_trait]
 pub trait ProducerCtx: Send {
-    /// Read a cell at this producer's own ClientVersion — the def-view its code was authored
-    /// against (SPEC.md §5.4). Recorded into the read-set, including reads that find nothing, since
+    /// Read a cell through this producer's own def-view — the schema its code was authored against
+    /// (SPEC.md §5.4). The record it resolves to is the one at the *field's* def-version as that
+    /// view names it (§5.3). Recorded into the read-set, including reads that find nothing, since
     /// absence is a legitimate dependency (SPEC.md §9.4).
     async fn get(&mut self, cell: &CellRef) -> Result<Option<Value>>;
 
@@ -38,7 +39,10 @@ pub trait ProducerCtx: Send {
     /// ClientVersion v2, so an ordinary `get` of the cell it is migrating would resolve at v2 and
     /// recurse into itself. Every *other* read a migration makes is an ordinary `get` and correctly
     /// sees the target view (SPEC.md §9.3).
-    async fn get_at(&mut self, cell: &CellRef, version: ClientVersion) -> Result<Option<Value>>;
+    ///
+    /// A [`DefVersion`] and not a ClientVersion: this names a position on *one field's* chain, and
+    /// the only chains that exist are per-field (SPEC.md §5.3).
+    async fn get_at(&mut self, cell: &CellRef, version: DefVersion) -> Result<Option<Value>>;
 
     /// Read a cell at the version this producer takes its **input** at.
     ///

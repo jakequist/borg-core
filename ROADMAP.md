@@ -37,6 +37,13 @@ value threaded through a loop; and a producer's workers are a pool rather than o
 lock. The invariants that were written to permit this were checked rather than assumed, and three of
 them were not true as implemented — see the decisions below.
 
+**Versions are per definition, and watermarks compose.** A stored record is keyed by the def-version
+of its own field rather than by whoever wrote it, so declaring an unrelated field no longer hides
+data or quietly severs the dependencies recorded against it; and validation returns §10.3's
+composition, so a producer reading another producer's output can reach `current` instead of being
+reported stale forever. `110-def-push-keeps-data` and `120-invalidation-survives-a-def-push` are the
+two scenarios; the second exists because S1 structurally cannot see that failure.
+
 Act 1 is the modern ORM.
 
 ---
@@ -172,6 +179,22 @@ them forward, and the CLI is doing the SDK's job well enough to keep learning fr
 enumerating it is what would make merge asymptotically free; the model now permits it and the old
 one forbade it. It needs read-path compaction to pay for itself, so what landed is the honest
 version: `n` membership rows and `n` index entries per merged layer instead of `n` full records.
+
+A **`Watermark` newtype**, and it is the one deferral that has already cost four bugs. Four pairs of
+`LayerId` have been conflated so far — `read_at` vs `reflects`, `authored` vs `landed`, the round
+ceiling as a bound vs as a filter, and a derived dependency's landing layer vs its watermark — and
+every one was two ids of the same Rust type meaning different things. A watermark is a position in
+the **source** stream (§10.1); `landed`, `authored` and a read ceiling are positions in the layer
+stream, which includes derived layers. Wrapping the first would make `landed_at > fresh_as_of` fail
+to compile, which is exactly the line that had to be rewritten here.
+
+What stopped it being done now is that it is not only a rename. `Resolved.fresh_as_of` is compared
+against, and set to, the layer being read — a ceiling that is usually a *derived* layer once a
+branch has settled — so a `Watermark` type immediately asks whether the read target should be the
+highest **source** layer at or below the ceiling instead. That is almost certainly the right answer
+and it makes §10.1 literally true, but it changes the layer id every settled derived read reports,
+which `100-watermark-truth` forks at and replays. It deserves its own change with its own scenario,
+not a rider on a bug fix.
 
 ---
 
@@ -589,6 +612,73 @@ what the invalidator sees. The read index keeps one, the later. That is the same
 `cells` table got from its primary key, and stating it explicitly is what keeps `MemoryStorage` and
 SQLite answering identically: with one index row per landing layer, "the newest landing" is a
 maximum with no tie to break, in either backend.
+
+### A record is keyed by its field's def-version, not by its writer's ClientVersion
+
+`DefVersion` is now a type of its own. `ClientVersion` is a whole schema and advances on every def
+push; a def-version belongs to one definition and advances only when that definition is mutated
+(§5.3). Storage, `CellAt`, `Event`, read-sets, the dependency index, migration chains and
+`ProducerCtx::get_at` all speak the second; every actor still carries the first, and
+`DefView::version_of` is the only bridge.
+
+Keying records by the writer's ClientVersion made a def push that named some *other* field move
+every subsequent write to a version no reader looked for. Two consequences, and the second is the
+one that hurt: the value read back `broken` — correctly, since a field that never changed shape has
+no migration chain and so no route to the new version — and, invisibly, every read-set entry
+recorded against the old version stopped matching, so invalidation stopped with no error, no `stale`
+and no watermark left behind. A derived value simply froze at its last computation and went on
+calling itself current.
+
+`100-watermark-truth` cannot see the second half, and understanding why is the point: a producer
+authored at the old def-version genuinely reads the old world, so replaying at the watermark
+faithfully reproduces the frozen value. The result is self-consistent and wrong.
+`120-invalidation-survives-a-def-push` compares a derived cell against the source cell it is a copy
+of instead, which is the comparison a replay structurally cannot make.
+
+The type is what keeps this from coming back. There is no arithmetic from one version to the other —
+the answer is a fact about the schema — so the compiler now insists a def-view be asked.
+
+### Existence cells, lists and untyped containers are unversioned
+
+They have no `FieldDef`, sit on no migration chain, and nothing about their shape can change. Before
+they took the writer's ClientVersion, which meant a def push made `imply_existence` write a *second*
+existence cell for an object that already had one — into the very buffer producers map over, so
+every declaration looked like a fresh entity to every pipeline. `DefVersion::UNVERSIONED` is one
+fixed key that stays findable across every push.
+
+### A derived dependency is validated against its watermark, not where it landed
+
+`Resolver::validate` compared each dependency's landing layer against the value's own watermark. For
+source data that is right. For derived data it compares a derived layer id against a source one: a
+derived layer sits *above* the source layer it reflects, by construction (§6.3), so a producer
+reading another producer's output was reported stale on a fully caught-up branch — permanently, and
+§10.4's `current` was unreachable for any chain.
+
+§10.3 already specified the answer, `W(B) = min(target, W(A), W(other deps))`, and nothing
+implemented it. Validation now returns that composed layer rather than a verdict, recursing into
+derived dependencies and memoizing per dependency so a diamond stays linear; the memo doubles as the
+cycle guard. Merges cannot reach the derived arm at all — `replayable_layers` carries only source
+layers — so the "landed, never authored" protection that arm was originally written for stays
+exactly where it belongs, on the source arm.
+
+`Landed::reflects()` names the quantity once, in core: *the source layer this record's content
+reflects*, which is where it landed for source data and its producer's watermark for derived. Both
+arms of the comparison are now written in one place, which is the cheap half of the type distinction
+this class of bug keeps asking for. The expensive half — a `Watermark` newtype separating
+source-stream positions from layer ids everywhere — is **not** done; see *Deferred, still*.
+
+### `freshness: current` validates before it computes
+
+An inline computation deliberately advances no watermark (§10.5), so it leaves nothing behind that a
+later read could recognise, and every `current` read re-ran the producer — and, on a chain, the whole
+chain — however settled the branch was. The read now validates first and computes only when
+validation does not already reach the layer being read. Validation runs no user code and is the same
+walk the read performs anyway.
+
+What is *not* done: `refresh` still re-runs every hop of a chain once any hop is behind, rather than
+only the hops that are. That costs work, never correctness, and needs validation to be callable from
+the derivation engine — which today would mean either duplicating it or handing the engine the
+resolver, and the second is the dependency direction `InlineDerivation` exists to keep one-way.
 
 ---
 

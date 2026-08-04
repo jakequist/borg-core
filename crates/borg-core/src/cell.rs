@@ -4,7 +4,7 @@
 //! ownership, migration staleness, and merge conflict resolution all key on the same primitive. So
 //! the physical unit of storage is the cell, not the object.
 
-use crate::ids::{ClientVersion, EventId, LayerId, ProducerId};
+use crate::ids::{DefVersion, EventId, LayerId, ProducerId};
 use crate::pid::Pid;
 use crate::value::{ObjectTypeName, Value};
 use serde::{Deserialize, Serialize};
@@ -215,17 +215,21 @@ impl fmt::Display for CellRef {
 /// is the *record key*: which of that cell's versions you mean. One cell may be materialized at
 /// several versions at once, because writes are never coerced (SPEC.md §5.4).
 ///
+/// The version is a [`DefVersion`] — **this field's** version — and not the ClientVersion of
+/// whoever wrote it. Those differ the moment a def push touches some other field, and keying on the
+/// second is what once made an unrelated declaration hide data and sever dependencies (§5.3, §5.4).
+///
 /// Read-sets, the dependency index and field ownership all key on `CellAt`, not `CellRef`. Keying
 /// them on `CellRef` alone would make a migration — which reads `C@v1` and writes `C@v9` — observe
 /// its own output as a change to its own input, and poison itself as a cycle.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CellAt {
     pub cell: CellRef,
-    pub version: ClientVersion,
+    pub version: DefVersion,
 }
 
 impl CellAt {
-    pub const fn new(cell: CellRef, version: ClientVersion) -> Self {
+    pub const fn new(cell: CellRef, version: DefVersion) -> Self {
         Self { cell, version }
     }
 }
@@ -296,9 +300,10 @@ pub struct Event {
     /// thing in its own right that layers merely reference.
     pub cell: CellRef,
     pub value: Value,
-    /// The `ClientVersion` this value was *written* at. Never coerced or rewritten; readers at other
-    /// versions migrate on the read path (SPEC.md §5.4).
-    pub version: ClientVersion,
+    /// The **def-version of this cell's field** as the writer's own def-view named it. Never
+    /// coerced or rewritten; readers at other versions migrate on the read path (SPEC.md §5.3,
+    /// §5.4).
+    pub version: DefVersion,
     pub origin: Origin,
     /// Present only when `origin == Derived`.
     pub derivation: Option<Derivation>,
@@ -316,7 +321,7 @@ pub struct Event {
 #[derive(Clone, Debug)]
 pub struct EventDraft {
     pub value: Value,
-    pub version: ClientVersion,
+    pub version: DefVersion,
     pub origin: Origin,
     pub derivation: Option<Derivation>,
 }
@@ -335,6 +340,34 @@ pub struct EventDraft {
 pub struct Landed {
     pub event: Event,
     pub landed_at: LayerId,
+}
+
+impl Landed {
+    /// **The source layer this record's content reflects.** SPEC.md §6.3, §10.1.
+    ///
+    /// The one question validation asks of a dependency is *"has what I read moved past the layer I
+    /// claim to reflect?"* — and that comparison is only meaningful against the **source** stream,
+    /// which is where watermarks point. The two kinds of record answer it differently, and this is
+    /// the difference:
+    ///
+    /// * **Source data** reflects where it landed. It is ground truth: it says what it says from the
+    ///   layer it arrived on, and *landed*, never *authored*, because a merge can carry an event
+    ///   written long ago onto this branch long after (§13).
+    /// * **Derived data** reflects its producer's watermark. Its own layer id is not that: a derived
+    ///   layer sits *above* the source layer it reflects, by construction (§6.3), so comparing where
+    ///   it landed against a watermark compares a derived id with a source one — the two are on
+    ///   different scales, and the derived one always wins. That mistake made every chained producer
+    ///   report stale forever, on a fully caught-up branch, and put §10.4's `current` out of reach
+    ///   for any pipeline reading another pipeline's output.
+    ///
+    /// Naming it once, here, is what keeps the two arms of that from being written separately and
+    /// getting one of them wrong again.
+    pub fn reflects(&self) -> LayerId {
+        self.event
+            .derivation
+            .as_ref()
+            .map_or(self.landed_at, |by| by.fresh_as_of)
+    }
 }
 
 /// Derived-cell metadata. SPEC.md §4.3, §10.

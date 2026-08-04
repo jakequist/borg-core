@@ -8,11 +8,13 @@ use crate::branch::BranchManager;
 use crate::defs::DefRegistry;
 use crate::index::DependencyIndexProvider;
 use borg_core::{
-    BranchId, CellAt, CellRef, ClientVersion, Freshness, FreshnessRequirement, LayerId, Origin,
-    ProducerId, ReadPath, Resolved, Result, Value,
+    BranchId, CellAt, CellRef, ClientVersion, DefVersion, Derivation, Freshness,
+    FreshnessRequirement, LayerId, Origin, ProducerId, ReadPath, Resolved, Result, Value,
 };
 use borg_storage::StorageProvider;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -145,7 +147,7 @@ pub trait InlineDerivation: Send + Sync {
         &self,
         branch: BranchId,
         cell: &CellRef,
-        version: ClientVersion,
+        version: DefVersion,
     ) -> Result<()>;
 }
 
@@ -210,21 +212,35 @@ impl Resolver {
         version: ClientVersion,
         requirement: FreshnessRequirement,
     ) -> Result<Resolved<Option<Value>>> {
-        // **`Current` pays at the call site.** Everything below this line is the same read every
-        // other requirement gets; the difference is that the world has been brought up to date
-        // first. Note it happens *before* the read path is resolved, because computing commits
-        // layers and the answer must be read from after them.
-        if requirement == FreshnessRequirement::Current && self.can_compute_at(branch, layer)? {
-            self.inline.compute_now(branch, cell, version).await?;
+        // **Which record this reader means.** A ClientVersion is a whole schema; a record is keyed
+        // by the def-version of *its own field* (§5.3). The reader's own view is what translates one
+        // into the other, and asking it is the only way to get from here to there — which is what
+        // keeps a def push naming some other field from moving this cell out from under this read.
+        //
+        // Folded before the inline computation below, deliberately: derivation commits value layers
+        // only (§6.2), so no amount of computing can change what this answers.
+        let at = self
+            .defs
+            .view_at(&self.branches.read_path(branch, layer)?, version.0)
+            .await?
+            .version_of(cell);
+        // **`Current` pays at the call site** — but only where there is something to pay for.
+        // Everything below this line is the same read every other requirement gets; the difference
+        // is that the world may have been brought up to date first. It happens *before* the read
+        // path is resolved, because computing commits layers and the answer must be read from after
+        // them.
+        if requirement == FreshnessRequirement::Current
+            && self.can_compute_at(branch, layer)?
+            && !self.settled_here(branch, cell, at, layer).await?
+        {
+            self.inline.compute_now(branch, cell, at).await?;
         }
         // `None` means HEAD — which for a fork that has not written anything yet is the fork point
         // it inherits from, not a head of its own.
         let path = self.branches.read_path(branch, layer)?;
         let layer = layer.unwrap_or_else(|| path.ceiling());
-        let Some(found) = self.storage.get_cell(&path, cell, version).await? else {
-            return self
-                .resolve_unmaterialized(&path, cell, layer, version)
-                .await;
+        let Some(found) = self.storage.get_cell(&path, cell, at).await? else {
+            return self.resolve_unmaterialized(&path, cell, layer, at).await;
         };
         // Both halves of the provenance, which only exist separately now that events are not
         // rewritten on the way across a merge: where the value was authored, and where the branch
@@ -251,14 +267,22 @@ impl Resolver {
             });
         };
 
+        // Taken apart rather than borrowed from: a read-set can be enormous (§9.4), and validation
+        // consumes it.
+        let Derivation {
+            producer,
+            fresh_as_of: stored,
+            read_set,
+        } = derivation;
+
         // Reads validate before reporting, so the returned watermark is tight rather than
         // pessimistically understated (SPEC.md §10.2).
-        let state = match requirement {
+        let (state, fresh_as_of) = match requirement {
             FreshnessRequirement::Any => {
-                if derivation.fresh_as_of.0 >= layer.0 {
-                    Freshness::Current
+                if stored.0 >= layer.0 {
+                    (Freshness::Current, layer)
                 } else {
-                    Freshness::Unvalidated
+                    (Freshness::Unvalidated, stored)
                 }
             }
             // `Current` validates too rather than assuming its own computation succeeded. If the
@@ -266,15 +290,15 @@ impl Resolver {
             // one validation gives — which is what stops "I asked for current" from becoming "I was
             // told current".
             FreshnessRequirement::Validated | FreshnessRequirement::Current => {
-                self.validate(&path, &derivation.read_set, derivation.fresh_as_of)
-                    .await?
+                let watermark = self
+                    .validate(&path, read_set, stored, layer, &mut HashMap::new())
+                    .await?;
+                if watermark.0 >= layer.0 {
+                    (Freshness::Current, layer)
+                } else {
+                    (Freshness::Stale, watermark)
+                }
             }
-        };
-
-        let fresh_as_of = if state == Freshness::Current {
-            layer
-        } else {
-            derivation.fresh_as_of
         };
 
         Ok(Resolved {
@@ -289,8 +313,47 @@ impl Resolver {
             } else {
                 state
             },
-            by: Some(derivation.producer),
+            by: Some(producer),
         })
+    }
+
+    /// Whether this cell is already correct as of the layer being read, so that computing it would
+    /// only re-derive what is already there.
+    ///
+    /// This is what makes `freshness: 'current'` **converge**. Without it every such read runs the
+    /// producer again — and a chained one runs the whole chain again — however settled the branch
+    /// is, because an inline computation deliberately advances no watermark (§10.5) and so leaves
+    /// behind no mark that the next read could recognise. Validation is that mark: it costs a few
+    /// index lookups, runs no user code (§10.2), and is the same walk the read below performs to
+    /// decide what to report.
+    async fn settled_here(
+        &self,
+        branch: BranchId,
+        cell: &CellRef,
+        at: DefVersion,
+        layer: Option<LayerId>,
+    ) -> Result<bool> {
+        let path = self.branches.read_path(branch, layer)?;
+        let ceiling = layer.unwrap_or_else(|| path.ceiling());
+        // Nothing stored at this version: what is owed is a migration, and running it is exactly
+        // what this reader asked to pay for (§10.4).
+        let Some(found) = self.storage.get_cell(&path, cell, at).await? else {
+            return Ok(false);
+        };
+        // Source data is ground truth — there is nothing to compute and nothing behind it.
+        let Some(by) = found.event.derivation else {
+            return Ok(true);
+        };
+        let watermark = self
+            .validate(
+                &path,
+                by.read_set,
+                by.fresh_as_of,
+                ceiling,
+                &mut HashMap::new(),
+            )
+            .await?;
+        Ok(watermark.0 >= ceiling.0)
     }
 
     /// Whether computing inline could change this read's answer.
@@ -307,35 +370,83 @@ impl Resolver {
         Ok(requested.0 >= self.branches.read_path(branch, None)?.ceiling().0)
     }
 
-    /// **Validate**: check whether anything in the read-set moved since the value was computed.
+    /// **Validate**: how far this value can honestly claim to be correct.
     ///
     /// Runs no user code — that is the whole point of separating this from recompute. A cell that
     /// depends on three fields is unaffected by the forty thousand writes that landed meanwhile, and
     /// advances to head for the cost of a few lookups (SPEC.md §10.2).
-    async fn validate(
-        &self,
-        path: &ReadPath,
-        read_set: &[CellAt],
+    ///
+    /// Returns §10.3's composition rather than a yes/no:
+    ///
+    /// ```text
+    /// W(B) = min(target, W(A), W(other deps...))
+    /// ```
+    ///
+    /// Two things are being asked of each dependency, and they are not the same question:
+    ///
+    /// * **Has it moved past what I claim to reflect?** [`Landed::reflects`] is what that is asked
+    ///   of — the *source* layer a record's content reflects — because a watermark points into the
+    ///   source stream. For source data that is where it landed; for derived data it is its
+    ///   producer's watermark, and never the derived layer it sits in, which is always above the
+    ///   source layer it reflects and so would make every chained value look permanently overtaken.
+    /// * **How far is it good for?** Only derived dependencies bound anything: a chain is only as
+    ///   fresh as the hop behind it, so this recurses and takes the minimum. Source data is ground
+    ///   truth and bounds nothing.
+    ///
+    /// `composed` memoizes the answer per dependency, which keeps a diamond-shaped graph linear —
+    /// and doubles as the cycle guard: a dependency reached while it is still being validated
+    /// (`None`) contributes its own stored watermark, which claims nothing it has not earned.
+    fn validate<'a>(
+        &'a self,
+        path: &'a ReadPath,
+        read_set: Vec<CellAt>,
         fresh_as_of: LayerId,
-    ) -> Result<Freshness> {
-        for dependency in read_set {
-            // Each dependency is checked at the version the producer *read it at*, not at the
-            // reader's version. Those differ whenever a migration is involved.
-            //
-            // Against `landed_at`, never `authored`. `fresh_as_of` is a layer on *this* branch, and
-            // a merge can carry an event authored long ago onto it long after this value was
-            // computed. Comparing against where the event was written would call that dependency
-            // unmoved and report a stale value as current — the one thing §10 does not permit.
-            let moved = self
-                .storage
-                .get_cell(path, &dependency.cell, dependency.version)
-                .await?
-                .is_some_and(|found| found.landed_at.0 > fresh_as_of.0);
-            if moved {
-                return Ok(Freshness::Stale);
+        target: LayerId,
+        composed: &'a mut HashMap<CellAt, Option<LayerId>>,
+    ) -> Pin<Box<dyn Future<Output = Result<LayerId>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut watermark = target;
+            for dependency in read_set {
+                // Each dependency is read at the version the producer *read it at*, not at the
+                // reader's version. Those differ whenever a migration is involved.
+                let Some(found) = self
+                    .storage
+                    .get_cell(path, &dependency.cell, dependency.version)
+                    .await?
+                else {
+                    // Absent when it was read, absent now. Absence is a dependency like any other
+                    // (§9.4) and this one has not changed.
+                    continue;
+                };
+                if found.reflects().0 > fresh_as_of.0 {
+                    // Known to have moved: nothing above this value's own watermark is defensible.
+                    return Ok(fresh_as_of);
+                }
+                let Some(upstream) = found.event.derivation else {
+                    continue;
+                };
+                let bound = match composed.get(&dependency) {
+                    Some(Some(known)) => *known,
+                    Some(None) => upstream.fresh_as_of,
+                    None => {
+                        composed.insert(dependency.clone(), None);
+                        let bound = self
+                            .validate(
+                                path,
+                                upstream.read_set,
+                                upstream.fresh_as_of,
+                                target,
+                                composed,
+                            )
+                            .await?;
+                        composed.insert(dependency.clone(), Some(bound));
+                        bound
+                    }
+                };
+                watermark = watermark.min(bound);
             }
-        }
-        Ok(Freshness::Current)
+            Ok(watermark)
+        })
     }
 
     /// The cell is not materialized at the reader's version.
@@ -353,7 +464,7 @@ impl Resolver {
         path: &ReadPath,
         cell: &CellRef,
         _layer: LayerId,
-        version: ClientVersion,
+        version: DefVersion,
     ) -> Result<Resolved<Option<Value>>> {
         let available = self.storage.cell_versions(path, cell).await?;
 
@@ -394,10 +505,11 @@ impl Resolver {
         version: ClientVersion,
     ) -> Result<Option<Lineage>> {
         let path = self.branches.read_path(branch, layer)?;
-        let Some(found) = self.storage.get_cell(&path, cell, version).await? else {
+        let at = self.defs.view_at(&path, version.0).await?.version_of(cell);
+        let Some(found) = self.storage.get_cell(&path, cell, at).await? else {
             return Ok(None);
         };
-        let target = CellAt::new(cell.clone(), version);
+        let target = CellAt::new(cell.clone(), at);
         let dependencies = self.index.dependencies(branch, &target)?;
 
         let mut from = Vec::new();

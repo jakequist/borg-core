@@ -283,9 +283,12 @@ impl BranchManager {
             // *Landed*, not authored: the question is whether the deletion became visible on the
             // parent after the fork, and a tombstone the parent inherited by merge was authored
             // somewhere else entirely.
+            //
+            // Read unversioned, not at `event.version`: that is the def-version of the *property*
+            // this event wrote, and an existence cell sits on no chain of its own (§5.2).
             let deleted = self
                 .storage
-                .get_cell(&path, &existence, event.version)
+                .get_cell(&path, &existence, borg_core::DefVersion::UNVERSIONED)
                 .await?
                 .filter(|found| found.event.value.is_tombstone())
                 .filter(|found| found.landed_at.0 > fork_point.0);

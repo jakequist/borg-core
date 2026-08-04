@@ -4,8 +4,8 @@
 //! `fork` and `merge` mean and the code is made to agree.
 
 use borg_core::{
-    BranchId, CellRef, ClientVersion, DefEvent, LayerAuthor, LayerId, MergeMode, Ownership, Pid,
-    PidKind, ProducerId, RepoId, Result, Value, ValueType, Writer,
+    BranchId, CellRef, ClientVersion, DefEvent, DefVersion, LayerAuthor, LayerId, MergeMode,
+    Ownership, Pid, PidKind, ProducerId, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, InProcessSequencer, LayerManager, WriteSession,
@@ -14,6 +14,10 @@ use borg_storage::{MemoryStorage, StorageProvider};
 use std::sync::Arc;
 
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 const SCORE: ProducerId = ProducerId(1);
 
 fn company(branch: BranchId, n: u64) -> Pid {
@@ -105,7 +109,7 @@ impl Harness {
         let path = self.branches.read_path(branch, None)?;
         Ok(self
             .storage
-            .get_cell(&path, cell, V1)
+            .get_cell(&path, cell, AT_V1)
             .await?
             .map(|found| found.event.value))
     }
@@ -119,7 +123,7 @@ impl Harness {
         let path = self.branches.read_path(branch, Some(layer))?;
         Ok(self
             .storage
-            .get_cell(&path, cell, V1)
+            .get_cell(&path, cell, AT_V1)
             .await?
             .map(|found| found.event.value))
     }

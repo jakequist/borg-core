@@ -6,9 +6,9 @@
 //! read, and the primitive that lets a test wait rather than sleep.
 
 use borg_core::{
-    BranchId, BufferId, CellAt, CellRef, ClientVersion, DefEvent, Derivation, Freshness,
-    FreshnessRequirement, LayerAuthor, LayerId, Ownership, Pid, PidKind, ProducerDef, ProducerId,
-    ProducerKind, RepoId, Result, Value, ValueType, Writer,
+    BranchId, BufferId, CellAt, CellRef, ClientVersion, DefEvent, DefVersion, Derivation,
+    Freshness, FreshnessRequirement, LayerAuthor, LayerId, Ownership, Pid, PidKind, ProducerDef,
+    ProducerId, ProducerKind, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -31,6 +31,10 @@ const TIER: ProducerId = ProducerId(2);
 const LEFT: ProducerId = ProducerId(3);
 const RIGHT: ProducerId = ProducerId(4);
 const V1: ClientVersion = ClientVersion(LayerId(1));
+/// The def-version every field in these tests sits at. One declaration, one def-layer, nothing
+/// mutated since — so this is where the records are keyed, whatever any actor's whole-schema view
+/// has moved on to (SPEC.md §5.3).
+const AT_V1: DefVersion = DefVersion(LayerId(1));
 
 fn company(n: u64) -> Pid {
     Pid::Allocated {
@@ -213,7 +217,7 @@ impl Harness {
                 Derivation {
                     producer,
                     fresh_as_of: LayerId(0),
-                    read_set: vec![CellAt::new(reads, V1)],
+                    read_set: vec![CellAt::new(reads, AT_V1)],
                 },
             )
             .await?;
@@ -506,5 +510,115 @@ async fn a_branch_with_no_producers_has_already_reached_every_layer() -> Result<
     )
     .await
     .expect("waiting for derived data on a branch with none would never return");
+    Ok(())
+}
+
+/// A producer that reads another producer's output can be caught up, and must be able to say so.
+///
+/// `validate` compares each dependency against the layer it landed in. That is the right question
+/// for source data, and the wrong one for derived: a producer's output lands in a *derived* layer,
+/// which by construction has a higher id than the source layer it reflects — so a chained
+/// dependency always looked as though it had moved after the value that read it, and every chained
+/// cell was reported stale on a fully settled branch. §10.3 says what to compare instead:
+///
+///     W(B) = min(target, W(A), W(other deps))
+///
+/// — the dependency's *watermark*, not where it landed.
+#[tokio::test]
+async fn a_chained_producer_on_a_caught_up_branch_is_current() -> Result<()> {
+    let h = Harness::new().await?;
+    let acme = company(400);
+    h.push(vec![
+        (existence(acme), Value::Bool(true)),
+        (prop(acme, "website"), Value::Int(9)),
+    ])
+    .await?;
+    h.engine.catch_up(BRANCH).await?;
+
+    let first = h
+        .read(
+            &prop(acme, "is_investible"),
+            FreshnessRequirement::Validated,
+        )
+        .await?;
+    assert_eq!(
+        first.state,
+        Freshness::Current,
+        "the first hop reads only source data and has always been able to reach current"
+    );
+
+    let second = h
+        .read(&prop(acme, "tier"), FreshnessRequirement::Validated)
+        .await?;
+    assert_eq!(second.value, Some(Value::Int(1)));
+    assert_eq!(
+        second.state,
+        Freshness::Current,
+        "and the second hop is no less caught up for having read the first"
+    );
+    Ok(())
+}
+
+/// …and `current` is still earned rather than assumed: a chain behind its source is behind.
+///
+/// The composition is a `min`, so the second hop reports the *first* hop's watermark — not head,
+/// which would be a lie, and not its own last run, which would understate how far the chain is
+/// known to be good for.
+#[tokio::test]
+async fn a_chain_is_only_as_fresh_as_the_hop_behind_it() -> Result<()> {
+    let (h, acme, settled) = stale_world().await?;
+
+    let first = h
+        .read(
+            &prop(acme, "is_investible"),
+            FreshnessRequirement::Validated,
+        )
+        .await?;
+    assert_eq!(
+        first.state,
+        Freshness::Stale,
+        "the source it reads has moved and nothing has re-run"
+    );
+
+    // `tier`'s own dependency — `is_investible` — has not been rewritten at all. It is behind
+    // anyway, because what it was computed from is behind.
+    let second = h
+        .read(&prop(acme, "tier"), FreshnessRequirement::Validated)
+        .await?;
+    assert_eq!(
+        second.state,
+        Freshness::Stale,
+        "staleness propagates down the chain rather than stopping at the producer that moved"
+    );
+    assert_eq!(
+        second.fresh_as_of, settled,
+        "and the watermark it reports is the minimum over the chain (SPEC.md §10.3)"
+    );
+    Ok(())
+}
+
+/// `--freshness current` on a chained cell converges: asking twice does not run the producer twice.
+///
+/// The pessimistic comparison made this unreachable — every read recomputed, reported stale, and
+/// left the next read exactly as much work to do.
+#[tokio::test]
+async fn asking_a_chained_cell_for_current_twice_does_not_compute_twice() -> Result<()> {
+    let (h, acme, _) = stale_world().await?;
+
+    let first = h
+        .read(&prop(acme, "tier"), FreshnessRequirement::Current)
+        .await?;
+    assert_eq!(first.state, Freshness::Current);
+    let after_first = h.layers.head(BRANCH).unwrap();
+
+    let second = h
+        .read(&prop(acme, "tier"), FreshnessRequirement::Current)
+        .await?;
+    assert_eq!(second.state, Freshness::Current);
+    assert_eq!(
+        h.layers.head(BRANCH).unwrap(),
+        after_first,
+        "the second read found the value already correct and committed nothing"
+    );
     Ok(())
 }

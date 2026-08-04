@@ -5,9 +5,9 @@
 //! triggered by a data write, a migration by a def-mutation.
 
 use borg_core::{
-    BranchId, BufferId, CellRef, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
-    LayerAuthor, LayerId, MigrationDirection, Origin, Ownership, Pid, PidKind, ProducerDef,
-    ProducerId, ProducerKind, RepoId, Result, Value, ValueType, Writer,
+    BranchId, BufferId, CellRef, ClientVersion, DefEvent, DefVersion, Freshness,
+    FreshnessRequirement, LayerAuthor, LayerId, MigrationDirection, Origin, Ownership, Pid,
+    PidKind, ProducerDef, ProducerId, ProducerKind, RepoId, Result, Value, ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, DerivationEngine, FrontierTracker,
@@ -571,8 +571,15 @@ async fn a_migration_bridges_the_versions_its_branch_records() -> Result<()> {
     let role = view
         .migration_role(&migration_def(UP, MigrationDirection::Up))
         .expect("the chain names this producer as the field's `up`");
-    assert_eq!(role.input, v_from, "up reads the older version");
-    assert_eq!(role.output, v_to, "and writes the newer one");
+    // A `DefVersion` on each side: the actor versions the test pushed at are whole-schema views,
+    // and what a chain names is one field's own version (SPEC.md §5.3). Here they coincide because
+    // each push touched only `website`.
+    assert_eq!(
+        role.input,
+        DefVersion(v_from.0),
+        "up reads the older version"
+    );
+    assert_eq!(role.output, DefVersion(v_to.0), "and writes the newer one");
     assert_eq!(
         role.step,
         vec![UP],

@@ -11,8 +11,8 @@ pub use memory::MemoryStorage;
 
 use async_trait::async_trait;
 use borg_core::{
-    Branch, BranchId, BufferId, CellRef, ClientVersion, DefEvent, Event, EventDraft, EventId,
-    Landed, Layer, LayerId, Pid, PidKind, ReadPath, Result,
+    Branch, BranchId, BufferId, CellRef, DefEvent, DefVersion, Event, EventDraft, EventId, Landed,
+    Layer, LayerId, Pid, PidKind, ReadPath, Result,
 };
 
 /// A handle to an open, invisible layer that is accepting writes. SPEC.md §6.2.
@@ -70,6 +70,10 @@ pub trait StorageProvider: Send + Sync {
     /// the migrated view a v5 client reads coexist. Were version merely a tag, a migration would
     /// overwrite the very value it migrated from.
     ///
+    /// The version asked for is a [`DefVersion`] — this *field's* version, not the caller's
+    /// whole-schema view (§5.3). Translating one into the other needs the definitions, which is
+    /// exactly the knowledge a provider does not have and must not need.
+    ///
     /// Returns only what is physically stored; the engine layers migration, validation and
     /// provenance on top.
     /// Reads resolve through a [`ReadPath`] rather than a bare branch, so that a fork inherits its
@@ -86,12 +90,12 @@ pub trait StorageProvider: Send + Sync {
         &self,
         path: &ReadPath,
         cell: &CellRef,
-        version: ClientVersion,
+        version: DefVersion,
     ) -> Result<Option<Landed>>;
 
     /// Which def-versions this cell is materialized at, as of a layer. Used by the resolver to find
     /// a migration path when the requested version is not yet materialized.
-    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<ClientVersion>>;
+    async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<DefVersion>>;
 
     /// Enumerate a buffer. **Engine-internal only** — used by the scheduler to discover new
     /// entities (SPEC.md §9.6). Enumeration is not exposed as a user-facing query in v1.

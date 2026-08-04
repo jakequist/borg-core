@@ -383,8 +383,8 @@ async fn a_def_mutation_records_a_migration_step() -> Result<()> {
     let hops = view
         .path(
             &borg_core::BufferId::ObjectProp("Company".into(), "score".into()),
-            borg_core::ClientVersion(LayerId(1)),
-            borg_core::ClientVersion(mutated),
+            borg_core::DefVersion(LayerId(1)),
+            borg_core::DefVersion(mutated),
         )
         .expect("a path exists, because the mutation supplied migrations");
     assert_eq!(hops.len(), 1, "one def-mutation, one hop");
