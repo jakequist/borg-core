@@ -44,6 +44,14 @@ composition, so a producer reading another producer's output can reach `current`
 reported stale forever. `110-def-push-keeps-data` and `120-invalidation-survives-a-def-push` are the
 two scenarios; the second exists because S1 structurally cannot see that failure.
 
+**Every client write is a transaction.** A client forks, writes in isolation and merges; `borg set`
+is that done in one process. A transaction records what it reads, and at commit those reads *are* its
+guards — so the safe path is now the only path, and last-write-wins is what remains for a cell nobody
+read rather than what everybody gets by default. Two transactions racing to increment one counter
+resolve to one increment in either commit order, and two racing to create one object resolve to one
+object. Transactions are ephemeral and reaped on an idle timeout; branches are the durable form of
+the same idea, and nothing reaps those.
+
 Act 1 is the modern ORM.
 
 ---
@@ -168,7 +176,26 @@ where it landed. `StorageProvider` grew `author_event` / `include_event` / `rebu
 `crates/borg-engine/tests/events.rs` is S11 and S12, and the `StorageProvider` contract now runs
 against **both** backends rather than SQLite alone.
 
-**Phases 2 and 3 — transactions and derivation-as-a-transaction — are not started.**
+### F — every client write is a transaction, and its guards are automatic
+
+Phase 2 of the transactional model (`SPEC-DRAFT.md` §2, §5, §7.1). A client no longer writes to a
+shared branch: `borg tx begin | get | set | delete | commit | abort` forks, writes in isolation and
+merges, and a bare `borg set X v` is that same thing done in one process. What a transaction read
+becomes what its commit is contingent on, re-evaluated against the parent since the fork point — so
+guards stopped being opt-in without the guard machinery changing at all. `Transaction` is a value
+type in `borg-core` carrying the fork point, the read-set and the write-set;
+`BranchManager::merge_transaction` is the commit; `LayerManager::check_reads` is the automatic half
+of `check_guards`. `WriteSession` now reports what it probed and what it wrote, which is what puts
+the implied-existence read (§8) into the read-set where it belongs. Transaction state lives beside
+the store with the pause flags, and is reaped on an idle timeout swept when a process opens the
+store. §12 and §13 are updated; `scenarios/130`, `140` and `150` are S2–S6 plus the surface and the
+reaping, and `crates/borg-engine/tests/transactions.rs` has the guard-derivation rules underneath
+them.
+
+Four decisions came out of it, below. The fan-out curve is unchanged: 128k entities at four cores
+derive in 1.61s against 1.56s before, and the shape is still linear.
+
+**Phase 3 — derivation as a transaction — is not started.**
 
 ### Deferred, still
 
@@ -679,6 +706,75 @@ What is *not* done: `refresh` still re-runs every hop of a chain once any hop is
 only the hops that are. That costs work, never correctness, and needs validation to be callable from
 the derivation engine — which today would mean either duplicating it or handing the engine the
 resolver, and the second is the dependency direction `InlineDerivation` exists to keep one-way.
+
+### The read-minus-written rule is about order, not about set difference
+
+`SPEC-DRAFT.md` §2 says *"guard the cells you read and did not write"*, and taken literally as a set
+difference it deletes compare-and-swap. A transaction that reads `X` and then writes `X` — the
+ordinary read-modify-write, and the case §2 itself says the guard should *fall out* of — would have
+`X` in both sets, so `X` would be dropped and two concurrent increments would both land with one
+silently lost.
+
+The reason §2 gives is the correct rule: a read that returned the transaction's **own write** says
+nothing about the parent. So a read is recorded unless the transaction has *already* written that
+cell, and `Transaction::observe` enforces that at the moment of the read rather than by subtracting
+sets at the end. Write-then-read contributes nothing; read-then-write is a compare-and-swap. §12.1
+now states it this way, and `140-transaction-conflicts` is the counter-example that would have
+caught the set-difference version.
+
+### `since` is the fork point for every guard, and per-read tracking would be wrong
+
+The obvious refinement — record *when* each read happened and use that as its `since` — is not merely
+unnecessary, it is unsound. A transaction's read path is bounded at the fork point (§7.2), so every
+read observes the parent as the parent stood *then*, whenever during the transaction's life it
+happens. Using the moment of the read would ignore every parent write between the fork and the read
+— writes the transaction provably did not see, because they were above its bound — which is the exact
+set a guard exists to catch. One `since`, and it is the snapshot the reads came from.
+
+### An automatic guard on a derived cell is dropped, not rejected
+
+`check_guards` rejects a guard naming a derived cell (§12): guarding a shadow is meaningless. Applied
+to an automatic guard that rule makes a transaction unable to commit *because it looked at a computed
+value*, which is a strange thing to punish — and it catches migrated data too, where the field is
+declared source but its records are a migration's output, so reading `Company.founded` in
+`100-watermark-truth`'s store would have been enough.
+
+`LayerManager::check_reads` therefore asks the touch question and not the derivedness one. It is also
+the cheaper half: the touch index records source layers only, so a derived cell can never be in it
+and the guard could not have tripped anyway, while `is_derived_anywhere` costs a storage read per
+cell per version on a read-set §7.7 says is unbounded. The hand-written guard keeps its rejection,
+because that one is a client asserting something it cannot mean.
+
+### The implicit existence read counts for `borg set` too
+
+`SPEC-DRAFT.md` §5 says a bare `borg set X v` "reads nothing, so it carries no guards". That is true
+of the cell it writes and false of the object it may create: the implied-existence probe (§8) is a
+read, and `borg set` is *the* common path on which two clients race to create the same object. Making
+the one-shot behave differently from `begin; set; commit` would also make "every client write is a
+transaction" true only in the telling.
+
+So the one-shot carries exactly the guards the explicit form would: none on the cell it writes, which
+is last-write-wins as §12 promises, and one on the existence cell it probed. When the object already
+exists that guard can only be tripped by a concurrent *deletion*, which is a conflict anyone would
+want reported.
+
+### A transaction that fails to commit stays open
+
+A rejected commit leaves the transaction where it was rather than aborting it. Its snapshot is stale
+and its commit cannot succeed, but the read-set is what a client needs in order to decide whether to
+retry or give up, and destroying it there leaves them holding an error and nothing else. `borg tx
+abort` is the explicit half, and the idle timeout collects the ones nobody comes back to.
+
+### An empty branch's first write is not a transaction, and cannot be
+
+A transaction forks the highest layer its branch can see, so a branch whose entire ancestry is empty
+has nothing to fork. `borg set` on such a branch writes directly. This is safe rather than a hole:
+§8.0 makes every write contingent on definitions, definitions are def layers, and a branch with no
+layers has none — so the write is going to be rejected whatever path it takes, and taking the direct
+one is what gets the caller *"no struct named `Wombat`"* instead of *"nothing to fork from"*. There is
+also nothing to isolate from: anything concurrent would have left a layer.
+
+`scenarios/060-definitions-enforced` opens on exactly this write, which is how the case was found.
 
 ---
 

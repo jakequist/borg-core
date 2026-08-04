@@ -53,8 +53,8 @@ use crate::defs::{DefRegistry, DefView};
 use crate::log::{LayerHandle, LayerManager};
 use crate::values::Values;
 use borg_core::{
-    AllocatorId, BranchId, BufferId, CellRef, ClientVersion, Derivation, EventDraft, LayerAuthor,
-    LayerId, LayerKind, ReadPath, Result, Value, ValueType, Writer, parse,
+    AllocatorId, BranchId, BufferId, CellAt, CellRef, ClientVersion, Derivation, EventDraft,
+    LayerAuthor, LayerId, LayerKind, ReadPath, Result, Value, ValueType, Writer, parse,
 };
 use borg_storage::StorageProvider;
 use std::collections::HashSet;
@@ -82,6 +82,15 @@ pub struct WriteSession {
     /// Existence cells this session has already written, so the implied-existence write below
     /// happens at most once per object per layer.
     touched: HashSet<CellRef>,
+    /// What a client session read and wrote, for the transaction that owns it (SPEC.md §12).
+    ///
+    /// **Client sessions only.** A producer's read-set already comes from `ProducerCtx`, and a
+    /// derived layer may hold millions of mutations that must never be buffered whole (§6.2) — so
+    /// recording every cell a producer writes would break the one constraint the log is built
+    /// around. A client transaction's sets are unbounded too (§7.7), and that is a cost it has
+    /// chosen: it is going to carry them to its own commit either way.
+    observed: Vec<CellAt>,
+    authored: Vec<CellRef>,
 }
 
 impl WriteSession {
@@ -118,7 +127,27 @@ impl WriteSession {
             writer,
             handle,
             touched: HashSet::new(),
+            observed: Vec::new(),
+            authored: Vec::new(),
         })
+    }
+
+    /// What this session read on the way to writing — today, exactly the existence probes below.
+    ///
+    /// Handed to the owning transaction as part of its read-set (SPEC.md §12). **An implicit read is
+    /// a read**: without it two transactions can each probe an object, each find it absent, and each
+    /// create it, with the second silently overwriting a decision the first made.
+    ///
+    /// Every probe precedes every write to the same cell within one session, which is what lets a
+    /// caller drain these in a batch and still get the ordering rule
+    /// ([`Transaction::observe`](crate::transaction::Transaction::observe)) right.
+    pub fn observed(&self) -> &[CellAt] {
+        &self.observed
+    }
+
+    /// Every cell this session wrote, implied existence cells included.
+    pub fn authored(&self) -> &[CellRef] {
+        &self.authored
     }
 
     /// The layer this session writes into. Reserved at open, which is why it can be named before
@@ -210,6 +239,9 @@ impl WriteSession {
             derivation,
         };
         self.handle.put(cell, draft).await?;
+        if self.writer == Writer::Client {
+            self.authored.push(cell.clone());
+        }
         Ok(())
     }
 
@@ -267,6 +299,11 @@ impl WriteSession {
         // look like a fresh entity to every producer mapping over the buffer, and re-derive the
         // world on a declaration that said nothing about it.
         let version = self.defs.version_of(&existence);
+        // Recorded whatever the probe finds. *Absence is a legitimate thing to have acted on*
+        // (§9.4): deciding to create an object because it was not there is a decision a later
+        // creation must invalidate, and a probe recorded only when it succeeds records exactly the
+        // half that needed no protection.
+        self.observed.push(CellAt::new(existence.clone(), version));
         if self
             .storage
             .get_cell(&self.path, &existence, version)
@@ -282,6 +319,7 @@ impl WriteSession {
             derivation: None,
         };
         self.handle.put(&existence, draft).await?;
+        self.authored.push(existence);
         Ok(())
     }
 

@@ -223,13 +223,43 @@ impl LayerManager {
                 if self.is_derived_anywhere(&path, cell).await? {
                     return Err(BorgError::GuardOnDerivedCell { cell: cell.clone() });
                 }
-                if let Some(mutated_at) = self.touches.touched_since(&path, cell, since)? {
-                    return Err(BorgError::GuardViolated {
-                        cell: cell.clone(),
-                        since,
-                        mutated_at,
-                    });
-                }
+            }
+            self.check_touched(&path, &guard.cells, since)?;
+        }
+        Ok(())
+    }
+
+    /// Check an **automatic** guard set — a transaction's read-set — against a branch's history
+    /// since a layer. SPEC.md §12.
+    ///
+    /// The same question [`check_guards`](Self::check_guards) asks, minus one check, and the
+    /// difference is deliberate: a cell here was *read*, not asserted about. A client that read a
+    /// derived value made no claim the system could hold it to, so the read contributes no guard
+    /// rather than making the commit illegal — refusing to commit a transaction because it looked at
+    /// derived data would be a strange reward for looking. It could not trip anyway: the touch index
+    /// records source layers only (§12), so a derived cell is never in it, and asking the question
+    /// costs a storage read per cell per version on a set §7.7 says is unbounded.
+    ///
+    /// `GuardOnDerivedCell` therefore stays what it always was — the answer to a client *writing* a
+    /// guard by hand on a cell it cannot usefully guard.
+    pub fn check_reads(&self, branch: BranchId, cells: &[CellRef], since: LayerId) -> Result<()> {
+        if cells.is_empty() {
+            return Ok(());
+        }
+        let path = self.read_path(branch, None)?;
+        self.check_touched(&path, cells, since)
+    }
+
+    /// *Has anything touched these cells since that layer?* — the one question both guard paths ask,
+    /// so that neither can drift into asking a slightly different one.
+    fn check_touched(&self, path: &ReadPath, cells: &[CellRef], since: LayerId) -> Result<()> {
+        for cell in cells {
+            if let Some(mutated_at) = self.touches.touched_since(path, cell, since)? {
+                return Err(BorgError::GuardViolated {
+                    cell: cell.clone(),
+                    since,
+                    mutated_at,
+                });
             }
         }
         Ok(())

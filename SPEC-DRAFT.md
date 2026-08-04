@@ -1,16 +1,18 @@
 # Draft: the transactional model
 
 > **Status: draft, not normative.** `SPEC.md` describes the system that exists. This describes a
-> proposed successor. Nothing here is built.
+> proposed successor. **Phases 1 and 2 are built** — what they became is normative in `SPEC.md`, and
+> the sections here are marked. Phase 3 is not started.
 
 Three changes, which turn out to be one change seen from three angles:
 
-1. **Events get identity; layers reference them.** Today an event carries the layer it lives in.
-   Inverting that lets one event belong to several layers, which is what makes a merge cheap.
-2. **Every client write is a transaction.** A client forks, writes in isolation, and merges. It never
-   writes to a shared branch.
+1. ~~**Events get identity; layers reference them.**~~ **Built** — `SPEC.md` §4.3, §6.2, §13. Today an
+   event carries the layer it lives in. Inverting that lets one event belong to several layers, which
+   is what makes a merge cheap.
+2. ~~**Every client write is a transaction.**~~ **Built** — `SPEC.md` §12, §13. A client forks, writes
+   in isolation, and merges. It never writes to a shared branch.
 3. **Derivation is a transaction too.** A round forks, runs, and merges. Producers are writers like
-   any other.
+   any other. *Not started.*
 
 Together they delete more than they add. The round ceiling (§16.5), the read-path hole it leaves,
 and the merge-versus-round exclusion that would otherwise be needed all stop existing rather than
@@ -76,6 +78,11 @@ other index in the system it is a projection of the log and can be rebuilt from 
 ---
 
 ## 2. Transactions are the only write path
+
+> **Built.** Normative in `SPEC.md` §12. One thing changed on the way: *"guard the cells you read and
+> did not write"* is implemented as an **ordering** rule rather than a set difference, because taken
+> as a set difference it deletes read-modify-write — see §12.1 and `ROADMAP.md`. Two things below are
+> still open and belong to phase 3: rounds as transactions, and partial application.
 
 No client writes to a shared branch. A write is:
 
@@ -201,6 +208,13 @@ with a watermark that says so. The system already describes exactly this situati
 
 ## 5. Capturing a client's read-set
 
+> **Built.** Normative in `SPEC.md` §12.1 and §12.2. The CLI surface below is exactly what shipped,
+> plus `borg tx delete`, `borg tx list`, `borg tx timeout`, and a `--tx` handle (or `$BORG_TX`) so
+> that one shell can hold two transactions open at once — which is what makes the interleavings in
+> §9's S2–S6 expressible at all. One correction: the bare `borg set` does carry the implicit
+> existence read, and so is a blind write on the cell it writes and a guarded one on the object it
+> may create; see `ROADMAP.md`.
+
 A producer's read-set is free: every access goes through `ProducerCtx`, so the engine sees it. A
 client has no equivalent, and this is the one piece of the model with no existing machinery.
 
@@ -274,6 +288,12 @@ The architecture gets smaller. That is the strongest argument for it.
 Ordered by how much they worry me.
 
 ### 7.1 Abandoned transactions — answered
+
+> **Built for client transactions.** Normative in `SPEC.md` §12.3. `borg tx timeout` is the switch,
+> beside the store; the default is 24h; the sweep runs when a process opens the store. Reaping
+> **rounds** by the same mechanism waits for phase 3, and so does the divergence-based refinement
+> below. What a reaped transaction leaves behind is its branch row — see `SPEC.md` §12.3 and §7.5
+> here.
 
 A `tx begin` with no commit would leak a branch and its state forever. The answer is a configured
 **idle timeout**: a transaction untouched for longer than that is reaped.
@@ -379,7 +399,8 @@ feature test.
 ### The claim that must not be false
 
 **S1 — every watermark tells the truth.** For any derived cell: read its stated `reflects`, fork
-there, recompute from scratch, compare. Identical, always.
+there, recompute from scratch, compare. Identical, always. — **built**,
+`scenarios/100-watermark-truth`.
 
 This checks §10.1's headline claim directly rather than by proxy, and every ordering bug found so far
 would have surfaced here. It is a *property* over whatever state other scenarios leave behind, which
@@ -388,20 +409,23 @@ makes it the cheapest ongoing insurance available.
 ### Guards, the newly load-bearing mechanism
 
 **S2 — a stale transaction is rejected in either merge order.** *Failing means order-enforcement crept
-back in.*
+back in.* — **built**, `scenarios/140-transaction-conflicts`.
 
 **S3 — absence is a guarded read.** Two transactions both observe a cell absent and both try to create
 it; one must lose. *Failing means absence tracking is decorative and concurrent creates silently
-duplicate.*
+duplicate.* — **built**, `scenarios/140-transaction-conflicts`.
 
 **S4 — a transaction does not conflict with itself.** Write `X`, read `X`, commit. *Failing means the
-parent-reads-only rule is wrong and every read-modify-write deadlocks itself.*
+parent-reads-only rule is wrong and every read-modify-write deadlocks itself.* — **built**,
+`scenarios/130-transactions`.
 
 **S5 — guards do not over-reject.** Two transactions writing different fields of one object both land.
-*Failing means guards are object-granular in practice and cell granularity is fiction.*
+*Failing means guards are object-granular in practice and cell granularity is fiction.* — **built**,
+`scenarios/130-transactions`.
 
 **S6 — deleting an object conflicts with writing to it.** *This is the test for "implicit reads count":
-the writer's existence probe is what makes it a conflict.*
+the writer's existence probe is what makes it a conflict.* — **built**,
+`scenarios/140-transaction-conflicts`.
 
 ### Derivation as a transaction
 
@@ -422,10 +446,11 @@ and we have re-derived the ceiling problem.*
 
 **S11 — authorship survives merge.** A merged value reports both where it was authored and where it
 landed. *Failing means we inverted the pointers and kept rewriting anyway: no cost saved, no lineage
-gained.*
+gained.* — **built**, `crates/borg-engine/tests/events.rs`.
 
 **S12 — time travel across a merge is coherent**, and one event referenced by two layers resolves to
-one identity rather than two values. *This is the specific risk the inversion introduces.*
+one identity rather than two values. *This is the specific risk the inversion introduces.* —
+**built**, `crates/borg-engine/tests/events.rs`.
 
 ### Composition — features that have never met
 

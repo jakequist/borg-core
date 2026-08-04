@@ -1,7 +1,13 @@
-//! Branches, forking, and merge. SPEC.md §7, §13.
+//! Branches, forking, and merge. SPEC.md §7, §12, §13.
 //!
 //! A fork is O(1) even under eager derivation: a new branch inherits its parent's layers — source
 //! and derived alike — by ancestry, and diverges only where it writes.
+//!
+//! **Every client write comes through here**, because every client write is a transaction (§12):
+//! fork, write in isolation, merge. `merge_transaction` is that last step, and the only thing it
+//! adds to an ordinary merge is the transaction's read-set, checked against the parent since the
+//! fork point. That is the same question a merge already asked — "did the parent touch this while I
+//! was working?" — so making guards automatic changed what gets asked, not what does the asking.
 //!
 //! Merge replays the child's **source** layers onto the parent as new layers. Derived layers are
 //! skipped, because the child's derived values are wrong on the parent by construction: they were
@@ -141,6 +147,54 @@ impl BranchManager {
         let parent = self
             .parent_of(child)
             .ok_or(BorgError::Storage("child has no parent".into()))?;
+        self.replay(child, parent, origin, mode, &[]).await
+    }
+
+    /// Commit a client transaction: merge it, guarded by everything it read. SPEC.md §12, §13.
+    ///
+    /// The transaction carries its own parent and fork point rather than having them inferred from
+    /// the branch's origin layer, because the two differ in the ordinary case of a transaction opened
+    /// on a branch that has nothing on it yet: the fork is taken at the highest layer that branch can
+    /// *see*, which belongs to an ancestor, while the merge must still land on the branch the client
+    /// named.
+    ///
+    /// **All-or-nothing.** A transaction expresses one intent, so one failed guard rejects the whole
+    /// thing (§13). Partial application belongs to rounds, which are `N` independent computations
+    /// with no invariant spanning any two of them.
+    pub async fn merge_transaction(
+        &self,
+        transaction: &borg_core::Transaction,
+        mode: MergeMode,
+    ) -> Result<Vec<LayerId>> {
+        self.replay(
+            transaction.branch,
+            transaction.parent,
+            transaction.fork_point,
+            mode,
+            &transaction.guards(),
+        )
+        .await
+    }
+
+    /// The merge itself: validate everything against the parent, then apply.
+    ///
+    /// `reads` is the committing transaction's read-set turned into guards (§12). It is checked
+    /// **once, first, against the parent as it stood before any of this merge landed** — and that
+    /// ordering is load-bearing rather than tidy. Checking it per layer as the layers were applied
+    /// would let the first layer of a merge trip a guard belonging to the second, so a transaction
+    /// that wrote two layers would conflict with itself for no reason other than the order this
+    /// function happens to walk them in.
+    async fn replay(
+        &self,
+        child: BranchId,
+        parent: BranchId,
+        origin: LayerId,
+        mode: MergeMode,
+        reads: &[CellRef],
+    ) -> Result<Vec<LayerId>> {
+        if let Err(violation) = self.layers.check_reads(parent, reads, origin) {
+            return Err(rejection(violation));
+        }
 
         let replayable = self.replayable_layers(child, mode);
 
@@ -162,11 +216,17 @@ impl BranchManager {
                 }
             }
             let events = self.contents_of(*layer).await?;
-            self.check_dangling(parent, origin, &events).await?;
 
             // Re-evaluate the child's guards against the *parent*, since the fork point. "Has the
             // parent touched this while I was working?" is exactly the definition of a merge
             // conflict, so guards double as the conflict detector for free (SPEC.md §13).
+            //
+            // **Before the dangling check, not after.** Since the writer's own existence probe is
+            // now in its read-set (§12), "the child wrote to an object the parent deleted" is a
+            // guard failure first and a dangling write second — and the guard is the more useful of
+            // the two things to be told, because it names the cell that moved rather than the cell
+            // that suffered for it. The dangling check stays as the backstop for a *blind* write,
+            // which observed nothing and so carries nothing to check.
             let guards = self
                 .layers
                 .layer(*layer)
@@ -177,13 +237,9 @@ impl BranchManager {
                 .check_guards(parent, &guards, Some(origin))
                 .await
             {
-                return Err(match violation {
-                    BorgError::GuardViolated { cell, .. } => {
-                        BorgError::MergeRejected(MergeRejection::GuardConflict { cell })
-                    }
-                    other => other,
-                });
+                return Err(rejection(violation));
             }
+            self.check_dangling(parent, origin, &events).await?;
             staged.push(events);
         }
 
@@ -303,7 +359,21 @@ impl BranchManager {
     }
 }
 
+/// A failed guard, said as a merge conflict.
+///
+/// The two are the same event seen from either end — a guard is checked at seal *and* re-evaluated
+/// against a parent — so the translation lives in one place rather than at each call site.
+fn rejection(violation: BorgError) -> BorgError {
+    match violation {
+        BorgError::GuardViolated { cell, .. } => {
+            BorgError::MergeRejected(MergeRejection::GuardConflict { cell })
+        }
+        other => other,
+    }
+}
+
 //
 //
-// Everything else is last-write-wins per cell, which is the documented default: guards are the
-// opt-in to safety, not the baseline.
+// A cell no transaction read is last-write-wins, which is the documented default and now the only
+// way to get it: a client that expressed no dependency on prior state gets what every database gives
+// a blind write (SPEC.md §12).

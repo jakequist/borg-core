@@ -15,6 +15,7 @@ pub mod ids;
 pub mod layer;
 pub mod parse;
 pub mod pid;
+pub mod transaction;
 pub mod value;
 
 pub use cell::{
@@ -32,4 +33,5 @@ pub use ids::{
 pub use layer::{Branch, Guard, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
 pub use parse::ParseError;
 pub use pid::{Pid, PidAllocator, PidKind};
+pub use transaction::Transaction;
 pub use value::{ObjectTypeName, Value, ValueInput, ValueType};

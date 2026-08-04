@@ -1221,6 +1221,98 @@ reported — that is lineage merge used to destroy (§4.3, §13).
 
 ## 12. Transactions
 
+**A transaction is the only client write path.** No client writes to a shared branch. A write is:
+
+```
+fork → write → merge
+```
+
+The fork's read path is bounded at the fork point (§7.2), so a transaction reads **a consistent
+snapshot**; guards re-evaluated against the parent since that fork point are already the
+merge-conflict detector (§13). Together that is snapshot isolation with optimistic concurrency
+control, assembled entirely out of mechanisms that existed for other reasons.
+
+Three consequences:
+
+- **Every trunk layer is one complete intent.** Never a partial write, never two intents interleaved.
+- **The safe path is the only path.** Guards used to be opt-in, which meant §13's last-write-wins was
+  what people actually got. It is now what a client gets only where it expressed no dependency at all.
+- **Transaction branches are created with derivation paused.** Deriving on a branch that exists to be
+  merged is waste: merge does not carry derived layers, and the parent recomputes.
+
+### 12.1 Guards are automatic
+
+A transaction records what it **read**; at commit, those reads *are* its guards. This is the same
+read-set shape producers already record (§9.4) — `CellAt`, cell and the def-version it was read at —
+so one mechanism serves both.
+
+**Captured:** every read made *through* the transaction, including reads that found nothing, and
+including the implicit ones. **Not captured:** anything read outside it. A client that runs `borg
+get X`, thinks, then opens a transaction and writes based on what it saw gets no protection for that
+read. This is the ordinary limitation of every optimistic system and is worth saying rather than
+implying: **a transaction can only guard what it observed through the transaction.**
+
+Four rules make it correct, each of which exists because something breaks without it.
+
+**Guard the cells you read and had not yet written.** A transaction that writes `X` and *then* reads
+`X` saw its own write, not the parent's state, so that read expresses no dependency on the parent.
+The rule is about **order**, not about set difference: a read that came *before* the transaction's
+own write did observe the parent and is guarded, which is exactly what makes compare-and-swap fall
+out of reading a cell before writing it. Collapse the two into "reads minus writes" and every
+read-modify-write silently stops being protected.
+
+**Evaluate every guard against the parent as it stood before the merge, then apply.** A transaction
+that wrote two layers would otherwise trip its own guard: the first layer to land touches a cell the
+second's guard names, and the transaction conflicts with itself for no reason but the order the
+merge walks its layers in.
+
+**Implicit reads count.** The existence probe a write performs (§8, implied existence) is a read and
+belongs in the read-set. Otherwise two transactions can each conclude an object does not exist and
+each create it, with the second silently overwriting a decision the first made.
+
+**Reads that found nothing count.** Absence is a legitimate thing to have acted on, and a later write
+to that cell must invalidate the decision — the same rule producers already follow (§9.4).
+
+**A write with no reads has no guards.** Such a transaction is last-write-wins on the cells it
+touches. That is honest — the client expressed no dependency on prior state — and it is what every
+database does with a blind write.
+
+**An automatic guard on a derived cell contributes nothing, silently.** Guarding derived data is
+meaningless (below), but a client that *read* it asserted nothing, so the read is dropped rather than
+the commit refused. A hand-written guard naming a derived cell is still an error: that one is a
+client saying something it cannot mean.
+
+### 12.2 Where a transaction's state lives
+
+A transaction spans several client calls, so it needs somewhere to keep which branch it forked, where
+it forked, and what it has read. That is **operational state, not log data** — it dies when the
+transaction ends — so it sits beside the store with the pause flags and the producer-implementation
+table (§9.2), never in the log, where it would be forkable, mergeable and time-travellable for no
+one's benefit.
+
+A transaction carries its parent branch explicitly rather than inferring it from the branch it forked.
+The two differ in the ordinary case of a transaction opened on a branch with no layers of its own: the
+fork is taken at the highest layer that branch can *see*, which belongs to an ancestor, while the
+merge must still land on the branch the client named.
+
+### 12.3 Transactions are ephemeral; branches are durable
+
+A transaction opened and never finished would leak a branch and its read-set forever. The answer is a
+configured **idle timeout**: a transaction untouched for longer than that is reaped.
+
+Idle rather than elapsed, so a long but active transaction survives and an abandoned short one does
+not — the predictor of a doomed transaction is silence, not age. Reaping sweeps **opportunistically
+when a process opens the store**, the same place the indexes are already rebuilt (§16), so there is
+no daemon and an idle store sweeps nothing because nothing is growing.
+
+The error when a client touches a reaped transaction must say *expired after N idle*, never *unknown
+transaction*. The first tells you what to do.
+
+This draws a line worth naming: **transactions are ephemeral and reaped; branches are durable and
+explicit.** A client that wants to walk away and come back wanted a branch (§7).
+
+### 12.4 The guard mechanism
+
 v1 supports `ObjectTransaction` only. `ListTransaction` and others are deferred.
 
 ```ts
@@ -1247,7 +1339,9 @@ lets a child's guard be re-evaluated against its parent at merge time.
 
 **Guards may reference source cells only.** Guarding a derived field is meaningless — its value is a
 function of source data with a lag, so the guard would be checking a shadow. Guard the sources
-instead.
+instead. A derived cell is never in the touch index, so such a guard could not trip in any case;
+rejecting it exists to catch a client asserting something it cannot mean, which is why an
+*automatic* guard on one is dropped instead (§12.1).
 
 ---
 
@@ -1298,14 +1392,24 @@ parent.
 | Situation | Result |
 |---|---|
 | Parent moved the same def since fork | reject merge — the child authored against a def-view the parent has since moved, so re-fork from head and redo |
-| Child wrote to an object the parent deleted | reject merge |
 | Child guard fails when re-evaluated against parent history since the fork point | reject merge |
-| Two branches wrote the same cell, unguarded | last-write-wins — child wins |
+| Child wrote to an object the parent deleted | reject merge |
+| Two branches wrote the same cell, neither having read it | last-write-wins — child wins |
 
 **Guards are the conflict detector.** Re-evaluating a child's guards against the parent's history
-since the fork point is exactly the question "did the parent touch this while I was working?" LWW is
-the default; guards are the opt-in to safety. Cell granularity makes LWW far less destructive than
-object-level LWW would be.
+since the fork point is exactly the question "did the parent touch this while I was working?" Since
+§12 makes those guards automatic, LWW is no longer the default — it is what remains for a cell
+nobody read. Cell granularity makes that far less destructive than object-level LWW would be.
+
+**Guards are checked before the dangling-write check**, which is a reordering the automatic read-set
+earned. A writer's own existence probe is now in its read-set, so "the child wrote to an object the
+parent deleted" surfaces as a guard failure first — and that is the more useful of the two things to
+be told, because it names the cell that moved rather than the cell that suffered for it. The dangling
+check remains as the backstop for a *blind* write, which observed nothing and so carries nothing to
+check.
+
+**A transaction's own guards are checked once, before any of its layers is applied.** Per-layer
+checking would let the first layer of a merge trip a guard belonging to the second (§12.1).
 
 ---
 

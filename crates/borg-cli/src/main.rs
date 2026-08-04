@@ -7,9 +7,9 @@
 //! indexes are rebuilt from the log on open (see `Registry`).
 
 use borg_core::{
-    BorgError, BranchId, ClientVersion, DefEvent, Freshness, FreshnessRequirement, LayerAuthor,
-    LayerId, LayerKind, MergeMode, ObjectTypeName, Origin, Ownership, ProducerId, RepoId, Result,
-    ValueType, Writer, parse,
+    BorgError, BranchId, CellAt, CellRef, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
+    LayerAuthor, LayerId, LayerKind, MergeMode, ObjectTypeName, Origin, Ownership, ProducerId,
+    RepoId, Resolved, Result, Transaction, Value, ValueType, Writer, parse,
 };
 use borg_engine::Registry;
 use borg_exec_native::NativeExecutor;
@@ -56,6 +56,8 @@ struct Args {
     settled: bool,
     /// `--timeout`, in whole seconds. How long `borg frontier reaches` will wait.
     timeout: u64,
+    /// `--tx`. Which open transaction a `borg tx …` command speaks to. See [`transaction_of`].
+    tx: Option<String>,
     rest: Vec<String>,
 }
 
@@ -69,6 +71,14 @@ borg — an event-sourced data backend
   borg delete <cell>                   tombstone a cell
   borg get <cell> [--value]            read a cell, with provenance
   borg explain <cell>                  show where a value came from
+
+  borg tx begin                        fork the branch; prints a transaction handle
+  borg tx get <cell> [--tx <id>]       read through a transaction, recording the read
+  borg tx set <cell> <value> [--tx]    write to a transaction
+  borg tx delete <cell> [--tx <id>]    tombstone through a transaction
+  borg tx commit [--tx <id>]           merge, guarded by everything the transaction read
+  borg tx abort [--tx <id>]            drop it
+  borg tx list | borg tx timeout [<duration>]
 
   borg branch list
   borg branch fork <parent> [--at <layer>] [--name <name>]
@@ -101,6 +111,23 @@ Every write is checked against the definitions on the branch: the struct must be
 field must be declared, the value must fit, and a field declared derived may be written only by
 the producer that owns it. Declare a schema with `borg def push` or `borg repo push` first.
 
+**Every client write is a transaction.** A transaction forks the branch, writes in isolation and
+merges, so it reads one consistent snapshot and never writes to a shared branch. Guards are
+automatic: what a transaction read becomes what its commit is contingent on, re-evaluated against
+the parent since the fork point, and a commit is rejected whole if any of it moved. Reads that found
+nothing count, and so does the existence probe a write performs — two transactions cannot both
+conclude an object is absent and both create it.
+
+A bare `borg set X v` is an implicit one-shot transaction: begin, set, commit, in one process. It
+reads nothing it did not write, so it is honestly last-write-wins on the cell it writes. A client
+wanting compare-and-swap reads the cell first and the guard falls out. A transaction can only guard
+what it observed *through* the transaction — `borg get` outside one buys no protection.
+
+Transactions are ephemeral and reaped; branches are durable and explicit. A transaction untouched
+for longer than `borg tx timeout` is dropped, swept when the next command opens the store. Idle, not
+elapsed, so a long but busy transaction survives. A client that wants to walk away and come back
+wanted `borg branch fork`, and nothing reaps that.
+
 Every actor carries a ClientVersion — the def-layer its view was built from (§5.4). borg's is the
 branch's current def-version, as printed by `borg def version`: the CLI has no generated code, so
 each invocation is authored against the schema as it stands. `--client-version` pins an older one,
@@ -129,6 +156,7 @@ Options:
   --freshness <mode>        any | validated (default) | current
   --settled                 read at the settled frontier, not at the ragged head
   --timeout <seconds>       how long `frontier reaches` waits (default 0)
+  --tx <id>                 which open transaction to speak to (or $BORG_TX)
   --value                   print only the value
   --count                   print only a count
   --rebuild                 `derive`: recompute from source instead of catching up"
@@ -147,6 +175,7 @@ fn parse_args() -> Args {
         freshness: FreshnessRequirement::Validated,
         settled: false,
         timeout: 0,
+        tx: None,
         rest: Vec::new(),
     };
     let mut raw = std::env::args().skip(1);
@@ -163,6 +192,7 @@ fn parse_args() -> Args {
                     .and_then(|secs| secs.parse().ok())
                     .unwrap_or_else(|| usage());
             }
+            "--tx" => args.tx = raw.next(),
             "--value" => args.value_only = true,
             "--count" => args.count_only = true,
             "--rebuild" => args.rebuild = true,
@@ -268,11 +298,24 @@ async fn run(args: Args) -> Result<()> {
     let verb = args.rest.first().map(String::as_str).unwrap_or("");
     let rest: Vec<&str> = args.rest.iter().skip(1).map(String::as_str).collect();
 
+    // Reaping sweeps **opportunistically, when a process opens the store** — the same place the
+    // indexes are already rebuilt — so there is no daemon, and an idle store sweeps nothing because
+    // nothing is growing (SPEC.md §12).
+    reap_transactions(&args)?;
+
     match (verb, rest.as_slice()) {
         ("init", _) => init(&args).await,
         ("set", [cell, value]) => set(&args, cell, value).await,
         ("delete", [cell]) => set(&args, cell, "~").await,
         ("get", [cell]) => get(&args, cell).await,
+        ("tx", ["begin"]) => tx_begin(&args).await,
+        ("tx", ["get", cell]) => tx_get(&args, cell).await,
+        ("tx", ["set", cell, value]) => tx_set(&args, cell, value).await,
+        ("tx", ["delete", cell]) => tx_set(&args, cell, "~").await,
+        ("tx", ["commit"]) => tx_commit(&args).await,
+        ("tx", ["abort"]) => tx_abort(&args).await,
+        ("tx", ["list"]) => tx_list(&args),
+        ("tx", ["timeout", rest @ ..]) => tx_timeout(&args, rest.first().copied()),
         ("explain", [cell]) => explain(&args, cell).await,
         ("branch", ["list"]) => branch_list(&args).await,
         ("branch", ["fork", parent, tail @ ..]) => branch_fork(&args, parent, tail).await,
@@ -307,29 +350,85 @@ async fn init(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Write one source cell as its own layer.
+/// Write one source cell — as an **implicit one-shot transaction**. SPEC.md §12.
 ///
-/// Everything interesting happens inside the session: it folds the branch's definitions, parses the
+/// begin, set, commit, in one process. That is what keeps the common case one command while making
+/// "every client write is a transaction" literally true rather than aspirationally true, and it is
+/// what stops there being a second, unguarded write path for anybody to reach for.
+///
+/// It reads nothing it did not write, so it carries no guard on the cell it writes and is honestly
+/// last-write-wins there — what every database gives a blind write, and what §12 says a client that
+/// expressed no dependency on prior state has asked for. The one read it does make is the existence
+/// probe (§8, implied existence), and that one counts: without it two of these racing to create the
+/// same object would both succeed.
+///
+/// Everything else still happens inside the session: it folds the branch's definitions, parses the
 /// text against the field's *declared* type, rejects an undeclared struct or field or a value that
-/// does not fit, and interns content on the way in (§3.4, §5.1, §8). The CLI's job is to name the
-/// cell and hand over the text.
+/// does not fit, and interns content on the way in (§3.4, §5.1, §8).
 async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
     let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
 
-    let version = client_version(&registry, args, branch).await?;
+    let Some(fork_point) = fork_point_of(&registry, branch)? else {
+        // Nothing anywhere in this branch's ancestry, so there are no definitions — and §8.0 makes
+        // every write contingent on definitions, so this write is going to be rejected whatever
+        // path it takes. Going straight to the session gets the caller the rejection they deserve
+        // ("no struct named `Wombat`") rather than "nothing to fork from", which is true and
+        // useless. Nothing is given up by not isolating: an empty branch has no concurrent state to
+        // be isolated from, because anything concurrent would have left a layer.
+        return write_directly(&registry, args, branch, &cell, value).await;
+    };
+    // Anonymous, and it is the only branch in the system that should be: a handle exists so that a
+    // *later* process can name a transaction, and this one dies before there is a later process.
+    let scratch = registry
+        .branches
+        .fork(owner_of(&registry, fork_point)?, fork_point, None)
+        .await?;
+
+    let version = client_version(&registry, args, scratch).await?;
     let mut session = registry
-        .begin_write(branch, version, Writer::Client)
+        .begin_write(scratch, version, Writer::Client)
         .await?;
     if let Err(rejection) = session.set_text(&cell, value).await {
         // A rejected write leaves no trace, so the layer it would have landed in never commits.
         session.abort().await?;
         return Err(rejection);
     }
-    outln!("{}", session.commit().await?);
+    let mut transaction = Transaction::new(scratch, branch, fork_point);
+    absorb(&mut transaction, &session);
+    session.commit().await?;
+
+    let replayed = registry
+        .branches
+        .merge_transaction(&transaction, MergeMode::DefAndData)
+        .await?;
+    // The layer on the **parent**, not on the scratch branch: this is what a client awaits with
+    // `borg frontier reaches`, and the one on the branch nobody else can see is no use for that.
+    outln!("{}", landing(&registry, &transaction, &replayed));
     drop(registry);
     auto_derive(args, branch).await
+}
+
+/// The one write path that is not a transaction, and the only branch state it can exist on is none
+/// at all. See the caller for why that is safe.
+async fn write_directly(
+    registry: &Registry,
+    args: &Args,
+    branch: BranchId,
+    cell: &CellRef,
+    value: &str,
+) -> Result<()> {
+    let version = client_version(registry, args, branch).await?;
+    let mut session = registry
+        .begin_write(branch, version, Writer::Client)
+        .await?;
+    if let Err(rejection) = session.set_text(cell, value).await {
+        session.abort().await?;
+        return Err(rejection);
+    }
+    outln!("{}", session.commit().await?);
+    Ok(())
 }
 
 async fn get(args: &Args, cell: &str) -> Result<()> {
@@ -369,7 +468,20 @@ async fn get(args: &Args, cell: &str) -> Result<()> {
         workers.shutdown().await;
     }
     let resolved = resolved?;
+    report(&registry, args, &cell, &resolved).await
+}
 
+/// The provenance envelope, as `borg get` and `borg tx get` both print it.
+///
+/// One renderer, because a read through a transaction is a read: if the two drifted, the CLI would
+/// be teaching that a transaction's reads are a different kind of thing from a branch's, which is
+/// exactly the belief §12 exists to remove.
+async fn report(
+    registry: &Registry,
+    args: &Args,
+    cell: &CellRef,
+    resolved: &Resolved<Option<Value>>,
+) -> Result<()> {
     // Interned content reads back as content, so a string field prints `acme.ai` rather than the
     // `@s-…` that is physically stored (§3.4). What `borg get --value` prints is what `borg set`
     // accepts, which is the property a shell pipeline actually relies on.
@@ -534,6 +646,437 @@ async fn branch_merge(args: &Args, child: &str, tail: &[&str]) -> Result<()> {
         Some(parent) => auto_derive(args, parent).await,
         None => Ok(()),
     }
+}
+
+// --- Transactions. SPEC.md §12, §13. ---------------------------------------------------------------
+
+/// How long a transaction may sit untouched before it is reaped, when nobody has said otherwise.
+///
+/// Generous on purpose: the cost of reaping too eagerly is a client losing work it was in the middle
+/// of, and the cost of reaping too late is a branch row and a read-set sitting in a file. Those are
+/// not the same size of mistake.
+const DEFAULT_TX_IDLE_TIMEOUT: u64 = 24 * 60 * 60;
+
+/// How many ended transactions are remembered, so that touching one can say what became of it rather
+/// than "unknown transaction". Bounded because this is a courtesy, not a log.
+const REMEMBERED_TRANSACTIONS: usize = 64;
+
+/// The open transactions, beside the store.
+///
+/// A transaction spans several CLI processes, so it needs somewhere to keep two things: which branch
+/// it forked, and what it has read so far. That goes here, with the pause flags and the
+/// producer-implementation table (§9.2), for the same reason they do — it is **operational state,
+/// not log data**, and it dies when the transaction ends. In the log it would be forkable,
+/// mergeable and time-travellable, and "which transactions were open at layer 400" is not a question
+/// anybody has.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Transactions {
+    /// Seconds. Rendered and accepted as a duration by `borg tx timeout`.
+    tx_idle_timeout: u64,
+    /// The next handle to hand out. Monotonic and never reused, so a stale `--tx` names a
+    /// transaction that existed rather than one that is about to.
+    next: u64,
+    open: Vec<Open>,
+    /// What became of the transactions that ended.
+    spent: Vec<Spent>,
+}
+
+impl Default for Transactions {
+    fn default() -> Self {
+        Self {
+            tx_idle_timeout: DEFAULT_TX_IDLE_TIMEOUT,
+            next: 1,
+            open: Vec::new(),
+            spent: Vec::new(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Open {
+    id: String,
+    /// Unix seconds, when this transaction was last used. **Idle, not elapsed**: a legitimate
+    /// transaction may run for hours, and what predicts an abandoned one is silence.
+    touched: u64,
+    state: Transaction,
+}
+
+/// A transaction that ended, and how.
+///
+/// The `fate` is a phrase rather than a code because it is going straight into a sentence, and the
+/// sentence is the point: *"expired after 2 minutes idle"* tells a client what to do next, and
+/// *"unknown transaction"* tells it to go and look for a bug it does not have.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Spent {
+    id: String,
+    fate: String,
+}
+
+fn transactions_path(args: &Args) -> PathBuf {
+    args.store.with_extension("transactions.json")
+}
+
+fn load_transactions(args: &Args) -> Transactions {
+    std::fs::read_to_string(transactions_path(args))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_transactions(args: &Args, table: &Transactions) -> Result<()> {
+    let raw =
+        serde_json::to_string_pretty(table).map_err(|err| BorgError::Storage(err.to_string()))?;
+    std::fs::write(transactions_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// `90s`, `10m`, `24h`, `7d`, or a bare count of seconds.
+fn duration(text: &str) -> Option<u64> {
+    let (digits, scale) = match text.as_bytes().last()? {
+        b's' => (&text[..text.len() - 1], 1),
+        b'm' => (&text[..text.len() - 1], 60),
+        b'h' => (&text[..text.len() - 1], 60 * 60),
+        b'd' => (&text[..text.len() - 1], 24 * 60 * 60),
+        _ => (text, 1),
+    };
+    digits.parse::<u64>().ok().map(|n| n * scale)
+}
+
+/// The largest whole unit that describes this exactly, which is how it was almost certainly typed.
+fn render_duration(seconds: u64) -> String {
+    for (scale, suffix) in [(86400, 'd'), (3600, 'h'), (60, 'm')] {
+        if seconds >= scale && seconds.is_multiple_of(scale) {
+            return format!("{}{suffix}", seconds / scale);
+        }
+    }
+    format!("{seconds}s")
+}
+
+/// The same duration spelled for a sentence rather than for a config file.
+fn spell_duration(seconds: u64) -> String {
+    let (count, unit) = [(86400, "day"), (3600, "hour"), (60, "minute")]
+        .into_iter()
+        .find(|(scale, _)| seconds >= *scale && seconds.is_multiple_of(*scale))
+        .map_or((seconds, "second"), |(scale, unit)| (seconds / scale, unit));
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
+}
+
+/// Drop transactions that have been idle too long. SPEC.md §12.
+///
+/// **No daemon.** This runs when a process opens the store, which is the same place the indexes are
+/// already rebuilt from the log — so an idle store sweeps nothing, because nothing is growing, and a
+/// busy one sweeps constantly for free.
+///
+/// A reaped transaction's *state* is dropped, which is what makes it unusable: nothing can be
+/// written through it and its layers can never merge. Its branch row is left where it is, because
+/// whether spent branches are reaped or kept as history is a real choice and is deliberately not
+/// being made by a janitor as a side effect (SPEC-DRAFT §7.5).
+fn reap_transactions(args: &Args) -> Result<()> {
+    let mut table = load_transactions(args);
+    if table.open.is_empty() {
+        return Ok(());
+    }
+    let now = now();
+    let timeout = table.tx_idle_timeout;
+    let mut reaped = Vec::new();
+    table.open.retain(|open| {
+        if now.saturating_sub(open.touched) <= timeout {
+            return true;
+        }
+        reaped.push((open.id.clone(), open.state.branch));
+        false
+    });
+    if reaped.is_empty() {
+        return Ok(());
+    }
+    for (id, branch) in reaped {
+        set_paused(args, branch, false)?;
+        retire(
+            &mut table,
+            id,
+            format!("expired after {} idle", spell_duration(timeout)),
+        );
+    }
+    save_transactions(args, &table)
+}
+
+fn retire(table: &mut Transactions, id: String, fate: String) {
+    table.spent.push(Spent { id, fate });
+    let excess = table.spent.len().saturating_sub(REMEMBERED_TRANSACTIONS);
+    table.spent.drain(..excess);
+}
+
+/// Which open transaction this command speaks to.
+///
+/// `--tx`, then `$BORG_TX`, then — when exactly one is open — that one. The environment variable is
+/// what makes the surface in §12 read as written (`borg tx get <cell>`, no handle in sight) from a
+/// shell that exported it once; the flag is what lets one shell hold two transactions open at the
+/// same time, which is the whole reason the handle is explicit and is an interleaving a
+/// single-process API cannot express.
+fn transaction_of(args: &Args, table: &Transactions) -> Result<usize> {
+    let named = args
+        .tx
+        .clone()
+        .or_else(|| std::env::var("BORG_TX").ok().filter(|id| !id.is_empty()));
+    let Some(id) = named else {
+        return match table.open.len() {
+            0 => Err(BorgError::Storage(
+                "no transaction is open — start one with `borg tx begin`".into(),
+            )),
+            1 => Ok(0),
+            _ => Err(BorgError::Storage(format!(
+                "several transactions are open ({}) — name one with --tx",
+                table
+                    .open
+                    .iter()
+                    .map(|open| open.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        };
+    };
+    if let Some(index) = table.open.iter().position(|open| open.id == id) {
+        return Ok(index);
+    }
+    // **Never "unknown transaction" for one that existed.** The first tells you what happened and
+    // what to do; the second sends you looking for a bug in your own bookkeeping.
+    if let Some(spent) = table.spent.iter().find(|spent| spent.id == id) {
+        return Err(BorgError::Storage(format!(
+            "transaction {id} {}",
+            spent.fate
+        )));
+    }
+    Err(BorgError::Storage(format!("unknown transaction {id}")))
+}
+
+/// The highest layer this branch can see — its own head, or the fork point it inherits when it has
+/// written nothing yet. `None` where the whole ancestry is empty.
+///
+/// A transaction forks *here* rather than at `head(branch)`, which is what lets the first write on a
+/// fresh fork be a transaction like every other write. The branch it merges back into is still the
+/// one the client named, which is why a transaction carries its parent rather than inferring it.
+fn fork_point_of(registry: &Registry, branch: BranchId) -> Result<Option<LayerId>> {
+    let ceiling = registry.branches.read_path(branch, None)?.ceiling();
+    Ok((ceiling.0 != 0).then_some(ceiling))
+}
+
+fn owner_of(registry: &Registry, layer: LayerId) -> Result<BranchId> {
+    registry
+        .layers
+        .layer(layer)
+        .map(|layer| layer.branch)
+        .ok_or_else(|| BorgError::Storage(format!("unknown layer {layer}")))
+}
+
+/// Fold a finished write session's reads and writes into the transaction that owns it.
+///
+/// Reads before writes, always: every probe a session makes precedes any write it makes to the same
+/// cell, so draining them in this order is what gets [`Transaction::observe`]'s ordering rule right
+/// — a read that came *before* the transaction's own write is a real dependency on the parent and is
+/// guarded, and a read that came after saw only the transaction itself.
+fn absorb(transaction: &mut Transaction, session: &borg_engine::WriteSession) {
+    for read in session.observed() {
+        transaction.observe(read.clone());
+    }
+    for write in session.authored() {
+        transaction.wrote(write.clone());
+    }
+}
+
+/// The layer a transaction landed in on its parent — what a client awaits with
+/// `borg frontier reaches`. A transaction that wrote nothing landed nowhere, and says head.
+fn landing(registry: &Registry, transaction: &Transaction, replayed: &[LayerId]) -> LayerId {
+    replayed.last().copied().unwrap_or_else(|| {
+        registry
+            .layers
+            .head(transaction.parent)
+            .unwrap_or(LayerId(0))
+    })
+}
+
+async fn tx_begin(args: &Args) -> Result<()> {
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let fork_point = fork_point_of(&registry, branch)?
+        .ok_or_else(|| BorgError::Storage("nothing to fork from — the branch is empty".into()))?;
+
+    let mut table = load_transactions(args);
+    let id = format!("tx-{}", table.next);
+    table.next += 1;
+    let forked = registry
+        .branches
+        .fork(
+            owner_of(&registry, fork_point)?,
+            fork_point,
+            Some(id.clone()),
+        )
+        .await?;
+    // **Created paused.** Deriving on a branch that exists to be merged is waste: merge does not
+    // carry derived layers, and the parent recomputes what it needs (§13).
+    set_paused(args, forked, true)?;
+
+    table.open.push(Open {
+        id: id.clone(),
+        touched: now(),
+        state: Transaction::new(forked, branch, fork_point),
+    });
+    save_transactions(args, &table)?;
+    outln!("{id}");
+    Ok(())
+}
+
+/// Read through a transaction, and **record the read**.
+///
+/// The recording is the whole difference from `borg get`, and it is what makes the guard at commit
+/// automatic. Reads that find nothing are recorded too: absence is a legitimate thing to have acted
+/// on, and a later write to that cell must invalidate the decision (§9.4).
+async fn tx_get(args: &Args, cell: &str) -> Result<()> {
+    let mut table = load_transactions(args);
+    let index = transaction_of(args, &table)?;
+    let registry = open(args).await?;
+    let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
+    let branch = table.open[index].state.branch;
+
+    let version = client_version(&registry, args, branch).await?;
+    // The def-version of *this field*, as this reader's own view names it — the record key, and the
+    // only bridge from a whole-schema ClientVersion to one (§5.3, §5.4). Recording the read at the
+    // reader's ClientVersion instead would file it under a version nothing else uses.
+    let path = registry.branches.read_path(branch, None)?;
+    let at = registry
+        .defs
+        .view_at(&path, version.0)
+        .await?
+        .version_of(&cell);
+
+    let resolved = registry
+        .resolver
+        .resolve(branch, &cell, None, version, args.freshness)
+        .await?;
+
+    let open = &mut table.open[index];
+    open.state.observe(CellAt::new(cell.clone(), at));
+    open.touched = now();
+    save_transactions(args, &table)?;
+
+    report(&registry, args, &cell, &resolved).await
+}
+
+async fn tx_set(args: &Args, cell: &str, value: &str) -> Result<()> {
+    let mut table = load_transactions(args);
+    let index = transaction_of(args, &table)?;
+    let registry = open(args).await?;
+    let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
+    let branch = table.open[index].state.branch;
+
+    let version = client_version(&registry, args, branch).await?;
+    let mut session = registry
+        .begin_write(branch, version, Writer::Client)
+        .await?;
+    if let Err(rejection) = session.set_text(&cell, value).await {
+        session.abort().await?;
+        return Err(rejection);
+    }
+    let open = &mut table.open[index];
+    absorb(&mut open.state, &session);
+    open.touched = now();
+
+    let layer = session.commit().await?;
+    save_transactions(args, &table)?;
+    outln!("{layer}");
+    Ok(())
+}
+
+/// Merge, guarded by everything the transaction read. SPEC.md §12, §13.
+async fn tx_commit(args: &Args) -> Result<()> {
+    let mut table = load_transactions(args);
+    let index = transaction_of(args, &table)?;
+    let registry = open(args).await?;
+    let state = table.open[index].state.clone();
+
+    let replayed = match registry
+        .branches
+        .merge_transaction(&state, MergeMode::DefAndData)
+        .await
+    {
+        Ok(replayed) => replayed,
+        Err(rejection) => {
+            // **The transaction stays open.** Its snapshot is stale and its commit cannot succeed,
+            // but the read-set is what a client needs in order to decide whether to retry or to give
+            // up, and throwing it away here would leave them holding an error and nothing else. The
+            // other half of that is `borg tx abort`, and the timeout is what collects the ones
+            // nobody comes back to.
+            table.open[index].touched = now();
+            save_transactions(args, &table)?;
+            return Err(rejection);
+        }
+    };
+
+    let spent = table.open.remove(index);
+    retire(&mut table, spent.id, "already committed".into());
+    save_transactions(args, &table)?;
+    set_paused(args, state.branch, false)?;
+
+    outln!("{}", landing(&registry, &state, &replayed));
+    drop(registry);
+    auto_derive(args, state.parent).await
+}
+
+/// Drop a transaction. Nothing it wrote is on the parent, because nothing it wrote ever left its own
+/// branch — which is what makes an abort free.
+async fn tx_abort(args: &Args) -> Result<()> {
+    let mut table = load_transactions(args);
+    let index = transaction_of(args, &table)?;
+    let spent = table.open.remove(index);
+    let id = spent.id.clone();
+    set_paused(args, spent.state.branch, false)?;
+    retire(&mut table, spent.id, "was aborted".into());
+    save_transactions(args, &table)?;
+    outln!("{id} aborted");
+    Ok(())
+}
+
+fn tx_list(args: &Args) -> Result<()> {
+    let table = load_transactions(args);
+    if table.open.is_empty() {
+        outln!("no open transactions");
+        return Ok(());
+    }
+    let now = now();
+    for open in &table.open {
+        let (reads, writes) = open.state.size();
+        outln!(
+            "{:<8} {:<6} forked at {:<6} {reads} read, {writes} written, idle {}",
+            open.id,
+            open.state.branch.to_string(),
+            open.state.fork_point.to_string(),
+            render_duration(now.saturating_sub(open.touched))
+        );
+    }
+    Ok(())
+}
+
+/// Read or set the idle timeout. SPEC.md §12.
+fn tx_timeout(args: &Args, spec: Option<&str>) -> Result<()> {
+    let mut table = load_transactions(args);
+    if let Some(spec) = spec {
+        table.tx_idle_timeout = duration(spec).ok_or_else(|| {
+            BorgError::Storage(format!(
+                "`{spec}` is not a duration — try 90s, 10m, 24h or 7d"
+            ))
+        })?;
+        save_transactions(args, &table)?;
+    }
+    outln!(
+        "tx_idle_timeout = {}",
+        render_duration(table.tx_idle_timeout)
+    );
+    Ok(())
 }
 
 /// The JSON a `borg def push` file holds.
@@ -1206,10 +1749,12 @@ fn paused_branches(args: &Args) -> Vec<u64> {
         .paused
 }
 
-async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-
+/// Turn auto-derivation on or off for one branch.
+///
+/// Factored out because transactions use it too: a transaction branch is **created paused** (§12),
+/// and a transaction that ends resumes what it paused rather than leaving a flag behind for a branch
+/// id that will never be written to again.
+fn set_paused(args: &Args, branch: BranchId, pause: bool) -> Result<()> {
     let mut paused = paused_branches(args);
     paused.retain(|id| *id != branch.0);
     if pause {
@@ -1217,9 +1762,13 @@ async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
     }
     let raw = serde_json::to_string_pretty(&DerivationConfig { paused })
         .map_err(|err| BorgError::Storage(err.to_string()))?;
-    std::fs::write(derivation_path(args), raw)
-        .map_err(|err| BorgError::Storage(err.to_string()))?;
+    std::fs::write(derivation_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+}
 
+async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+    set_paused(args, branch, pause)?;
     outln!(
         "auto-derivation {} on {branch}",
         if pause { "paused" } else { "resumed" }

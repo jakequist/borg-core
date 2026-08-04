@@ -118,6 +118,17 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - A watermark is a `LayerId` like any other, so nothing stops one being compared with a layer id
   that is not a source layer. Four bugs have come from that family already; `ROADMAP.md`'s
   *Deferred, still* records what a `Watermark` newtype would cost and why it is its own change.
+- **Transaction branches are never reaped.** Reaping drops a transaction's *state*, which is what
+  makes it unusable, and leaves the branch row. Whether spent branches are collected or kept as
+  history is a real choice (SPEC-DRAFT §7.5) and should not be made by a janitor as a side effect.
+- **The reap sweep lives in the CLI, not in `Registry::open`.** §12.3 says "when a process opens the
+  store", and for this client that is `run()`. The transaction table is a filesystem sidecar like the
+  pause flags and the producer table; `Registry::open` sits below the provider line, where a
+  filesystem sidecar has no business. A server moves the sweep to wherever it opens the store.
+- **Every `borg set` now costs two layers** — one on its transaction branch, one on the parent naming
+  it — plus a branch row. Forks are `O(1)` and layers are cheap, but `Registry::open` replays the log
+  on every CLI invocation, so the `O(log)` open grows twice as fast as it did. SPEC-DRAFT §7.4 flagged
+  this; the fan-out benchmark cannot see it, because it drives the engine rather than the CLI.
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.
