@@ -18,6 +18,8 @@ borg-core.workspace = true
 borg-engine.workspace = true
 borg-storage-sqlite.workspace = true
 borg-exec-native.workspace = true
+borg-exec-process.workspace = true
+borg-protocol.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -4,7 +4,9 @@ members = [
     "crates/borg-core",
     "crates/borg-storage",
     "crates/borg-storage-sqlite",
+    "crates/borg-protocol",
     "crates/borg-exec",
+    "crates/borg-exec-process",
     "crates/borg-exec-native",
     "crates/borg-engine",
     "crates/borg-cli",
@@ -20,7 +22,9 @@ repository = "https://github.com/meteor-hq/borg"
 borg-core = { path = "crates/borg-core" }
 borg-storage = { path = "crates/borg-storage" }
 borg-storage-sqlite = { path = "crates/borg-storage-sqlite" }
+borg-protocol = { path = "crates/borg-protocol" }
 borg-exec = { path = "crates/borg-exec" }
+borg-exec-process = { path = "crates/borg-exec-process" }
 borg-exec-native = { path = "crates/borg-exec-native" }
 borg-engine = { path = "crates/borg-engine" }
 
@@ -31,6 +35,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 thiserror = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
+rmp-serde = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
 [workspace.lints.rust]

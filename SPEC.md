@@ -1017,7 +1017,7 @@ without semantic change.
 | `StorageProvider` | SQLite (`borg-storage-sqlite`), or in-memory | native Borg storage |
 | `DependencyIndexProvider` | in-memory, key-ranged | persistent, sharded by cell key |
 | `ProducerPolicyProvider` | `NaiveEagerProducerPolicy` | prioritized, incremental, batched |
-| `ExecutionProvider` | in-process Rust, full trust | container over a socket |
+| `ExecutionProvider` | in-process Rust, or a subprocess over stdio (§17.4) | container over a socket |
 | `ErrorPolicyProvider` | `NaiveProducerPoisonPolicy` | partial / per-cell recovery |
 | `CodegenProvider` | — (deferred, §15) | TypeScript, Python, Rust, Go |
 
@@ -1106,6 +1106,22 @@ pub trait ProducerCtx {
     async fn set(&mut self, cell: CellRef, v: Value) -> Result<()>;   // ownership-checked
 }
 ```
+
+### 17.4 The worker protocol
+
+A producer worker speaks a framed message stream: the engine invokes, the worker asks for cells, the
+engine answers. Codecs are negotiated in a handshake and framing is **per codec** — newline-delimited
+for text so a shell worker can use `read`, length-prefixed for binary. Every encoding is produced by
+the same serde impls on the same types, so no mapping document exists between them to drift.
+
+Two shapes were forced by targeting a shell worker first, and both are better than what they replaced:
+
+- **Cells and values travel as text** — `"Company#100.website"`, `"9"`, `"@Company#101"`, `"~"` —
+  the same forms the CLI accepts. A worker cannot reasonably assemble the structural JSON of a cell
+  address, and a protocol only usable through a generated client library is one whose complexity is
+  hidden rather than absent. Text also removes the `Int`/`Double` ambiguity a bare JSON number has.
+- **Every message is a single-key object**, including the payload-free ones. A worker dispatches on
+  one key without special cases.
 
 **`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting

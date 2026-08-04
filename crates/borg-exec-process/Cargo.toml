@@ -1,0 +1,17 @@
+[package]
+name = "borg-exec-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+borg-core.workspace = true
+borg-exec.workspace = true
+borg-protocol.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "rt", "sync", "macros"] }
+serde_json.workspace = true

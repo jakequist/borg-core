@@ -3,24 +3,41 @@
 #
 # There is no client library here — just `read`, `jq` and `echo`. If this is workable, the protocol
 # is genuinely simple and genuinely language-neutral.
+#
+# Note that stdout carries the protocol. Anything printed for a human goes to stderr.
 set -euo pipefail
 
-# `describe` runs once at push time: the script declares what it is and what it maps over, and the
-# server turns that into a PushProducer def event.
+# `describe` runs once at push time: the script declares what it implements and what it maps over,
+# and the server turns that into a PushProducer def event. A producer definition therefore cannot
+# exist without the code that satisfies it.
 if [ "${1:-}" = "describe" ]; then
     jq -nc '{producers: [{name: "invest", source: "Company"}]}'
     exit 0
 fi
 
-# Otherwise: read messages until told to stop. The worker holds no state between invocations, so the
-# server may spawn, terminate and parallelise these at will.
+# Every protocol message is a single-key object, so dispatching is always `keys[0]`.
 say() { printf '%s\n' "$1"; }
 
-# Ask for one cell and read back its value.
+# Handshake. We speak JSON; the newline framing is what makes `read` sufficient.
+IFS= read -r _server_hello
+say '{"codec":"json"}'
+
+# Ask for one cell; the answer lands in $CELL.
+#
+# Note it does *not* echo the result. A request/response protocol on stdout cannot be driven from
+# inside `$( )`, because command substitution captures the request instead of sending it. That is a
+# property of the shell, not of the protocol — but it is the kind of thing only writing a real
+# worker tells you.
 get() {
     say "$(jq -nc --arg c "$1" '{get: $c}')"
     IFS= read -r reply
-    jq -rc '.value // empty' <<<"$reply"
+    CELL="$(jq -r '.value // empty' <<<"$reply")"
+}
+
+# Write one cell and wait for the acknowledgement.
+set_cell() {
+    say "$(jq -nc --arg c "$1" --arg v "$2" '{set: {cell: $c, value: $v}}')"
+    IFS= read -r _ack
 }
 
 while IFS= read -r msg; do
@@ -33,14 +50,14 @@ while IFS= read -r msg; do
     company="$(jq -r '.invoke.input' <<<"$msg")"
 
     score=0
-    website="$(get "$company.website")"
+    get "$company.website"
+    website="$CELL"
     if [ -n "$website" ] && [ "$website" -gt 3 ]; then
         score=$((score + 6))
     fi
 
-    investible=$([ "$score" -gt 5 ] && echo true || echo false)
-    say "$(jq -nc --arg c "$company.is_investible" --argjson v "$investible" '{set: {cell: $c, value: $v}}')"
-    IFS= read -r _ack
+    if [ "$score" -gt 5 ]; then investible=true; else investible=false; fi
+    set_cell "$company.is_investible" "$investible"
 
-    say '{"done":true}'
+    say '{"done":{}}'
 done

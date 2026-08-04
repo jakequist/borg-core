@@ -14,7 +14,7 @@ use borg_core::{
 use borg_engine::Registry;
 use borg_exec_native::NativeExecutor;
 use borg_storage_sqlite::SqliteStorage;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(0);
@@ -26,6 +26,7 @@ struct Args {
     store: PathBuf,
     branch: Option<String>,
     value_only: bool,
+    count_only: bool,
     rest: Vec<String>,
 }
 
@@ -47,6 +48,10 @@ borg — an event-sourced data backend
   borg def push <file.json>            push definition mutations
   borg def show <Struct>               show a struct's definition
 
+  borg repo push <dir>                 push a repo: defs and pipelines
+  borg producer list                   registered producers
+  borg derive [--count]                run producers until caught up
+
   borg layer list | borg layer head
   borg frontier                        how far each producer has caught up
 
@@ -56,7 +61,8 @@ Values are 42, 1.5, true, false, ~ (tombstone) or @Struct#id (a reference).
 Options:
   --store <path>   store file (default ./borg.db)
   --branch <name>  branch to operate on (default: the root branch)
-  --value          print only the value"
+  --value          print only the value
+  --count          print only a count"
     );
     std::process::exit(2)
 }
@@ -66,6 +72,7 @@ fn parse_args() -> Args {
         store: PathBuf::from("borg.db"),
         branch: None,
         value_only: false,
+        count_only: false,
         rest: Vec::new(),
     };
     let mut raw = std::env::args().skip(1);
@@ -74,6 +81,7 @@ fn parse_args() -> Args {
             "--store" => args.store = raw.next().unwrap_or_else(|| usage()).into(),
             "--branch" => args.branch = raw.next(),
             "--value" => args.value_only = true,
+            "--count" => args.count_only = true,
             "-h" | "--help" => usage(),
             _ => args.rest.push(arg),
         }
@@ -142,6 +150,9 @@ async fn run(args: Args) -> Result<()> {
         ("def", ["show", name]) => def_show(&args, name).await,
         ("layer", ["list"]) => layer_list(&args).await,
         ("layer", ["head"]) => layer_head(&args).await,
+        ("repo", ["push", dir]) => repo_push(&args, dir).await,
+        ("producer", ["list"]) => producer_list(&args).await,
+        ("derive", _) => derive(&args).await,
         ("frontier", _) => frontier(&args).await,
         _ => usage(),
     }
@@ -171,6 +182,42 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
         .layers
         .open(branch, LayerKind::Value, LayerAuthor::Source)
         .await?;
+
+    // Writing a property implies the object exists. Producers map over a struct's `ObjectBuffer`,
+    // which holds existence cells (§4.2), so without this a `Company` whose fields were set but
+    // which was never explicitly created would be invisible to every pipeline.
+    //
+    // Only when absent, never on every write: the existence cell lives in the buffer producers
+    // subscribe to, so rewriting it would make *any* property write look like a new entity and
+    // re-run pipelines that read nothing of the sort.
+    if let Some(existence) = implied_existence(&cell)
+        && registry
+            .resolver
+            .resolve(
+                branch,
+                &existence,
+                None,
+                CLIENT_VERSION,
+                FreshnessRequirement::Any,
+            )
+            .await?
+            .value
+            .is_none()
+    {
+        layer
+            .put(
+                &existence,
+                CellRecord {
+                    value: borg_core::Value::Bool(true),
+                    version: CLIENT_VERSION,
+                    written_at: layer.id(),
+                    origin: Origin::Source,
+                    derivation: None,
+                },
+            )
+            .await?;
+    }
+
     layer
         .put(
             &cell,
@@ -186,6 +233,17 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
     let id = registry.layers.commit(layer).await?;
     println!("{id}");
     Ok(())
+}
+
+/// The existence cell a property write implies, if this is a property write.
+fn implied_existence(cell: &borg_core::CellRef) -> Option<borg_core::CellRef> {
+    match &cell.buffer {
+        borg_core::BufferId::ObjectProp(struct_name, _) => Some(borg_core::CellRef::existence(
+            struct_name.clone(),
+            *cell.pid(),
+        )),
+        _ => None,
+    }
 }
 
 async fn get(args: &Args, cell: &str) -> Result<()> {
@@ -479,13 +537,20 @@ async fn frontier(args: &Args) -> Result<()> {
     let path = registry.branches.read_path(branch, None)?;
     let view = registry.defs.view(&path).await?;
 
+    // The log knows producer ids; only the implementation table knows what a human called them.
+    // Joining the two here is the CLI's job precisely because the log must not hold either.
+    let names = load_impls(args);
     let head = registry.layers.head(branch).unwrap_or(LayerId(0));
     let mut any = false;
     for producer in view.producers() {
         any = true;
+        let name = names
+            .producers
+            .iter()
+            .find(|impl_| impl_.id == producer.id.0)
+            .map_or_else(|| producer.id.to_string(), |impl_| impl_.name.clone());
         println!(
-            "{:<8} caught up through {} (head {head})",
-            producer.id.to_string(),
+            "{name:<16} caught up through {} (head {head})",
             registry.frontier.watermark(branch, producer.id)
         );
     }
@@ -500,4 +565,163 @@ fn flag<'a>(tail: &[&'a str], name: &str) -> Option<&'a str> {
         .position(|arg| *arg == name)
         .and_then(|i| tail.get(i + 1))
         .copied()
+}
+
+// --- Repos, producers and derivation ---
+
+/// Where a producer's implementation lives.
+///
+/// Deliberately *not* in the log. §9.2 separates a producer's definition from its implementation:
+/// the log records that producer P exists at some ClientVersion, and the `ExecutionProvider`
+/// resolves that id to code. Writing a local file path into the log would tie the data model to one
+/// machine's filesystem. This sidecar is the CLI's own resolution table, and a container-backed
+/// runtime would keep an image reference in exactly the same place.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Implementations {
+    producers: Vec<Implementation>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Implementation {
+    id: u64,
+    name: String,
+    source: String,
+    command: PathBuf,
+}
+
+fn impls_path(args: &Args) -> PathBuf {
+    args.store.with_extension("producers.json")
+}
+
+fn load_impls(args: &Args) -> Implementations {
+    std::fs::read_to_string(impls_path(args))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_impls(args: &Args, impls: &Implementations) -> Result<()> {
+    let raw =
+        serde_json::to_string_pretty(impls).map_err(|err| BorgError::Storage(err.to_string()))?;
+    std::fs::write(impls_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+}
+
+/// Push a repo: ask each pipeline to describe itself, record the definitions in the log, and
+/// remember where the code lives.
+async fn repo_push(args: &Args, dir: &str) -> Result<()> {
+    let dir = PathBuf::from(dir);
+    let repo = read_repo_id(&dir)?;
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+
+    let mut pipelines: Vec<PathBuf> = std::fs::read_dir(dir.join("pipelines"))
+        .map_err(|err| BorgError::Storage(format!("{}/pipelines: {err}", dir.display())))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_file())
+        .collect();
+    pipelines.sort();
+
+    let mut impls = load_impls(args);
+    let mut events = Vec::new();
+    for command in pipelines {
+        // The script is the source of truth for what it implements, so a producer definition cannot
+        // exist without the code that satisfies it.
+        let described = borg_exec_process::describe(&command)?;
+        for spec in described.producers {
+            let id = ProducerId(spec.id());
+            events.push(DefEvent::PushProducer(borg_core::ProducerDef {
+                id,
+                kind: borg_core::ProducerKind::Pipeline,
+                source: borg_core::BufferId::Object(spec.source.as_str().into()),
+                version: LayerId(1),
+                declaring_repo: repo,
+            }));
+            impls.producers.retain(|p| p.id != id.0);
+            impls.producers.push(Implementation {
+                id: id.0,
+                name: spec.name.clone(),
+                source: spec.source.clone(),
+                command: command.canonicalize().unwrap_or_else(|_| command.clone()),
+            });
+            println!("{} -> {id}", spec.name);
+        }
+    }
+
+    if !events.is_empty() {
+        registry.defs.push(branch, events).await?;
+    }
+    save_impls(args, &impls)
+}
+
+/// Read the repo id out of `borg.toml`.
+fn read_repo_id(dir: &Path) -> Result<RepoId> {
+    let manifest = dir.join("borg.toml");
+    let raw = std::fs::read_to_string(&manifest)
+        .map_err(|err| BorgError::Storage(format!("{}: {err}", manifest.display())))?;
+    for line in raw.lines() {
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim() == "id"
+            && let Ok(id) = value.trim().parse::<u32>()
+        {
+            return Ok(RepoId(id));
+        }
+    }
+    Err(BorgError::Storage(format!(
+        "{}: no `id` under [repo]",
+        manifest.display()
+    )))
+}
+
+async fn producer_list(args: &Args) -> Result<()> {
+    for producer in load_impls(args).producers {
+        println!(
+            "{:<20} {:<10} maps {:<12} {}",
+            producer.name,
+            format!("P{}", producer.id),
+            producer.source,
+            producer.command.display()
+        );
+    }
+    Ok(())
+}
+
+/// Run every producer forward to head.
+async fn derive(args: &Args) -> Result<()> {
+    let storage = Arc::new(SqliteStorage::open(&args.store)?);
+    let impls = load_impls(args);
+
+    let probe = Registry::open(
+        Arc::clone(&storage) as Arc<_>,
+        Arc::new(NativeExecutor::new()),
+    )
+    .await?;
+    let allocation = allocation_branch(&probe)?;
+    let executor = borg_exec_process::from_registrations(
+        allocation,
+        impls
+            .producers
+            .iter()
+            .map(|p| (p.id, p.command.clone(), p.source.clone())),
+    );
+    drop(probe);
+
+    let registry = Registry::open(storage, Arc::clone(&executor) as Arc<_>).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+
+    // Producer definitions live in the log; this makes the engine aware of the ones on this branch.
+    let path = registry.branches.read_path(branch, None)?;
+    let view = registry.defs.view(&path).await?;
+    for def in view.producers() {
+        registry.engine.register(def.clone());
+    }
+
+    let executed = registry.engine.catch_up(branch).await?;
+    executor.shutdown().await;
+
+    if args.count_only {
+        println!("{executed}");
+    } else {
+        println!("{executed} invocation(s)");
+    }
+    Ok(())
 }
