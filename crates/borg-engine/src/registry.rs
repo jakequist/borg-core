@@ -208,7 +208,6 @@ impl Registry {
             &self.layers,
             &self.defs,
             branch,
-            None,
             version,
             writer,
             LayerAuthor::Source,

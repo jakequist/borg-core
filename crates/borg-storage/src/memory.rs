@@ -21,7 +21,14 @@ use std::sync::{Arc, Mutex};
 /// A projection of layer membership, kept because reads must stay a single lookup once events no
 /// longer carry a layer. [`MemoryStorage::rebuild_read_index`] regenerates it from the log, which
 /// is what makes it a cache rather than a second source of truth.
-type ReadIndex = HashMap<BranchId, HashMap<(CellRef, DefVersion), Vec<(LayerId, EventId)>>>;
+///
+/// **Nested rather than keyed on a `(CellRef, DefVersion)` tuple**, because `HashMap::get` wants
+/// the whole key and a `CellRef` owns two or three `String`s — so a tuple key made every read clone
+/// one, *per read-path segment*. A round's read path has two segments now that a round has a branch
+/// of its own (§16.5), which doubled a cost nothing had noticed while it was paid once. Nesting
+/// removes it rather than halving it: the cell is borrowed and the version is `Copy`. It also turns
+/// `cell_versions` from a scan of the branch into a lookup.
+type ReadIndex = HashMap<BranchId, HashMap<CellRef, HashMap<DefVersion, Vec<(LayerId, EventId)>>>>;
 
 /// The newest landing at or below a bound.
 ///
@@ -51,7 +58,9 @@ fn index(into: &mut ReadIndex, branch: BranchId, layer: LayerId, event: &Event) 
     let history = into
         .entry(branch)
         .or_default()
-        .entry((event.cell.clone(), event.version))
+        .entry(event.cell.clone())
+        .or_default()
+        .entry(event.version)
         .or_default();
     match history.iter_mut().find(|(landed, _)| *landed == layer) {
         Some(entry) => entry.1 = event.id,
@@ -229,7 +238,8 @@ impl StorageProvider for MemoryStorage {
             let found = inner
                 .reads
                 .get(branch)
-                .and_then(|cells| cells.get(&(cell.clone(), version)))
+                .and_then(|cells| cells.get(cell))
+                .and_then(|versions| versions.get(&version))
                 .and_then(|history| newest_at(history, *bound));
             if let Some((landed_at, event)) = found {
                 return Ok(Some(Landed {
@@ -245,11 +255,9 @@ impl StorageProvider for MemoryStorage {
         let inner = self.inner.lock().unwrap();
         let mut versions = Vec::new();
         for (branch, bound) in &path.segments {
-            for ((c, version), history) in inner.reads.get(branch).into_iter().flatten() {
-                if c == cell
-                    && !versions.contains(version)
-                    && history.iter().any(|(at, _)| at.0 <= bound.0)
-                {
+            let found = inner.reads.get(branch).and_then(|cells| cells.get(cell));
+            for (version, history) in found.into_iter().flatten() {
+                if !versions.contains(version) && history.iter().any(|(at, _)| at.0 <= bound.0) {
                     versions.push(*version);
                 }
             }
@@ -268,18 +276,29 @@ impl StorageProvider for MemoryStorage {
         let mut rows = Vec::new();
         for (branch, bound) in &path.segments {
             let mut segment = Vec::new();
-            for ((cell, _), history) in inner.reads.get(branch).into_iter().flatten() {
+            for (cell, versions) in inner.reads.get(branch).into_iter().flatten() {
                 if &cell.buffer != buffer || seen.contains(cell) {
                     continue;
                 }
-                if let Some((_, event)) = newest_at(history, *bound) {
-                    segment.push(cell.clone());
-                    rows.push(inner.event(event));
+                for history in versions.values() {
+                    if let Some((_, event)) = newest_at(history, *bound) {
+                        segment.push(cell.clone());
+                        rows.push(inner.event(event));
+                    }
                 }
             }
             seen.extend(segment);
         }
         Ok(Box::pin(futures_util::stream::iter(rows)))
+    }
+
+    async fn read_membership(&self, layer: LayerId) -> Result<Vec<EventId>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .members
+            .get(&layer)
+            .map(|membership| membership.events.clone())
+            .unwrap_or_default())
     }
 
     async fn read_layer(&self, layer: LayerId) -> Result<EventStream> {

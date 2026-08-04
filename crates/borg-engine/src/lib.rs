@@ -46,7 +46,7 @@ pub mod touch;
 pub mod values;
 pub mod write;
 
-pub use branch::BranchManager;
+pub use branch::{BranchManager, RoundOutcome};
 pub use defs::{DefRegistry, DefView, MigrationHop, VersionStep};
 pub use derive::DerivationEngine;
 pub use index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};

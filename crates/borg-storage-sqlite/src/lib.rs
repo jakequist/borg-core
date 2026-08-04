@@ -601,6 +601,24 @@ impl StorageProvider for SqliteStorage {
         )))
     }
 
+    async fn read_membership(&self, layer: LayerId) -> Result<Vec<EventId>> {
+        let id = layer.0 as i64;
+        with_conn(&self.conn, move |conn| {
+            let mut stmt = conn
+                .prepare_cached("SELECT event FROM layer_events WHERE layer = ?1 ORDER BY seq")
+                .map_err(sql)?;
+            let found = stmt
+                .query_map(params![id], |row| row.get::<_, i64>(0))
+                .map_err(sql)?;
+            let mut ids = Vec::new();
+            for row in found {
+                ids.push(EventId(row.map_err(sql)? as u64));
+            }
+            Ok(ids)
+        })
+        .await
+    }
+
     async fn read_layer(&self, layer: LayerId) -> Result<EventStream> {
         let id = layer.0 as i64;
         let rows = with_conn(&self.conn, move |conn| {

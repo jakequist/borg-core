@@ -103,7 +103,6 @@ impl Harness {
             &self.layers,
             &self.defs,
             branch,
-            None,
             V1,
             Writer::Client,
             LayerAuthor::Source,
@@ -129,7 +128,6 @@ impl Harness {
             &self.layers,
             &self.defs,
             branch,
-            None,
             V1,
             Writer::Producer(SCORE),
             LayerAuthor::Derived {
@@ -405,7 +403,6 @@ async fn tx_set(
         &h.layers,
         &h.defs,
         transaction.branch,
-        None,
         V1,
         Writer::Client,
         LayerAuthor::Source,

@@ -1,10 +1,14 @@
-//! Client transactions. SPEC.md §12, §13.
+//! Transactions — the client's, and the derivation round's. SPEC.md §12, §13, §16.5.
 //!
 //! A client never writes to a shared branch. It forks, writes in isolation, and merges — and because
 //! the fork's read path is bounded at the fork point, everything it reads is one consistent snapshot.
 //! Guards re-evaluated against the parent since that fork point were already the merge-conflict
 //! detector (§13), so snapshot isolation with optimistic concurrency comes out of mechanisms that
 //! already existed rather than out of new ones.
+//!
+//! A **round** is the same shape with one difference, and [`Round`] below is where that difference
+//! is written down: a client transaction is one intent and lands whole or not at all, while a round
+//! is `N` independent computations and lands the ones whose guards held.
 //!
 //! What is new is that the guards are **automatic**. A transaction records what it read; at commit
 //! those reads *are* its guards. Guards were opt-in before, which meant §13's last-write-wins was
@@ -17,7 +21,7 @@
 use crate::cell::{CellAt, CellRef};
 use crate::ids::{BranchId, LayerId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One client transaction: where it forked, what it read there, and what it wrote.
 ///
@@ -96,6 +100,168 @@ impl Transaction {
     /// operator asking why a commit is expensive (§7.7).
     pub fn size(&self) -> (usize, usize) {
         (self.reads.len(), self.writes.len())
+    }
+}
+
+/// A derivation round, as a transaction. SPEC.md §16.5.
+///
+/// A round forks the branch at the source layer it settles, runs every producer on that fork, and
+/// merges when it settles. That fork point *is* what the round can see, so `reflects` is true by
+/// construction rather than maintained — which is the whole of what replaced the round ceiling.
+///
+/// Each invocation is a transaction against the same snapshot, and the round is the collection
+/// of them keyed by the layer each one committed. Keying on the layer is what makes partial application
+/// expressible: a merge decides per layer, and one layer is one invocation.
+///
+/// **The invocations are held as the read-sets and write-sets they already were**, rather than as
+/// [`Transaction`]s. A producer's accesses come out of `ProducerCtx` as vectors the dependency index
+/// already needs (§9.4), so this takes them by value and copies nothing — which matters, because
+/// this is the hot path of a 128k-invocation round and a `Transaction`'s two `BTreeSet`s were 12% of
+/// it, spent computing a guard set that is *provably identical* to the one below. See
+/// [`guards`](Self::guards) for why identical.
+///
+/// Two rules are the round's own, and both exist because a round is `N` independent computations
+/// rather than one intent. They are [`guards`](Self::guards) and [`cascade`](Self::cascade).
+#[derive(Clone, Debug)]
+pub struct Round {
+    /// The branch the producers write to, forked at [`Round::fork_point`].
+    pub branch: BranchId,
+    /// The branch this round merges back into — the one whose data it is settling.
+    pub parent: BranchId,
+    /// The source layer being settled. Also the `since` of every guard the round carries, for the
+    /// reason [`Transaction::guards`] gives.
+    pub fork_point: LayerId,
+    invocations: BTreeMap<LayerId, Accesses>,
+}
+
+/// What one invocation touched: the same two sets the dependency index is fed.
+///
+/// `CellAt` because that is the record key the engine already has in hand (§16.3), and a guard is a
+/// question about a `CellRef` — so both accessors project the version away, exactly as
+/// [`Transaction::guards`] does.
+#[derive(Clone, Debug, Default)]
+struct Accesses {
+    reads: Vec<CellAt>,
+    writes: Vec<CellAt>,
+}
+
+impl Accesses {
+    fn observed(&self) -> impl Iterator<Item = &CellRef> {
+        self.reads.iter().map(|at| &at.cell)
+    }
+
+    fn written(&self) -> impl Iterator<Item = &CellRef> {
+        self.writes.iter().map(|at| &at.cell)
+    }
+}
+
+impl Round {
+    pub const fn new(branch: BranchId, parent: BranchId, fork_point: LayerId) -> Self {
+        Self {
+            branch,
+            parent,
+            fork_point,
+            invocations: BTreeMap::new(),
+        }
+    }
+
+    /// Record what one invocation read and wrote, and which layer it committed.
+    pub fn ran(&mut self, layer: LayerId, reads: Vec<CellAt>, writes: Vec<CellAt>) {
+        self.invocations.insert(layer, Accesses { reads, writes });
+    }
+
+    /// The layers this round committed, oldest first.
+    pub fn layers(&self) -> impl Iterator<Item = LayerId> {
+        self.invocations.keys().copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.invocations.is_empty()
+    }
+
+    /// What each of this round's layers is contingent on: the cells it read and **the round** did
+    /// not produce.
+    ///
+    /// This is [`Transaction::guards`] asked of a round, and it differs in exactly one way: the
+    /// subtraction is round-wide. That is the S7 rule — within one round `invest` writes
+    /// `is_investible` and `tier` reads it, and `tier` must not fail on a cell its own round
+    /// produced.
+    ///
+    /// **It is also a set difference rather than [`Transaction::observe`]'s ordering, and that is
+    /// safe here where it would not be for a client** (§12.1). Three things make it so, and all
+    /// three have to hold:
+    ///
+    /// * A round has no order to appeal to. Its invocations are independent by construction
+    ///   (§16.3.1) and run concurrently, so a rule that asked whether `tier`'s read came before
+    ///   `invest`'s write would give a different guard set on every interleaving.
+    /// * The difference deletes nothing that could have fired. Everything a round writes is derived,
+    ///   and a derived cell is never in the cell-touch index (§12.4).
+    /// * The read-modify-write the ordering rule exists to protect cannot arise. A producer that
+    ///   reads a cell it writes is a cycle (§16.6), not a compare-and-swap.
+    ///
+    /// Borrowed rather than cloned, because a round's guard set is the sum of its producers'
+    /// read-sets and is unbounded (§7.7).
+    pub fn guards(&self) -> Vec<(LayerId, Vec<&CellRef>)> {
+        let produced: BTreeSet<&CellRef> = self
+            .invocations
+            .values()
+            .flat_map(Accesses::written)
+            .collect();
+        self.invocations
+            .iter()
+            .map(|(layer, invocation)| {
+                let guards = invocation
+                    .observed()
+                    .filter(|cell| !produced.contains(*cell))
+                    .collect();
+                (*layer, guards)
+            })
+            .collect()
+    }
+
+    /// Everything that must be dropped once these layers are, transitively.
+    ///
+    /// A round applies partially, and the invocations it applies must still be a **consistent**
+    /// subset: an invocation that consumed a sibling's output cannot land when that sibling does
+    /// not, or the round would publish a value derived from one that never existed — and it would
+    /// be published labelled with a watermark claiming exactly the replay that would not reproduce
+    /// it (§10.1).
+    ///
+    /// Dropping it is safe for the same reason dropping the original is: its cells stay dirty in
+    /// the dependency index, so the round that settles the layer which failed the guard rediscovers
+    /// the whole chain, and until then the value reads stale.
+    ///
+    /// The closure is computed over the round's *own* reads and writes only. A read of something no
+    /// invocation in this round wrote is a read of the snapshot, and the snapshot is not going
+    /// anywhere.
+    pub fn cascade(&self, failed: &BTreeSet<LayerId>) -> BTreeSet<LayerId> {
+        if failed.is_empty() {
+            return BTreeSet::new();
+        }
+        // cell -> the layers that read it. Built only when something has already failed, so the
+        // common case — a round nothing contended with — pays nothing for it.
+        let mut readers: BTreeMap<&CellRef, Vec<LayerId>> = BTreeMap::new();
+        for (layer, invocation) in &self.invocations {
+            for cell in invocation.observed() {
+                readers.entry(cell).or_default().push(*layer);
+            }
+        }
+
+        let mut dropped = failed.clone();
+        let mut frontier: Vec<LayerId> = failed.iter().copied().collect();
+        while let Some(layer) = frontier.pop() {
+            let Some(invocation) = self.invocations.get(&layer) else {
+                continue;
+            };
+            for cell in invocation.written() {
+                for consumer in readers.get(cell).into_iter().flatten() {
+                    if dropped.insert(*consumer) {
+                        frontier.push(*consumer);
+                    }
+                }
+            }
+        }
+        dropped
     }
 }
 
@@ -183,6 +349,66 @@ mod tests {
         tx.observe(CellAt::new(prop("balance"), V1));
         tx.observe(CellAt::new(prop("balance"), V2));
         assert_eq!(tx.guards(), vec![prop("balance")]);
+    }
+
+    const L1: LayerId = LayerId(11);
+    const L2: LayerId = LayerId(12);
+    const L3: LayerId = LayerId(13);
+
+    fn round() -> Round {
+        Round::new(BranchId(3), BranchId(1), FORK)
+    }
+
+    fn at(field: &str) -> CellAt {
+        CellAt::new(prop(field), V1)
+    }
+
+    /// S7. `invest` writes `is_investible`; `tier` reads it. Neither may fail the round.
+    #[test]
+    fn a_chained_producer_does_not_guard_on_its_own_rounds_output() {
+        let mut round = round();
+        round.ran(L1, vec![at("headcount")], vec![at("is_investible")]);
+        round.ran(L2, vec![at("is_investible")], vec![at("tier")]);
+
+        assert_eq!(
+            round.guards(),
+            vec![
+                (L1, vec![&prop("headcount")]),
+                // …and *not* `is_investible`, which this round produced.
+                (L2, vec![]),
+            ]
+        );
+    }
+
+    /// The source cell a producer read is still a guard — that is what rejects a stale round (S8).
+    #[test]
+    fn a_round_guards_the_source_cells_it_read() {
+        let mut round = round();
+        round.ran(L1, vec![at("headcount")], vec![at("tier")]);
+        assert_eq!(round.guards(), vec![(L1, vec![&prop("headcount")])]);
+    }
+
+    /// A round that lost one invocation must also lose whatever consumed its output — otherwise it
+    /// publishes a value derived from one that never landed.
+    #[test]
+    fn dropping_an_invocation_drops_what_consumed_it() {
+        let mut round = round();
+        round.ran(L1, vec![at("headcount")], vec![at("is_investible")]);
+        round.ran(L2, vec![at("is_investible")], vec![at("tier")]);
+        // An unrelated invocation, to show the cascade is a closure and not a blanket rejection.
+        round.ran(L3, vec![at("name")], vec![at("slug")]);
+
+        assert_eq!(
+            round.cascade(&BTreeSet::from([L1])),
+            BTreeSet::from([L1, L2])
+        );
+    }
+
+    #[test]
+    fn a_round_with_nothing_rejected_cascades_to_nothing() {
+        let mut round = round();
+        round.ran(L1, vec![at("headcount")], vec![at("tier")]);
+        assert!(round.cascade(&BTreeSet::new()).is_empty());
     }
 
     #[test]

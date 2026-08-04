@@ -1,8 +1,9 @@
 # Draft: the transactional model
 
-> **Status: draft, not normative.** `SPEC.md` describes the system that exists. This describes a
-> proposed successor. **Phases 1 and 2 are built** — what they became is normative in `SPEC.md`, and
-> the sections here are marked. Phase 3 is not started.
+> **Status: draft, not normative, and now wholly superseded.** `SPEC.md` describes the system that
+> exists. This described a proposed successor. **All three phases are built** — what they became is
+> normative in `SPEC.md`, and the sections here are marked. Kept for the reasoning, which the spec
+> states as conclusions rather than as arguments.
 
 Three changes, which turn out to be one change seen from three angles:
 
@@ -11,8 +12,8 @@ Three changes, which turn out to be one change seen from three angles:
    is what makes a merge cheap.
 2. ~~**Every client write is a transaction.**~~ **Built** — `SPEC.md` §12, §13. A client forks, writes
    in isolation, and merges. It never writes to a shared branch.
-3. **Derivation is a transaction too.** A round forks, runs, and merges. Producers are writers like
-   any other. *Not started.*
+3. ~~**Derivation is a transaction too.**~~ **Built** — `SPEC.md` §12, §13, §16.4, §16.5. A round
+   forks, runs, and merges. Producers are writers like any other.
 
 Together they delete more than they add. The round ceiling (§16.5), the read-path hole it leaves,
 and the merge-versus-round exclusion that would otherwise be needed all stop existing rather than
@@ -130,6 +131,12 @@ guard falls out.
 
 ## 3. Derivation is a transaction
 
+> **Built.** Normative in `SPEC.md` §16.5. Everything below is what shipped. One rule below turned
+> out to be *stated too weakly* rather than wrongly — see §4's note on partial application — and one
+> boundary needed drawing that this section does not draw: a round isolates data, not definitions,
+> because a def-view bounded at the fork point hides the `MutateField` that appoints a migration from
+> the round that has to run it. `ROADMAP.md` has both.
+
 A round forks the branch at the source layer it is settling, runs every producer on that fork, and
 merges when it settles.
 
@@ -191,6 +198,13 @@ grows the read path per merge and needs compaction. Deferred, deliberately.
 branch; a *round* branch carries only derived layers and merges them, which is the whole point.
 
 ### Rounds may apply partially; client transactions may not
+
+> **Built, with one correction.** Normative in `SPEC.md` §13 and §16.5. "Applies the invocations whose
+> guards held and drops the rest" is not quite enough: the applied subset must also be **closed under
+> the round's own dependencies**, or a chained producer lands a value derived from a sibling's output
+> that was itself dropped — labelled with a watermark that replaying would not reproduce, which is the
+> failure this whole redesign is against. A dropped invocation therefore takes its round-internal
+> consumers with it, transitively. `ROADMAP.md` records why that is free.
 
 §13 currently rejects a whole merge rather than applying it partially. That stays true for a **client
 transaction**, which expresses one intent.
@@ -271,6 +285,8 @@ is captured server-side and the client never has to be trusted to report it hone
 
 ## 6. What this deletes
 
+> **Built.** All five, and none of them needed a replacement.
+
 | | |
 |---|---|
 | §16.5 round ceiling | absent — a branch boundary expresses the filter exactly |
@@ -289,11 +305,12 @@ Ordered by how much they worry me.
 
 ### 7.1 Abandoned transactions — answered
 
-> **Built for client transactions.** Normative in `SPEC.md` §12.3. `borg tx timeout` is the switch,
-> beside the store; the default is 24h; the sweep runs when a process opens the store. Reaping
-> **rounds** by the same mechanism waits for phase 3, and so does the divergence-based refinement
-> below. What a reaped transaction leaves behind is its branch row — see `SPEC.md` §12.3 and §7.5
-> here.
+> **Built.** Normative in `SPEC.md` §12.3 and §16.5. `borg tx timeout` is the switch, beside the
+> store; the default is 24h; the sweep runs when a process opens the store. A **round** needs no
+> timeout at all, which is the stronger version of what this section asked for: a round holds no
+> state outside the process running it, so an abandoned one is already reaped — its output is on a
+> branch nothing can see, its watermark never advanced, and the next round rediscovers the same work.
+> The divergence-based refinement below is still not built.
 
 A `tx begin` with no commit would leak a branch and its state forever. The answer is a configured
 **idle timeout**: a transaction untouched for longer than that is reaped.
@@ -350,6 +367,12 @@ kept as history is a real choice and should be made deliberately rather than by 
 
 ### 7.6 Every read path grows a segment
 
+> **Confirmed, and it is the single largest cost of the change.** A round's read path is
+> `[(round, head), (trunk, fork)]`, so every producer read is two index probes rather than one —
+> ~900k extra probes in a 128k round, and about +0.26s of the +0.36s the fan-out benchmark moved. The
+> probe itself is as cheap as it can be made without changing the index's shape (the `CellRef` clone
+> it used to do is gone). `ROADMAP.md` has the numbers and what closing the rest would cost.
+
 A transaction's read path is `[(txn, head), (parent, fork)]`, and a round's likewise. Two segments
 rather than one, on every read, for every write in flight. Bounded and small — but it is the hot
 path, and worth confirming the resolver's segment walk stays cheap.
@@ -371,6 +394,13 @@ rather than quiet.
 ---
 
 ## 8. What I would want to prove before building
+
+> **Done, and the fifth did not hold.** The first four are `crates/borg-engine/tests/rounds.rs` and
+> `scenarios/160-rounds-are-transactions`; `scenarios/100-watermark-truth` is the standing form of the
+> fourth. The benchmark moved: 128k entities at four cores derive in 1.88s against 1.62s, and the
+> re-derive is 1.50s against 1.14s. The merge is only ~0.10s of that once its guard set is skipped on
+> a quiet branch and its layers are regrouped by producer; the rest is §7.6 — a second read-path
+> segment on every producer read. `ROADMAP.md` has the measurements.
 
 - **A stale round cannot land.** Two rounds settling different source layers, both invoking one
   producer on one entity, merged in both orders — the older must be rejected by its own guard either
@@ -430,17 +460,21 @@ the writer's existence probe is what makes it a conflict.* — **built**,
 ### Derivation as a transaction
 
 **S7 — a chained producer does not trip its own round's guard.** *Failing means rounds containing any
-producer chain never commit.*
+producer chain never commit.* — **built**, `crates/borg-engine/tests/rounds.rs` and
+`scenarios/160-rounds-are-transactions`.
 
 **S8 — a stale round cannot land, in either order.** *Failing means the deleted ordering rule was
-necessary after all.*
+necessary after all.* — **built**, `crates/borg-engine/tests/rounds.rs`.
 
 **S9 — one contended cell does not kill a round.** *Failing means one hot cell starves a large round
-forever.*
+forever.* — **built**, `crates/borg-engine/tests/rounds.rs`.
 
 **S10 — a client merge landing mid-round produces a true watermark.** The original motivating bug, now
 expected to be structurally impossible. *Failing means the branch boundary does not express the filter
-and we have re-derived the ceiling problem.*
+and we have re-derived the ceiling problem.* — **built**, `crates/borg-engine/tests/rounds.rs`. These
+three are Rust tests rather than scenarios because the CLI is process-per-command and layer ids are
+minted per process (§17.2), so two `borg` processes overlapping in time is a corruption rather than an
+interleaving.
 
 ### The events/layers inversion
 

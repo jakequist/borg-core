@@ -93,7 +93,7 @@ impl Harness {
                 reflects: self.layers.head(branch).unwrap_or(LayerId(0)),
             },
         };
-        WriteSession::open(&self.layers, &self.defs, branch, None, V1, writer, author).await
+        WriteSession::open(&self.layers, &self.defs, branch, V1, writer, author).await
     }
 
     async fn push(&self, branch: BranchId, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {

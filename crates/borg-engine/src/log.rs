@@ -242,27 +242,46 @@ impl LayerManager {
     ///
     /// `GuardOnDerivedCell` therefore stays what it always was — the answer to a client *writing* a
     /// guard by hand on a cell it cannot usefully guard.
-    pub fn check_reads(&self, branch: BranchId, cells: &[CellRef], since: LayerId) -> Result<()> {
-        if cells.is_empty() {
-            return Ok(());
-        }
+    pub fn check_reads<'a>(
+        &self,
+        branch: BranchId,
+        cells: impl IntoIterator<Item = &'a CellRef>,
+        since: LayerId,
+    ) -> Result<()> {
         let path = self.read_path(branch, None)?;
         self.check_touched(&path, cells, since)
     }
 
+    /// Whether anything has been written to this branch since a layer, at all.
+    ///
+    /// The question a caller with an enormous guard set should ask first: nothing written means no
+    /// guard can have failed, whatever it names (§16.5). Only *source* writes count, because only
+    /// they are in the touch index and only they can trip a guard (§12.4).
+    pub fn touched_since(&self, branch: BranchId, since: LayerId) -> Result<bool> {
+        let path = self.read_path(branch, None)?;
+        self.touches.moved_since(&path, since)
+    }
+
     /// *Has anything touched these cells since that layer?* — the one question both guard paths ask,
     /// so that neither can drift into asking a slightly different one.
-    fn check_touched(&self, path: &ReadPath, cells: &[CellRef], since: LayerId) -> Result<()> {
-        for cell in cells {
-            if let Some(mutated_at) = self.touches.touched_since(path, cell, since)? {
-                return Err(BorgError::GuardViolated {
-                    cell: cell.clone(),
-                    since,
-                    mutated_at,
-                });
-            }
+    ///
+    /// Borrowed and batched: a round asks this once per invocation over that invocation's whole
+    /// read-set, which at a large fan-out is the difference between one lock acquisition and a
+    /// million.
+    fn check_touched<'a>(
+        &self,
+        path: &ReadPath,
+        cells: impl IntoIterator<Item = &'a CellRef>,
+        since: LayerId,
+    ) -> Result<()> {
+        match self.touches.first_touched_since(path, cells, since)? {
+            Some((cell, mutated_at)) => Err(BorgError::GuardViolated {
+                cell: cell.clone(),
+                since,
+                mutated_at,
+            }),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     async fn is_derived_anywhere(&self, path: &ReadPath, cell: &CellRef) -> Result<bool> {
@@ -286,6 +305,14 @@ impl LayerManager {
 
     pub fn layer(&self, id: LayerId) -> Option<Layer> {
         self.state.lock().unwrap().layers.get(&id).cloned()
+    }
+
+    /// Who authored a layer, without cloning the layer.
+    ///
+    /// A `Layer` carries its guards, so asking for one to read a two-word enum copies a `Vec` — which
+    /// is invisible until a round asks it once per invocation (§16.5).
+    pub fn author_of(&self, id: LayerId) -> Option<LayerAuthor> {
+        self.state.lock().unwrap().layers.get(&id).map(|l| l.author)
     }
 
     /// Every committed layer belonging to a branch. A layer belongs to exactly one branch

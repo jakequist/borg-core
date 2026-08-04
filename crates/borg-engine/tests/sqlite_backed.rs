@@ -137,7 +137,6 @@ impl Harness {
             &self.layers,
             &self.defs,
             branch,
-            None,
             V1,
             Writer::Client,
             LayerAuthor::Source,

@@ -33,5 +33,5 @@ pub use ids::{
 pub use layer::{Branch, Guard, Layer, LayerAuthor, LayerKind, LayerState, MergeMode, ReadPath};
 pub use parse::ParseError;
 pub use pid::{Pid, PidAllocator, PidKind};
-pub use transaction::Transaction;
+pub use transaction::{Round, Transaction};
 pub use value::{ObjectTypeName, Value, ValueInput, ValueType};

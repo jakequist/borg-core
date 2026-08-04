@@ -31,11 +31,11 @@ to be current at the call site instead of taking the lag, a client can wait for 
 its own write, and a report can read the whole branch at the point everything agrees. The automation
 is pausable per branch, and a paused branch reports its lag in the vocabulary that already existed.
 
-**And it runs concurrently.** A round discovers a wave of invocations and runs them at once; the
-ceiling that lets one producer see another's output within a round is committed state rather than a
-value threaded through a loop; and a producer's workers are a pool rather than one process behind a
-lock. The invariants that were written to permit this were checked rather than assumed, and three of
-them were not true as implemented — see the decisions below.
+**And it runs concurrently.** A round discovers a wave of invocations and runs them at once; a
+producer sees a peer's output because a round has a branch of its own and a client's concurrent write
+is above its fork point; and a producer's workers are a pool rather than one process behind a lock.
+The invariants that were written to permit this were checked rather than assumed, and three of them
+were not true as implemented — see the decisions below.
 
 **Versions are per definition, and watermarks compose.** A stored record is keyed by the def-version
 of its own field rather than by whoever wrote it, so declaring an unrelated field no longer hides
@@ -195,7 +195,45 @@ them.
 Four decisions came out of it, below. The fan-out curve is unchanged: 128k entities at four cores
 derive in 1.61s against 1.56s before, and the shape is still linear.
 
-**Phase 3 — derivation as a transaction — is not started.**
+### G — derivation is a transaction, and the round ceiling is gone
+
+Phase 3 of the transactional model (`SPEC-DRAFT.md` §3, §4, §7.1), and the last of it. A round forks
+the branch at the source layer it settles, runs every producer on the fork, and merges what settled —
+so a producer's read path is `[(round branch, head), (trunk, fork point)]` and there is no
+high-water mark anywhere. `reflects` is the fork point by construction; a client write landing
+mid-round is above the bound and is simply not in the path.
+
+`RoundCeiling` is deleted, not kept as a fallback, and with it the prefix-versus-filter hole recorded
+below, the `ReadPath` that would have had to carry admitted layers, and the `reflects` column the
+provider line was never going to get. `borg_core::Round` is `N` invocations sharing one fork point,
+sitting beside `Transaction` because the two guard rules have to be read together;
+`BranchManager::merge_round` is the merge; `DerivationEngine::settle` is public, because the
+interleavings worth testing are statements about *which* layer a round settles.
+§12, §13, §16.4 and §16.5 are updated; `crates/borg-engine/tests/rounds.rs` is S7–S10 and
+`scenarios/160-rounds-are-transactions` is S7 through the real binary.
+
+Eight decisions came out of it, below.
+
+**The fan-out benchmark moved, and this is where it went.** 128k entities at four cores derive in
+1.88s against 1.62s before (+16%); the re-derive after flipping the one shared cell is 1.50s against
+1.14s (+30%). The shape is unchanged — still linear in `n`, still scaling with parallelism the same
+way.
+
+Measured, not guessed, and in two parts. **The merge is ~0.10s of it** at 128k, after three fixes
+worth naming because each was a factor of several: the cell-touch index no longer clones a `CellRef`
+per probe (it was keyed on a `(BranchId, CellRef)` tuple, and `HashMap::get` wants the whole key); a
+merge whose parent has had *nothing* written to it since the fork point skips building the guard set
+at all, which is one comparison instead of a million; and the round's `n` per-invocation layers are
+regrouped into one layer per producer, so the trunk gains one layer rather than 128k. The naive
+version of the merge was 0.48s.
+
+**The remaining ~0.26s is the second read-path segment**, and it is the cost SPEC-DRAFT §7.6
+predicted: every producer read now walks `[(round branch, head), (trunk, fork point)]` instead of one
+segment, so it is two index probes rather than one, ~900k extra probes in a 128k round. Halving that
+back would mean a read index keyed cell-first rather than branch-first, which makes `scan_buffer`
+proportional to the whole store rather than to a branch — a trade worth measuring on its own and not
+worth taking blind. What was cheap was removing a `CellRef` clone from the probe itself, which is
+done: `MemoryStorage`'s read index is nested now for the same reason the touch index is.
 
 ### Deferred, still
 
@@ -493,30 +531,27 @@ running it twice at once would put two layers of one round on one cell and two `
 to describe one run. Deferring the duplicate is free, because this wave's own output re-triggers it
 if it is still dirty.
 
-### The round ceiling is committed state, and cannot be exactly §16.5
+### The round ceiling was a prefix used to express a filter — and is now deleted, not fixed
 
-The sequential engine threaded the ceiling through its loop. That was not merely awkward to
-parallelise: it made the value depend on the order the loop happened to visit producers in, and the
-order is not prescribed. It is now a monotonic maximum raised by every layer the round commits —
-same rule, different owner.
+*(Superseded by milestone G. Kept because the shape of the problem is why the fix is a fork.)*
 
-**The exact formulation is not implementable behind the current `ReadPath`.** §16.5 says the ceiling
-is *"the highest layer that is either ≤ L, or is a derived layer with `reflects == L`"* — a filter.
-A `ReadPath` bound is one layer id — a prefix. They coincide while derivation is the only writer, and
-diverge when a client commits a source layer `L'` mid-round below one of this round's ids: the prefix
-admits `L'`, so output labelled `fresh_as_of: L` may have incorporated `L'`.
+The ceiling was *"the highest layer that is either ≤ L, or is a derived layer with `reflects == L`"* —
+a **filter** — held as a `ReadPath` bound, which is a **prefix**. The two coincide while derivation is
+the only writer on the branch and diverge the moment a client commits a source layer `L'` mid-round
+with an id below one of this round's: the prefix admitted `L'`, so output labelled `fresh_as_of: L`
+could have incorporated `L'`.
 
-The strict repair was implemented and is worse. Advancing only over a contiguous run of ids the round
+The strict repair was implemented and was worse. Advancing only over a contiguous run of ids the round
 itself produced means a ceiling stalled below `L'` **never rises again**, so every re-run of a
 downstream producer reads the same absent input and the round stops converging — a lost update, found
-by a test that pushed a source layer while a round was settling. The stale label, by contrast, is
-transient and self-correcting: settling `L'` re-runs everything that read what `L'` wrote, and until
-then `validate` reports the value `Stale` because its dependency was written above its `fresh_as_of`.
-The only observable residue is a time-travel read pinned at exactly `L`.
+by a test that pushed a source layer while a round was settling.
 
-Closing it properly needs a `ReadPath` that carries admitted layers beside its bound, or a `reflects`
-column storage may filter on — and the second teaches the provider line about derivation, which
-invariant 1 forbids. **That is a design change and is not made here**; §16.5 records the consequence.
+**What actually fixed it was not a better bound.** A round forks its own branch at `L`, so `L'` is on
+another branch and the filter is expressed exactly: everything the round wrote is at *my head*,
+everything else is bounded at the fork point, and there is no third category to admit by accident.
+The two design changes this entry said would be needed — a `ReadPath` carrying admitted layers, and a
+`reflects` column the provider may filter on — are both unnecessary, which is the strongest argument
+the transactional model made for itself.
 
 ### Three invariants were not true as implemented
 
@@ -776,6 +811,102 @@ also nothing to isolate from: anything concurrent would have left a layer.
 
 `scenarios/060-definitions-enforced` opens on exactly this write, which is how the case was found.
 
+### A round guards what it read and did not produce, as a set difference
+
+§12.1's rule for a client is about **order** — a read before your own write is still guarded, or every
+compare-and-swap silently stops being protected. A round cannot use that rule: its invocations are
+independent by construction and run concurrently, so whether `tier`'s read of `is_investible` came
+"before" `invest`'s write is a fact about the interleaving, and a guard set that depended on it would
+differ from run to run. So the subtraction is round-wide and a plain set difference.
+
+**Taking it as a set difference deletes nothing here**, which is why the two rules can differ without
+one of them being wrong. Everything a round writes is derived; a derived cell is never in the
+cell-touch index (§12.4); so no guard on one could ever have tripped. And the read-modify-write the
+ordering rule protects cannot arise — a producer that reads a cell it writes is a cycle (§16.6), not
+a compare-and-swap.
+
+That is also why `Round` holds its invocations as the read-sets and write-sets they already are
+rather than as `Transaction`s. Building one `Transaction` per invocation was the first shape and it
+was **12% of the fan-out benchmark**, spent on two `BTreeSet`s per invocation to compute a guard set
+provably identical to the one the raw vectors give. What is reused is what should be — the guard
+*rule*, stated once and next to the client's version of it in `borg-core`, and the whole of the merge
+machinery underneath: `check_reads`, the cell-touch index, and `since` being the fork point.
+
+### Partial application has to be closed under the round's own dependencies
+
+This is the one thing the draft did not anticipate, and it is a correctness bug rather than a
+refinement. Draft §4 says a round "applies the invocations whose guards held and drops the rest". Take
+that literally with a chained producer and the round publishes a lie: `invest`'s layer is dropped
+because a client moved `headcount`, but `tier` — which read `is_investible` off the round's own branch
+and carries no guard on it, correctly — lands anyway. The trunk then holds a `tier` derived from an
+`is_investible` that never existed, labelled `reflects: L`, and replaying `L` does not reproduce it.
+That is exactly the class of failure `100-watermark-truth` exists to catch, reintroduced by the fix
+for a different one.
+
+So a dropped invocation takes everything in the same round that consumed its output with it,
+transitively (`Round::cascade`). Dropping more is free for the same reason dropping any of it is:
+the edges are recorded on the trunk, the layer that failed the guard is a source layer some later
+round settles, and that round rediscovers the whole chain. The closure is built only when something
+has already failed, so an uncontended round pays nothing for it.
+
+### A round merges one layer per producer, not one per invocation
+
+One layer per invocation on the *round* branch, because partial application decides per invocation and
+a guard is a fact about one invocation. But nothing downstream of the merge needs that granularity — a
+layer is an ordered group of events (§6.2) and `LayerAuthor::Derived` describes the whole group — so
+the accepted layers are regrouped by producer on the way across.
+
+Without it, fork-and-merge would double the log: a 128k fan-out would commit 128k layers on the round
+branch and 128k more on the trunk, and `Registry::open` replays the log on every CLI invocation. With
+it the trunk gains one layer per producer per round, which is *fewer* than before the change.
+
+### The dependency index is keyed on the trunk, never on the round's branch
+
+A round branch is where events land on the way through; the dependency graph is a fact about the data,
+which lives on the trunk. Keyed on the round branch, the index would be discarded with the round — and
+then an invocation whose merge was rejected would never be rediscovered, because rediscovery is
+`dependents(branch, cells)` and the edges would be under a branch id nobody looks up. Partial
+application is only safe because those edges are already on the trunk when the merge decides.
+
+### An inline computation does not fork
+
+`freshness: current` computes one cell because one client asked, and advances no watermark (§10.5). A
+round forks because it is `N` computations that must land or not land together with respect to the
+world they read. One invocation has no such structure, and forking it would buy a branch and a merge
+to isolate a single run from a snapshot it has no claim on. It writes to the branch directly, at head,
+as it always did — and a round in flight cannot see it, because its layer is above the round's fork
+point like any other.
+
+### A round isolates data, not definitions
+
+The fork point bounds a round's *data* reads and nothing else. Definitions are folded along the
+trunk's full ancestry, which is what §8.0's two def-views already did when the bound was a ceiling:
+a layer holds value events xor def events (§6.2), so nothing a round commits can move a definition,
+and bounding the def-view at the fork point hides exactly the `MutateField` that appoints a migration
+from the round that has to run it. Bounding it was tried; the symptom is that a migration pushed over
+existing data never runs at all. `WriteSession::open_on` is where the two branches are passed
+separately, and it exists only for this caller.
+
+### A branch id is not free just because no row claims it
+
+A round forks on every settle, so branch ids are minted by the engine rather than by a caller who
+knows what they are doing. `BranchManager` therefore skips an id that already names layers, not only
+one that already has a branch row — two branches sharing an id breaks the one thing §6.2 says about
+layers and branches, and the cost of being sure is one map lookup.
+
+### A backlog of source layers still costs re-runs
+
+Rounds settle one source layer each, so when several are committed before any is settled, the round
+settling the earlier layer merges *above* the later layer's id — and the round settling the later one,
+forked at it, cannot see that output. This predates the change (a ceiling stalled at `L'` had the same
+blind spot in its first wave, and only saw past it by way of the prefix hole) and is unchanged by it.
+
+It costs re-runs rather than correctness in the shapes v1 produces, because each round recomputes what
+its own source layer dirtied, chains included. The exposure is an invocation dirtied by `L'` that
+depends on a derived cell only an earlier round produced. Settling a *range* rather than a single
+layer is the shape that closes it, and it changes what a watermark counts — its own change, with its
+own scenario.
+
 ---
 
 ## Tests we owe
@@ -805,6 +936,14 @@ because a concurrency bug that shows up one run in six reads as a flake and is n
 unit tests in `borg-engine` itself arrived with them, on the round ceiling — the interleavings that
 distinguish a prefix from a maximum are exactly the ones an integration test cannot provoke on
 purpose.
+
+Paid off in G (`crates/borg-engine/tests/rounds.rs`): S7–S10, plus a deletion landing mid-round. The
+last four need two writers overlapping in time, so they hold a round open inside a producer while the
+test writes — which turned up a fragility in the *existing* gate in `concurrency.rs` as well.
+`tokio::task::yield_now` hands the worker back to its own local run queue, so under load every worker
+can spin on a gate only a task in the global queue can open; the upstream-commits-late test failed its
+own precondition about one run in forty that way, and both gates poll on a timer now. That frequency
+is exactly the one this file says to take seriously, and it was a test bug rather than a product one.
 
 And `borg-exec-process` got its first tests at all (`pool.rs`): concurrent invocations served by
 concurrent processes, the pool bounded by its size, and a worker reused when nothing overlaps. They

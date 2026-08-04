@@ -1,0 +1,11 @@
+# A two-hop chain, which is the shape S7 is about: `tier` reads the field `invest` writes, both
+# inside the same round.
+[repo]
+id = 1
+name = "investing"
+
+[[pipelines]]
+command = "pipelines/invest.sh"
+
+[[pipelines]]
+command = "pipelines/tier.sh"

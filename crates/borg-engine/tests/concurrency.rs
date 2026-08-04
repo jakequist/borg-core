@@ -136,7 +136,6 @@ impl Harness {
             &self.layers,
             &self.defs,
             BRANCH,
-            None,
             version,
             Writer::Client,
             LayerAuthor::Source,
@@ -350,13 +349,21 @@ async fn an_upstream_that_always_commits_late_still_reaches_its_downstream() -> 
                 let gate = Arc::clone(&gate);
                 Box::pin(async move {
                     let website = ctx.get(&prop(input, "website")).await?;
-                    // Bounded, so a scheduling policy that puts the downstream in another wave
+                    // **Sleep, not `yield_now`.** A yield hands the worker back to its *local* run
+                    // queue, and the downstream this is waiting for may be sitting in the global
+                    // one — so under load every worker can end up spinning on a gate only a task
+                    // none of them will poll can open. That showed up as this test's own
+                    // precondition failing about one run in forty, which is exactly the frequency
+                    // this file exists to take seriously. A timer parks the worker and the
+                    // downstream gets scheduled.
+                    //
+                    // Still bounded, so a scheduling policy that puts the downstream in another wave
                     // degrades this to an ordinary run rather than to a hang.
-                    for _ in 0..10_000 {
+                    for _ in 0..2_000 {
                         if gate.load(Ordering::Acquire) > 0 {
                             break;
                         }
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
                     }
                     let Some(Value::Int(n)) = website else {
                         return Ok(());

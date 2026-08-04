@@ -102,10 +102,11 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - Auto-derivation happens in the process that commits a layer, not in a scheduler of its own. A
   write therefore pays for the derivation it causes; §9.6 says that is a latency property, not a
   semantic one, and a server moves the same call behind a signal.
-- A round's ceiling is a `ReadPath` bound, which is a prefix, where §16.5's formulation is a filter.
-  Under a *concurrent source write* a round can therefore read a layer above the one it reflects. The
-  strict alternative was tried and stops the fixpoint converging; §16.5 and `ROADMAP.md` record the
-  consequence and what closing it would cost.
+- Rounds settle one source layer each, so a **backlog** — several source layers committed before any
+  is settled — leaves the round settling the earlier one merging above the later one's id, where the
+  round settling the later one cannot see it. Costs re-runs rather than correctness in the shapes v1
+  produces; settling a *range* is the fix and it changes what a watermark counts (§16.5,
+  `ROADMAP.md`).
 - `scan_buffer` and `read_layer` materialise results before streaming them.
 - SQLite `Registry::open` rebuilds indexes by replaying the log — `O(log)` per CLI invocation.
 - Writes to list and untyped-container cells are **not** validated: there is no `ListDef` event to
@@ -118,17 +119,24 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - A watermark is a `LayerId` like any other, so nothing stops one being compared with a layer id
   that is not a source layer. Four bugs have come from that family already; `ROADMAP.md`'s
   *Deferred, still* records what a `Watermark` newtype would cost and why it is its own change.
-- **Transaction branches are never reaped.** Reaping drops a transaction's *state*, which is what
-  makes it unusable, and leaves the branch row. Whether spent branches are collected or kept as
-  history is a real choice (SPEC-DRAFT §7.5) and should not be made by a janitor as a side effect.
+- **A round forks before it knows whether it has any work**, so a source layer that dirties nothing
+  still costs a branch row. Forking lazily means threading the round's read path into the scheduler
+  rather than its branch id, which is a real restructuring for a row.
+- **Transaction branches are never reaped**, and neither are round branches. Reaping drops a
+  transaction's *state*, which is what makes it unusable, and leaves the branch row; a round holds no
+  state outside the process running it, so an abandoned one leaves a branch row and derived layers
+  nothing can reach. Whether spent branches are collected or kept as history is a real choice
+  (SPEC-DRAFT §7.5) and should not be made by a janitor as a side effect. Note this is now **two**
+  branches per `borg set`: the transaction's, and the round's.
 - **The reap sweep lives in the CLI, not in `Registry::open`.** §12.3 says "when a process opens the
   store", and for this client that is `run()`. The transaction table is a filesystem sidecar like the
   pause flags and the producer table; `Registry::open` sits below the provider line, where a
   filesystem sidecar has no business. A server moves the sweep to wherever it opens the store.
-- **Every `borg set` now costs two layers** — one on its transaction branch, one on the parent naming
-  it — plus a branch row. Forks are `O(1)` and layers are cheap, but `Registry::open` replays the log
-  on every CLI invocation, so the `O(log)` open grows twice as fast as it did. SPEC-DRAFT §7.4 flagged
-  this; the fan-out benchmark cannot see it, because it drives the engine rather than the CLI.
+- **Every `borg set` now costs four layers** — one on its transaction branch, one on the parent
+  naming it, and then a round which is one derived layer per producer on its own branch plus one per
+  producer on the parent. Forks are `O(1)` and layers are cheap, but `Registry::open` replays the log
+  on every CLI invocation, so the `O(log)` open grows with it. SPEC-DRAFT §7.4 flagged this; the
+  fan-out benchmark cannot see it, because it drives the engine rather than the CLI.
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.

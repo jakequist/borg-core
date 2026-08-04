@@ -1193,8 +1193,9 @@ A dashboard wants ragged; a report wants settled.
 A watermark points into the **source** stream, and the derived layers carrying a source layer's
 consequences have higher ids than it — so the layer a settled read resolves at is not the watermark
 itself but the highest layer below which nothing is unsettled: layers at or under the watermark, plus
-derived layers reflecting one of them. This is §16.5's round ceiling asked about the branch rather
-than about one round.
+derived layers reflecting one of them. That is the *settled ceiling* — a property of the branch,
+computed on the read path, and not to be confused with anything a round maintains: a round expresses
+what it can see with a branch boundary and holds no bound of its own (§16.5).
 
 ---
 
@@ -1232,13 +1233,19 @@ snapshot**; guards re-evaluated against the parent since that fork point are alr
 merge-conflict detector (§13). Together that is snapshot isolation with optimistic concurrency
 control, assembled entirely out of mechanisms that existed for other reasons.
 
+**Derivation is a transaction too.** A round forks, runs its producers, and merges, guarded by what
+they read — so producers are writers like any other and there is exactly one write path in the
+system. Everything in this section applies to a round; §16.5 is where the two differences live.
+
 Three consequences:
 
 - **Every trunk layer is one complete intent.** Never a partial write, never two intents interleaved.
 - **The safe path is the only path.** Guards used to be opt-in, which meant §13's last-write-wins was
   what people actually got. It is now what a client gets only where it expressed no dependency at all.
 - **Transaction branches are created with derivation paused.** Deriving on a branch that exists to be
-  merged is waste: merge does not carry derived layers, and the parent recomputes.
+  merged is waste: a client merge does not carry derived layers, and the parent recomputes. A round
+  branch is paused for a sharper reason — a round deriving on its own branch would be a round inside
+  a round (§16.5).
 
 ### 12.1 Guards are automatic
 
@@ -1308,6 +1315,12 @@ no daemon and an idle store sweeps nothing because nothing is growing.
 The error when a client touches a reaped transaction must say *expired after N idle*, never *unknown
 transaction*. The first tells you what to do.
 
+**Rounds are reaped by the same mechanism, and cost nothing to lose.** A round is a transaction too
+(§16.5) and a wedged producer leaks identically. A reaped round's output is discarded, but the cells
+it was computing are still dirty in the dependency index, so the next round rediscovers them — the
+same property that makes partial application safe. It is also why *idle* beats *elapsed*: a
+legitimate 128k-invocation round runs long but is never idle.
+
 This draws a line worth naming: **transactions are ephemeral and reaped; branches are durable and
 explicit.** A client that wants to walk away and come back wanted a branch (§7).
 
@@ -1347,9 +1360,22 @@ rejecting it exists to catch a client asserting something it cannot mean, which 
 
 ## 13. Merge
 
-Merge replays the child branch's **source** events onto the parent as **new** layers. Derived layers
-are tagged and skipped — the child's derived values are wrong on the parent by construction, because
-the underlying data differs. The parent's derivation engine re-derives in the background.
+**There are two kinds of merge, and which layers they carry is the difference.**
+
+Merging a **client** branch replays its **source** events onto the parent as **new** layers. Derived
+layers are tagged and skipped — the child's derived values are wrong on the parent by construction,
+because the underlying data differs. The parent's derivation engine re-derives in the background.
+
+Merging a **round** branch (§16.5) replays its **derived** layers, and there is nothing else on it.
+Carrying them is the entire purpose of the branch: a round computed them from data the parent has,
+which is exactly what a client branch's derived output is not. The two are separate operations rather
+than one operation reading what a branch happens to contain, because "skip derived layers" and "carry
+only derived layers" are opposite rules and the difference must be stated by the caller.
+
+Everything below describes the client merge. A round merge differs in three further ways, all of them
+consequences of a round being `N` independent computations rather than one intent: it applies
+**partially**, it evaluates a guard set per invocation rather than one for the whole child, and it
+regroups the layers it carries by producer. §16.5 is where those live.
 
 **Merge does not copy events.** Each new parent layer *names* the events of the child layer it
 replays (§4.3, §6.2). Nothing is rewritten, so:
@@ -1383,9 +1409,13 @@ existing values then migrate exactly as the child's did, as ordinary derivation 
 **Def+data.** Also replays ValueEvents. Each retains its authored ClientVersion, so the parent's
 readers migrate as needed; nothing is coerced.
 
-**Validation precedes any write.** v1 rejects a whole merge rather than applying it partially, so
-every layer is checked before the first one is replayed and a rejected merge leaves no trace on the
-parent.
+**Validation precedes any write.** v1 rejects a whole client merge rather than applying it partially,
+so every layer is checked before the first one is replayed and a rejected merge leaves no trace on the
+parent. A transaction expresses one intent and there is no half of it worth having. A **round** is
+the deliberate exception (§16.5): it is `N` computations with no invariant spanning any two of them,
+and one contended cell must cost one invocation rather than the round. Validation still precedes any
+write there — every guard is checked against the parent as it stood before the merge, and only then
+is anything applied.
 
 **Failure and conflict rules:**
 
@@ -1520,7 +1550,7 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 | `DefRegistry` | defs, def-versions, ClientVersion resolution, live-version set |
 | `Invalidator` | walks a committing layer, converts it into dirty invocations |
 | `DependencyIndex` | bidirectional cell ↔ invocation graph; in-memory-primary |
-| `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, settles each source layer as a closure (§16.5) |
+| `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, settles each source layer as a transaction (§16.5) |
 | `ProducerRuntime` | executes user code; owns the read proxy that records and verifies read/write sets |
 | `Resolver` | read path: locate cell, migrate for version skew, validate, build envelope |
 | `FrontierTracker` | per-producer watermarks, settled frontier, `frontier.reaches()` |
@@ -1597,23 +1627,124 @@ An **aborted** layer is not waited for — it will never commit — and a layer 
 store is reopened is aborted, because an open layer is exclusive to a process that no longer exists
 (§6.2).
 
-### 16.5 A source layer settles as a closure
+**A round forking a branch of its own does not qualify it either** (§16.5). The fork is where a
+round's output goes, not a record of what a round has left to do: nothing about pending work is
+written to it, and a process killed mid-round leaves a branch holding derived layers no other branch
+can see, plus the same watermark gap it started from. The next round rediscovers exactly the same
+work and forks again. This is the same statelessness the pause switch and the parallelism bound leave
+intact, applied to isolation instead of to scheduling.
+
+### 16.5 A source layer settles as a transaction
 
 A committed layer triggers producers; their output commits further layers, which trigger more.
 **All of it carries the same `reflects`**, because it is all the consequence of one source layer. A
 producer's watermark advances to `L` only once that whole closure has settled — which is precisely
 what makes the watermark's claim true: *replay the world at `L` and you get exactly this.*
 
+**A round is a transaction like any other write** (§12). It forks the branch at the source layer it
+is settling, runs every producer on the fork, and merges when it settles:
+
+```
+fork at L → run producers → merge, guarded by what they read
+```
+
 Only **source** layers open a round. Derived layers are consequences, picked up inside the closure
 rather than driving rounds of their own. Skipping derived layers entirely is tempting and wrong: it
 silently breaks every chained producer, since a producer consuming another's output can only ever be
 triggered by that producer's derived layer.
 
-**The layer a producer reads at is not the layer it reflects.** Within a round, reads resolve at the
-round's **ceiling** — the source layer plus every derived layer already committed as a consequence of
-it — while the output is labelled with the source layer. Without that separation a downstream
-producer could never see its upstream's output, because that output lives in a derived layer with a
-*higher* id than the source layer they both reflect.
+#### The fork point is the filter
+
+**The layer a producer reads at is not the layer it reflects**, and the branch boundary is what
+expresses the difference. A producer's read path is:
+
+```
+[(round branch, its own head), (trunk, L)]
+```
+
+- It sees its siblings' output, because that output is on the round's own branch bounded at that
+  branch's head. There is no high-water mark to maintain: *"the head of my branch"* already means
+  *"my source layer plus everything this round has committed"*, which is exactly the world a
+  downstream producer must see to consume its upstream's output.
+- It cannot see anything a client lands on the trunk meanwhile, because the trunk segment is bounded
+  at the fork point and a layer committed afterwards is above that bound.
+
+**`reflects` is therefore true by construction rather than by bookkeeping.** A round cannot label its
+output with a layer it did not fork at, because the fork point is the only thing it can see. Earlier
+drafts of this section maintained the same idea as a *ceiling* — a monotonic high-water mark raised
+by every layer the round committed — and that was a `ReadPath` bound, which is a prefix, used to
+express a filter. The two diverge exactly when a second writer exists: a client's source layer `L'`
+committed mid-round with an id below one of the round's was admitted by the prefix, and output
+labelled `fresh_as_of: L` could have incorporated data from `L'`. A branch boundary has no such gap,
+because `L'` is not on the round's branch at all. The hole is not closed; it cannot form.
+
+Three things stop existing with it: the ceiling, a `ReadPath` that would have had to carry admitted
+layers beside its bound, and a `reflects` column the storage provider would have had to filter on —
+which §17.1 forbids. The provider line is untouched.
+
+#### Guards make round ordering irrelevant
+
+Two rounds may be in flight at once — one settling `L`, one settling `L'` — and both may invoke the
+same producer on the same entity. Single-writer-per-field does not help, because it is the *same*
+producer. Without something else, whichever merges last wins, and that may be the older result.
+
+Automatic guards settle it with **no ordering rule at all**. A round's guards are its producers'
+read-sets, which the engine already captures (§9.4). The `L` round read some source cell at `L`, so
+it carries *"unchanged since `L`"*. For it to be in danger at all, `L'` must already be on the trunk —
+otherwise the `L'` round could not have forked from it — so its guard fails **whichever order the
+merges are attempted in**. The stale round is not sequenced behind the fresher one; it is rejected.
+That is stronger than an ordering rule, because it needs no queue and no serialization point: the bad
+interleaving becomes harmless rather than prevented.
+
+**A round guards the cells it read and the round did not write.** The subtraction is round-wide, not
+per-invocation, and that is what lets a chain commit: within one round `invest` writes
+`is_investible` and `tier` reads it, and `tier` must not fail on a cell its own round produced. §12.1
+states the client's version of this rule as an *ordering* — a read before your own write is still
+guarded — because taken as a set difference it deletes read-modify-write. A round has no order to
+appeal to, and does not need one: everything it writes is derived, a derived cell is never in the
+cell-touch index (§12.4), so no guard on one could ever have tripped; and a producer that reads a
+cell it writes is a cycle (§16.6), not a compare-and-swap.
+
+#### Rounds apply partially
+
+§13 rejects a whole merge rather than applying it partially, and that stays true for a **client
+transaction**, which expresses one intent. It is not true for a **round**. A round is `N` independent
+computations with no invariant spanning any two of them, and whole-round rejection would let one
+contended cell kill a 128k-invocation round — and under sustained contention it would never land at
+all. So a round applies the invocations whose guards held and drops the rest.
+
+Dropping is safe because of the freshness design rather than in spite of it. A dropped invocation's
+edges were recorded in the dependency index when it ran — on the trunk, never on the round's own
+branch — so its cells are still dirty; the layer that failed its guard is itself a source layer some
+later round settles, and that round rediscovers the invocation through the very cell that moved. In
+the meantime the value reads `stale` with a watermark that says so (§10.2).
+
+**The applied subset must be closed under the round's own dependencies.** If an invocation is
+dropped, everything in the same round that read what it wrote is dropped with it, transitively.
+Otherwise the round would publish a value derived from one that never landed, labelled with a
+watermark claiming exactly the replay that would not reproduce it (§10.1) — a lie of precisely the
+kind §16.5 exists to make impossible. The closure is computed over the round's own reads and writes
+only: a read of something no invocation in this round wrote is a read of the snapshot, and the
+snapshot is not going anywhere.
+
+Guards are evaluated **first, all of them, against the trunk as it stood before any of the merge
+landed**, and only then is anything applied. Checking them interleaved with application would let one
+invocation of a round trip another's guard, which is the mistake §12.1 rules out for a transaction's
+own layers.
+
+#### Rounds are ephemeral
+
+A round branch is created with derivation paused, like every other transaction branch (§12) — a round
+deriving on its own branch would be a round inside a round. It is never merged into by anything, and
+nothing else in the system can see it: a branch is visible only to its descendants (§7.2).
+
+**A wedged round is reaped by being abandoned.** A process that dies mid-round leaves a branch row and
+derived layers no other branch can reach; the watermark never advanced, so the next round rediscovers
+the same work and forks again. That is the same property that makes partial application safe, and it
+is why *idle* rather than *elapsed* is the right measure for transactions generally (§12.3): a
+legitimate 128k-invocation round runs long but is never idle.
+
+#### Concurrency within a round
 
 Ordering within a round is not prescribed, and **a round runs its invocations concurrently**. The
 invocations discovered from one layer cannot collide: single-writer-per-field (§16.3) means no two of
@@ -1628,29 +1759,41 @@ the next wave's work. That barrier is what makes "the fixpoint self-corrects" tr
 hopeful: a producer records its read-set *before* its layer commits, so a run that missed an input is
 already subscribed to it by the time any later wave scans the layer that supplied it. Without the
 barrier a run could commit after the layer it needed had already been scanned, and the correction
-would never be triggered.
+would never be triggered. The barrier is about that ordering and nothing else; it long predates the
+fork and is unaffected by it.
 
-> The ceiling is safe because derivation is the only writer while a round settles. Under concurrent
-> source writes the precise formulation is *"the highest layer that is either ≤ L, or is a derived
-> layer with `reflects == L`"* — same meaning, expressed without relying on quiescence.
+**One layer per invocation on the round branch, one layer per producer on the trunk.** The
+per-invocation layer is the unit partial application decides on, and a guard is a fact about one
+invocation. Nothing downstream of the merge needs that granularity — a layer is an ordered group of
+events (§6.2) and `LayerAuthor::Derived` describes the whole group — so the accepted layers are
+regrouped by producer on the way across, and a fan-out of 128k invocations lands as one layer rather
+than 128k.
 
-**That formulation is a filter, and a `ReadPath` bound is a prefix.** They coincide exactly while
-derivation is the only writer on the branch. They diverge when a client commits a source layer `L'`
-mid-round and is assigned an id below one this round goes on to commit: the prefix then admits `L'`,
-and output labelled `fresh_as_of: L` may have incorporated data from `L'`.
+#### The residue: cost, and ordering
 
-v1 takes the prefix and states the consequence rather than pretending the case away. The alternative
-— advance only over a contiguous run of ids the round itself produced — is worse, because a ceiling
-stalled below `L'` never rises again, every re-run of a downstream producer reads the same absent
-input, and the round stops converging at all. A stale label is transient and self-correcting:
-settling `L'` re-runs everything that read what `L'` wrote, and until then `validate` reports such a
-value `Stale`, because its dependency was written above its own `fresh_as_of` (§10.2). The one
-observable residue is a **time-travel read pinned at exactly `L`**, which may see a value that
-reflects `L'`.
+**Every producer read walks two read-path segments.** That is the price of the branch boundary and it
+is paid on the hot path: a 128k-invocation round makes roughly a million reads, each now resolved
+through `[(round branch, head), (trunk, fork point)]` rather than through one segment. Measured at
+about +16% on a full derive and +30% on a re-derive; the shape of the curve is unchanged. The merge
+itself is a small part of that, because a merge whose parent has had nothing written to it since the
+fork point does not build a guard set at all, and because the round's per-invocation layers are
+regrouped by producer.
 
-Closing that gap needs a `ReadPath` that carries admitted layers beside its bound, or a `reflects`
-column the provider is allowed to filter on — and the second would teach the storage interface about
-derivation, which §17.1 forbids. Either is a design change, not a fix.
+**Derived output can land after source layers it predates.**
+
+A round reflecting `L` may merge at a trunk position above a client's `L'`. Derived history is
+therefore non-monotonic in `reflects`, and a **time-travel read pinned at exactly `L`** does not see
+output computed from `L` — which is correct, because at `L` the round had not landed, and is
+surprising. Derived data is addressed by `reflects` rather than by derived LayerId (§16.3), so this
+affects where in the log a value is found and never which value it is.
+
+A second residue is a **backlog**: when several source layers are committed before any of them is
+settled, the round settling the earlier one merges above the later one's id, so the round settling the
+later one — forked at that later layer — cannot see it. Each round recomputes what its own source
+layer dirtied, chains included, so this costs re-runs rather than correctness in the shapes v1
+produces; but an invocation dirtied by `L'` that depends on a derived cell only some earlier round
+produced would read it absent. Settling a *range* rather than a single layer is the shape that closes
+it, and it changes what a watermark counts, so it is its own change.
 
 ### 16.6 Cycle detection
 
@@ -1700,6 +1843,7 @@ get_cell(branch, cell, layer) -> (Event, landedAt)?
 author_event(open_layer, cell, EventDraft) -> EventId   // streaming; never buffered whole
 include_event(open_layer, EventId)              // membership — what makes merge not copy
 read_layer(layer) -> Iterator<Event>            // a layer's membership, in order
+read_membership(layer) -> [EventId]             // the same, as identities — what merge actually wants
 rebuild_read_index()                            // the index is a projection, and this proves it
 scan_buffer(branch, buffer, layer) -> Iterator   // engine-internal enumeration only
 open_layer / seal_layer / commit_layer / abort_layer
@@ -1731,6 +1875,12 @@ rewrite** — every read joins the event and membership tables against a layer t
 rows whose layer is committed. Committing is then a single-row update, `O(1)` however large the
 layer. Flipping a `visible` column on each row instead would make commit `O(rows)` and undo the very
 property the interface exists to preserve.
+
+**Membership is readable without its events.** A merge names a child layer's events on the parent
+(§13) and wants nothing about them but their identities — and a round's output is `n` events each
+carrying the read-set it was computed from, so reading them whole to discard everything but the id is
+a deep copy per event where a pointer would do. `read_membership` is that read; `read_layer` remains
+the one the invalidator uses, because a changeset is only a changeset if you can see the cells.
 
 **The read index is maintained on the way in, for the same reason.** Its rows stream in with the
 events they project and are invisible by the same join; building it at commit instead would make

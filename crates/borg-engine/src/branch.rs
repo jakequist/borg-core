@@ -9,9 +9,13 @@
 //! fork point. That is the same question a merge already asked — "did the parent touch this while I
 //! was working?" — so making guards automatic changed what gets asked, not what does the asking.
 //!
-//! Merge replays the child's **source** layers onto the parent as new layers. Derived layers are
-//! skipped, because the child's derived values are wrong on the parent by construction: they were
-//! computed from different data.
+//! **There are two kinds of merge, and which layers they carry is the difference.** Merging a
+//! *client* branch replays its **source** layers and skips its derived ones, because the child's
+//! derived values are wrong on the parent by construction: they were computed from different data.
+//! Merging a *round* branch (§16.5) replays its **derived** layers and there is nothing else on it —
+//! carrying them is the entire purpose of the branch. The two are separate entry points,
+//! [`BranchManager::merge_transaction`] and [`BranchManager::merge_round`], so that the distinction
+//! is made on purpose rather than falling out of what a branch happens to contain.
 //!
 //! **Merge does not copy events.** A parent layer *names* the events of the child layer it replays
 //! (§13). The events are not rewritten, so `authored` still says where they were written and the
@@ -25,12 +29,33 @@
 use crate::log::LayerManager;
 use borg_core::{
     BorgError, Branch, BranchId, CellRef, Event, FieldName, LayerAuthor, LayerId, LayerKind,
-    MergeMode, MergeRejection, ObjectTypeName, ReadPath, Result,
+    MergeMode, MergeRejection, ObjectTypeName, ReadPath, Result, Round,
 };
 use borg_storage::StorageProvider;
 use futures_util::StreamExt;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// What became of a round at its merge. SPEC.md §16.5.
+///
+/// A round is `N` independent computations, so this is a report rather than a verdict: some
+/// invocations landed and some did not, and the caller needs to be able to say which.
+#[derive(Debug, Default)]
+pub struct RoundOutcome {
+    /// How many invocations the round ran. Not the same as how many landed, and deliberately not
+    /// pinned by any test: how often a downstream producer re-runs is what the interleaving decides
+    /// (§9.6).
+    pub executed: usize,
+    /// The layers created on the parent, one per producer that had anything to land.
+    pub landed: Vec<LayerId>,
+    /// How many of the round's invocations were applied.
+    pub applied: usize,
+    /// The invocations rejected outright, and the cell that moved underneath each.
+    pub rejected: Vec<(LayerId, CellRef)>,
+    /// How many further invocations went with them because they consumed their output.
+    pub cascaded: usize,
+}
 
 pub struct BranchManager {
     layers: Arc<LayerManager>,
@@ -75,6 +100,23 @@ impl BranchManager {
         self.layers.branches()
     }
 
+    /// The next unused branch id.
+    ///
+    /// **Unused means unused by the log, not merely unregistered.** The counter resumes past every
+    /// branch the store knows about, but a branch that has layers and no row would otherwise be
+    /// handed out again — and then two branches share an id, which breaks the one thing §6.2 says
+    /// about layers and branches: a layer belongs to exactly one branch. That was tolerable while
+    /// every fork came from a caller who knew what it was doing; a round forks by itself, on every
+    /// settle, and the cost of being sure is one map lookup.
+    fn next_branch(&self) -> BranchId {
+        loop {
+            let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            if self.layers.branch(id).is_none() && self.layers.head(id).is_none() {
+                return id;
+            }
+        }
+    }
+
     async fn persist(&self, branch: &Branch) -> Result<()> {
         self.layers.register_branch(branch.clone());
         self.storage.put_branch(branch).await
@@ -82,7 +124,7 @@ impl BranchManager {
 
     /// The root of the tree: a branch with no origin.
     pub async fn create_root(&self, name: Option<String>) -> Result<BranchId> {
-        let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = self.next_branch();
         self.persist(&Branch {
             id,
             name,
@@ -109,7 +151,7 @@ impl BranchManager {
                 branch: parent,
             });
         }
-        let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = self.next_branch();
         self.persist(&Branch {
             id,
             name,
@@ -174,6 +216,150 @@ impl BranchManager {
             &transaction.guards(),
         )
         .await
+    }
+
+    /// Land a settled round on the branch it was settling. SPEC.md §16.5.
+    ///
+    /// **Rounds apply partially, and client transactions do not.** A client transaction expresses
+    /// one intent, so a single failed guard rejects the whole thing (§13). A round is `N`
+    /// independent computations with no invariant spanning any two of them, and whole-round
+    /// rejection would let one contended cell kill a 128k-invocation round — and under sustained
+    /// contention it would never land at all. So the invocations whose guards held are applied and
+    /// the rest are dropped.
+    ///
+    /// Dropping is safe because of the freshness design, not in spite of it: a dropped invocation's
+    /// cells are still dirty in the dependency index, the layer that failed its guard is itself a
+    /// source layer some later round will settle, and that round rediscovers the invocation through
+    /// the very cell that moved. In the meantime the value reads `stale` with a watermark that says
+    /// so (§10.2).
+    ///
+    /// **Guards are evaluated first, all of them, against the parent as it stood before any of this
+    /// merge landed.** Per-layer checking interleaved with application would let one invocation of
+    /// a round trip another's guard, which is the same mistake §12.1 rules out for a transaction's
+    /// own layers.
+    pub async fn merge_round(&self, round: &Round) -> Result<RoundOutcome> {
+        let parent = round.parent;
+        let fork_point = round.fork_point;
+        let mut outcome = RoundOutcome::default();
+        if round.is_empty() {
+            return Ok(outcome);
+        }
+
+        // **Nothing written to the trunk since the fork means no guard can have failed**, whatever
+        // the round read — so the guard set is not even built. A round's guard set is the sum of its
+        // producers' read-sets and is unbounded (§7.7); a 128k-invocation round carries close to a
+        // million guard cells, and on a quiet branch this answers all of them with two map lookups.
+        let mut failed: BTreeSet<LayerId> = BTreeSet::new();
+        if self.layers.touched_since(parent, fork_point)? {
+            for (layer, guards) in round.guards() {
+                if let Err(BorgError::GuardViolated { cell, .. }) =
+                    self.layers.check_reads(parent, guards, fork_point)
+                {
+                    failed.insert(layer);
+                    outcome.rejected.push((layer, cell));
+                }
+            }
+        }
+
+        // A producer never probes existence (§8, and `WriteSession::imply_existence`), so nothing in
+        // a round's read-set names the object it writes to. Deletion therefore has to be checked
+        // rather than guarded — but from the *parent's* changeset, which is small, instead of by
+        // asking storage about every event a round produced, which is not. Nothing deleted on the
+        // parent means nothing to check, which is the ordinary case and costs one comparison.
+        let deleted = self.deleted_since(parent, fork_point).await?;
+        if !deleted.is_empty() {
+            for layer in round.layers() {
+                if failed.contains(&layer) {
+                    continue;
+                }
+                let mut stream = self.storage.read_layer(layer).await?;
+                while let Some(row) = stream.next().await {
+                    let cell = CellRef::existence_of(&row?.cell);
+                    if deleted.contains(&cell) {
+                        failed.insert(layer);
+                        outcome.rejected.push((layer, cell));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Everything that consumed a dropped invocation's output goes too, or the round publishes a
+        // value computed from one that never landed.
+        let dropped = round.cascade(&failed);
+        outcome.cascaded = dropped.len() - failed.len();
+
+        // One parent layer per producer, rather than one per invocation. A layer is an ordered group
+        // of events (§6.2) and `LayerAuthor::Derived` describes the whole group, so the round's
+        // per-invocation layers — which exist because partial application decides per invocation —
+        // do not have to survive the crossing. A fan-out of 128k invocations lands as one layer
+        // instead of 128k, which is what keeps fork-and-merge from doubling the log.
+        //
+        // Grouped as layer *ids*, never as their contents: a round's output may hold millions of
+        // events and can never be buffered whole (§6.2, invariant 3). They stream from the child
+        // layer straight into the parent one below.
+        let mut by_producer: Vec<(LayerAuthor, Vec<LayerId>)> = Vec::new();
+        for layer in round.layers() {
+            if dropped.contains(&layer) {
+                continue;
+            }
+            outcome.applied += 1;
+            let author = self.layers.author_of(layer).unwrap_or(LayerAuthor::Source);
+            match by_producer.iter_mut().find(|(seen, _)| *seen == author) {
+                Some((_, group)) => group.push(layer),
+                None => by_producer.push((author, vec![layer])),
+            }
+        }
+
+        for (author, carried) in by_producer {
+            let mut layer = self.layers.open(parent, LayerKind::Value, author).await?;
+            let mut named = 0usize;
+            for child in carried {
+                // Identities only. The parent layer names the child's event rather than rewriting
+                // it (§13), so nothing about the event but its id is wanted — and a round's events
+                // each carry the read-set they were computed from, so reading them whole to discard
+                // all but the id is a deep copy per event where a pointer would do.
+                for event in self.storage.read_membership(child).await? {
+                    layer.include(event).await?;
+                    named += 1;
+                }
+            }
+            if named == 0 {
+                // Every invocation of this producer wrote nothing — the ordinary outcome for a
+                // producer whose input was not there yet. An empty layer on the trunk would be a
+                // layer id spent to say so.
+                self.layers.abort(layer).await?;
+                continue;
+            }
+            outcome.landed.push(self.layers.commit(layer).await?);
+        }
+        Ok(outcome)
+    }
+
+    /// Existence cells the parent has tombstoned since the fork point.
+    ///
+    /// The parent's changeset rather than the child's output: a round's output is unbounded and its
+    /// merge must not pay a storage read per event, while the layers a client landed during one
+    /// round are few and usually none at all.
+    async fn deleted_since(
+        &self,
+        parent: BranchId,
+        fork_point: LayerId,
+    ) -> Result<HashSet<CellRef>> {
+        let mut deleted = HashSet::new();
+        for layer in self.layers.layers_of(parent) {
+            if layer.id.0 <= fork_point.0 || !matches!(layer.author, LayerAuthor::Source) {
+                continue;
+            }
+            let mut stream = self.storage.read_layer(layer.id).await?;
+            while let Some(row) = stream.next().await {
+                let event = row?;
+                if event.value.is_tombstone() && CellRef::existence_of(&event.cell) == event.cell {
+                    deleted.insert(event.cell);
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// The merge itself: validate everything against the parent, then apply.

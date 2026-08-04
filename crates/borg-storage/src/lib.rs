@@ -110,6 +110,15 @@ pub trait StorageProvider: Send + Sync {
     /// that decides which of them resolves.
     async fn read_layer(&self, layer: LayerId) -> Result<EventStream>;
 
+    /// The same membership, as identities only.
+    ///
+    /// A merge names a child layer's events on the parent (§13) and needs nothing about them but
+    /// their ids — and a round's output is `n` events each carrying the read-set it was computed
+    /// from, so reading them as whole events to throw everything but the id away is the difference
+    /// between a merge that costs a pointer per event and one that costs a deep copy per event.
+    /// Measured on the fan-out benchmark, where it was most of the merge.
+    async fn read_membership(&self, layer: LayerId) -> Result<Vec<EventId>>;
+
     /// A committed def layer's events, in order.
     async fn read_def_layer(&self, layer: LayerId) -> Result<Vec<DefEvent>>;
 

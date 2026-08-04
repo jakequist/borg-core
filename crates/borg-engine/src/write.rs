@@ -43,11 +43,12 @@
 //! naming a producer as a field's `up` or `down` arrives with the `MutateField`, so a `down`
 //! migration's own view, which is by definition older than that event, cannot see it.
 //!
-//! Both are folded along the branch's **full** ancestry even when the session is bounded at a layer.
-//! The bound exists to pin *data* reads to a settling round's ceiling (§16.5); a layer holds value
-//! events xor def events (§6.2), so derivation never commits a def layer and the ceiling can only
-//! ever hide definitions the round predates — which is how a migration ends up checked against the
-//! very schema its own def-mutation introduced.
+//! Both are folded along the **full ancestry of the branch that owns the data**, which for a
+//! producer running inside a round is the trunk and not the round's own branch (§16.5). A round
+//! isolates *data*: its fork point is what makes `reflects` true. Definitions are not data — a layer
+//! holds value events xor def events (§6.2), so derivation never commits a def layer, and the fork
+//! point can only ever hide definitions the round predates. Hiding them is what would break a
+//! migration, which is checked against the very schema its own def-mutation introduced.
 
 use crate::defs::{DefRegistry, DefView};
 use crate::log::{LayerHandle, LayerManager};
@@ -96,9 +97,6 @@ pub struct WriteSession {
 impl WriteSession {
     /// Fold the branch's definitions and open a layer to write into.
     ///
-    /// `at` bounds both the def-view and the existence probe, which is what lets a producer run
-    /// inside a settling round see the round's own ceiling rather than the branch head (§16.5).
-    ///
     /// Public because this *is* the write path: `Registry::begin_write` is a convenience over it for
     /// callers that hold a whole registry. What is not public is `LayerHandle::put` — there is one
     /// door, and it is this one.
@@ -106,13 +104,30 @@ impl WriteSession {
         layers: &Arc<LayerManager>,
         defs: &DefRegistry,
         branch: BranchId,
-        at: Option<LayerId>,
         version: ClientVersion,
         writer: Writer,
         author: LayerAuthor,
     ) -> Result<Self> {
-        let path = layers.read_path(branch, at)?;
-        let def_path = layers.read_path(branch, None)?;
+        Self::open_on(layers, defs, branch, branch, version, writer, author).await
+    }
+
+    /// [`open`](Self::open) for a producer running inside a round (§16.5).
+    ///
+    /// The layer goes on the round's branch and data reads resolve there; the definitions the write
+    /// is checked against come from the trunk, because a round isolates data and not schema — see
+    /// the module header. This is the only caller for which the two differ, and it exists as its own
+    /// entry point so that nobody else has to think about the distinction.
+    pub async fn open_on(
+        layers: &Arc<LayerManager>,
+        defs: &DefRegistry,
+        branch: BranchId,
+        definitions: BranchId,
+        version: ClientVersion,
+        writer: Writer,
+        author: LayerAuthor,
+    ) -> Result<Self> {
+        let path = layers.read_path(branch, None)?;
+        let def_path = layers.read_path(definitions, None)?;
         let authority = defs.view(&def_path).await?;
         let view = defs.view_at(&def_path, version.0).await?;
         let handle = layers.open(branch, LayerKind::Value, author).await?;
