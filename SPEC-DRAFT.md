@@ -273,12 +273,32 @@ The architecture gets smaller. That is the strongest argument for it.
 
 Ordered by how much they worry me.
 
-### 7.1 Abandoned transactions leak
+### 7.1 Abandoned transactions — answered
 
-`borg tx begin` with no matching commit leaves a branch and its state behind forever. Under implicit
-one-shot transactions that is rare, but an interactive or crashed client will do it, and nothing
-reaps them. A TTL, or a sweep of transaction branches with no activity, needs designing — this is the
-one concern with no existing answer anywhere in the system.
+A `tx begin` with no commit would leak a branch and its state forever. The answer is a configured
+**idle timeout**: a transaction untouched for longer than that is reaped.
+
+Idle rather than elapsed, so a long but active transaction survives. Reaping sweeps opportunistically
+when a process opens the store — the same place indexes are already rebuilt — so there is no daemon,
+and an idle store sweeps nothing because nothing is growing.
+
+**Rounds are reaped by the same mechanism**, since they are transactions too and a wedged producer
+leaks identically. That is safe by construction: a reaped round's output is discarded, but the cells
+it was computing are still dirty in the dependency index, so the next round rediscovers them — the
+same property that makes partial application safe. It is also why idle beats absolute: a legitimate
+128k-invocation round runs long but is never idle.
+
+This draws a line worth naming: **transactions are ephemeral and reaped; branches are durable and
+explicit.** A client that wants to walk away and come back wanted a branch.
+
+A refinement worth keeping in view: the real predictor of a doomed transaction is not age but
+**divergence** — layers committed on the parent since the fork. A transaction open an hour on an idle
+store is harmless; one open ten seconds on a busy store already has guards certain to fail. Measuring
+that would turn reaping from janitorial into useful, telling a client to give up rather than making
+it wait for a merge that cannot succeed.
+
+The error when a client touches a reaped transaction must say *expired after N minutes idle*, not
+*unknown transaction*. The first tells you what to do.
 
 ### 7.2 `O(1)` merge is not free, and the draft does not claim it
 
@@ -343,3 +363,85 @@ rather than quiet.
   labelled with a watermark that is actually true, repeatedly, under parallelism.
 - **The fan-out benchmark does not regress.** 128k entities currently derive in 1.1s at four cores;
   fork-and-merge per round must not undo that.
+
+---
+
+## 9. Acceptance scenarios
+
+Organised by the *failure class* they attack rather than by feature, because the bugs this project has
+actually hit cluster into a few repeated shapes: ordering assumptions that hold sequentially and break
+concurrently, two similar-looking quantities getting conflated, features that work alone and not
+together, and labels that claim more than was verified.
+
+Each says what would be broken if it failed. That is what makes it a stress test rather than a
+feature test.
+
+### The claim that must not be false
+
+**S1 — every watermark tells the truth.** For any derived cell: read its stated `reflects`, fork
+there, recompute from scratch, compare. Identical, always.
+
+This checks §10.1's headline claim directly rather than by proxy, and every ordering bug found so far
+would have surfaced here. It is a *property* over whatever state other scenarios leave behind, which
+makes it the cheapest ongoing insurance available.
+
+### Guards, the newly load-bearing mechanism
+
+**S2 — a stale transaction is rejected in either merge order.** *Failing means order-enforcement crept
+back in.*
+
+**S3 — absence is a guarded read.** Two transactions both observe a cell absent and both try to create
+it; one must lose. *Failing means absence tracking is decorative and concurrent creates silently
+duplicate.*
+
+**S4 — a transaction does not conflict with itself.** Write `X`, read `X`, commit. *Failing means the
+parent-reads-only rule is wrong and every read-modify-write deadlocks itself.*
+
+**S5 — guards do not over-reject.** Two transactions writing different fields of one object both land.
+*Failing means guards are object-granular in practice and cell granularity is fiction.*
+
+**S6 — deleting an object conflicts with writing to it.** *This is the test for "implicit reads count":
+the writer's existence probe is what makes it a conflict.*
+
+### Derivation as a transaction
+
+**S7 — a chained producer does not trip its own round's guard.** *Failing means rounds containing any
+producer chain never commit.*
+
+**S8 — a stale round cannot land, in either order.** *Failing means the deleted ordering rule was
+necessary after all.*
+
+**S9 — one contended cell does not kill a round.** *Failing means one hot cell starves a large round
+forever.*
+
+**S10 — a client merge landing mid-round produces a true watermark.** The original motivating bug, now
+expected to be structurally impossible. *Failing means the branch boundary does not express the filter
+and we have re-derived the ceiling problem.*
+
+### The events/layers inversion
+
+**S11 — authorship survives merge.** A merged value reports both where it was authored and where it
+landed. *Failing means we inverted the pointers and kept rewriting anyway: no cost saved, no lineage
+gained.*
+
+**S12 — time travel across a merge is coherent**, and one event referenced by two layers resolves to
+one identity rather than two values. *This is the specific risk the inversion introduces.*
+
+### Composition — features that have never met
+
+This class has produced the most bugs and has the least coverage.
+
+**S13 — migration under a concurrent client write.** *Migrations and concurrency have never been
+exercised together.*
+
+**S14 — a def-only merge landing while a round computes under the old def.**
+
+**S15 — a second-order fork with a migration**, migrating data inherited through two levels.
+
+### Determinism
+
+**S16 — identical settled state across many parallel runs**, asserting the settled result and never
+the schedule.
+
+Frequency matters: milestone C's ordering bug appeared **one run in six**, and an `EPIPE` panic **one
+in forty, under load only**. Both read as flakes and were not. Fewer than ~50 runs is not evidence.
