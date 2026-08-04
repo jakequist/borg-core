@@ -51,6 +51,10 @@ found a real bug. Encoding the whole PID fixes it properly.
 Goes with A because both touch the value and PID text layer; doing them together is one round of
 scenario churn instead of two.
 
+**Done.** The codec is in `borg-core/src/pid.rs` and the form is normative in `SPEC.md` §3.1 and
+§4.1: LEB128 varints for an allocated PID, all 32 bytes for a content hash, Crockford base32, and
+the kind letters `o l a j y m s b n`. `Company#100` survives as input-only shorthand.
+
 ### B — definitions become load-bearing
 
 Writes validate against the def view: unknown struct or field rejected, type mismatch rejected, and

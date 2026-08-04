@@ -74,6 +74,36 @@ strings are stored exactly once registry-wide.
 
 A PID encodes its own kind, so the dispatch to the correct buffer requires no lookup.
 
+**Text form.** A PID is written `<kind>-<id>`: a single kind letter, a hyphen, and the rest of the
+PID in [Crockford base32](https://www.crockford.com/base32.html) — lowercase on output,
+case-insensitive on input, with `i`/`l` read as `1` and `o` as `0`.
+
+| Letter | Kind | Letter | Kind |
+|---|---|---|---|
+| `o` | `Object` | `s` | `String` |
+| `l` | `List` | `b` | `Binary` |
+| `a` | `Any` | `n` | `BigInt` |
+| `j` | `AnyObject` | `y` | `AnyArray` |
+| `m` | `AnyNumber` | | |
+
+`o`, `l`, `s`, `b` are initials; `n` is BigInt (*number*) and `a` is `Any`. The untyped family takes
+the next distinctive letter of its own name — an*yObj*ect, arra*y*, nu*m*ber — because its initials
+are already spoken for.
+
+The id is **lossless** — this is the whole point of it. An allocated PID encodes `branchId`,
+`allocatorId` and `counter` as three LEB128 varints; a content-addressed PID encodes all 32 bytes of
+its hash. A truncated hash would make two distinct strings indistinguishable everywhere a human or a
+shell script handles one, and lengthening the prefix moves the birthday bound rather than removing
+it.
+
+The two flavors are told apart on decode by payload length alone: three varints reach at most 25
+bytes, a hash is exactly 32, so the encoding needs no discriminator.
+
+> A text form that dropped components — as an earlier `Company#100` did, carrying only the counter —
+> is not a naming convenience but a defect. It forces every consumer to *assume* the missing
+> components, and two consumers assuming differently name different objects while appearing to
+> agree.
+
 ### 3.2 Primitives
 
 `Int`, `Boolean` and `Double` have no PID because the identifier would cost more than the payload.
@@ -102,6 +132,24 @@ key = Pid                 // an object property, or an object's existence
 **The buffer is part of the address, not derived from it.** A sharded store must be able to route a
 request from the cell address alone; if the shard key required a schema lookup first, every read
 would need the defs before it could be sent anywhere (§17.2).
+
+**Text form.** A cell address is written as its buffer, a colon, and the PID (§3.1):
+
+```
+Company:o-1234abcd            an object's existence cell
+Company:o-1234abcd.website    an object property
+Founder[]:l-5678wxyz          a list's own cell — its value is the list's length (§4.4)
+Founder[]:l-5678wxyz[0]       a list element
+```
+
+This is the form the CLI accepts and the form cells travel in on the worker protocol (§17.4), parsed
+and rendered in one place so the two cannot drift. **A colon, not parentheses**: parentheses read
+marginally better but are shell metacharacters, and a worker is expected to be a shell script — a
+form that needs quoting is one that will eventually be typed unquoted.
+
+`Company#100` is additionally accepted **on input only**, meaning counter 100 on the root branch
+with allocator 0. It is a convenience for hand-authored data and nothing renders it; the shorthand
+in this document's later examples is that form, abbreviating a PID for readability.
 
 The cell is the right granularity because every mechanism in Borg is already field-granular:
 transaction guards, producer dependencies, field ownership, migration staleness, and merge conflict
@@ -1116,8 +1164,8 @@ the same serde impls on the same types, so no mapping document exists between th
 
 Two shapes were forced by targeting a shell worker first, and both are better than what they replaced:
 
-- **Cells and values travel as text** — `"Company#100.website"`, `"9"`, `"@Company#101"`, `"~"` —
-  the same forms the CLI accepts. A worker cannot reasonably assemble the structural JSON of a cell
+- **Cells and values travel as text** — `"Company:o-1234abcd.website"`, `"9"`, `"@o-5678wxyz"`,
+  `"~"` (§3.1, §4.1) — the same forms the CLI accepts. A worker cannot reasonably assemble the structural JSON of a cell
   address, and a protocol only usable through a generated client library is one whose complexity is
   hidden rather than absent. Text also removes the `Int`/`Double` ambiguity a bare JSON number has.
 - **Every message is a single-key object**, including the payload-free ones. A worker dispatches on

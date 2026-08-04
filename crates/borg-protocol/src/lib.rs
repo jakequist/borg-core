@@ -14,8 +14,12 @@
 //!
 //! ## Cells and values travel as text
 //!
-//! A cell is `"Company#100.website"` and a value is `"9"`, `"true"`, `"@Company#101"` or `"~"` —
-//! exactly the forms the CLI accepts, parsed and rendered by `borg_core::parse`.
+//! A cell is `"Company:o-1234abcd.website"` and a value is `"9"`, `"true"`, `"@o-5678wxyz"` or
+//! `"~"` — exactly the forms the CLI accepts, parsed and rendered by `borg_core::parse`.
+//!
+//! The cell form uses a colon rather than parentheses because a worker is expected to be a shell
+//! script: `Company(o-1234abcd)` would need quoting everywhere it appeared, and a form that needs
+//! quoting is one that will eventually be typed unquoted.
 //!
 //! This is a deliberate choice and it was forced by the target audience. A bash worker cannot
 //! reasonably assemble the structural JSON of a `CellRef`, and a protocol only usable from a

@@ -16,6 +16,12 @@ borg --branch feature set 'Company#1.name' 2
 assert_eq "$(borg get 'Company#1.name' --value --branch feature)" "2" "the child sees its own write"
 assert_eq "$(borg get 'Company#1.name' --value --branch main)" "1" "the parent is untouched"
 
+# A PID records where an object was *allocated*, not where it lives, so the fork inherits the
+# object under the same name rather than a renamed copy — visible in the canonical address.
+assert_eq "$(borg get 'Company#1.name' --branch feature | head -1)" \
+    "$(borg get 'Company#1.name' --branch main | head -1)" \
+    "the same object has one canonical address on both branches"
+
 # The parent moves on somewhere the child did not touch.
 borg --branch main set 'Company#1.founded' 1999
 

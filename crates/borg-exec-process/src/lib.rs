@@ -140,8 +140,9 @@ pub struct ProcessExecutor {
 }
 
 impl ProcessExecutor {
-    /// `branch` is the allocation branch for cell shorthand — the same one the CLI uses, so a
-    /// worker naming `Company#1` means what a human naming it means.
+    /// `branch` is the branch the `Company#1` shorthand resolves against — the same one the CLI
+    /// uses, so a worker naming a cell that way means what a human naming it means. Canonical
+    /// addresses, which is what workers are actually handed, carry their own branch and ignore it.
     pub fn new(branch: BranchId) -> Self {
         Self {
             commands: HashMap::new(),
@@ -183,8 +184,9 @@ impl ExecutionProvider for ProcessExecutor {
         }
         let worker = workers.get_mut(&command).expect("just inserted");
 
-        // The worker is handed the *entity* in the same text form a human would type, and appends
-        // field names to it — so `Company#1` is exactly the prefix it needs.
+        // The worker is handed the *entity* in the canonical text form and appends field names to
+        // it — so `Company:o-1234abcd` is exactly the prefix it needs, and it never has to know
+        // which branch it is running on.
         worker.send(&ToWorker::Invoke {
             producer: producer.id.0,
             input: borg_core::CellRef::existence(source.into(), input).to_string(),

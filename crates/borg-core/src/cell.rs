@@ -150,41 +150,37 @@ impl fmt::Debug for CellRef {
 /// The canonical text form of a cell address.
 ///
 /// ```text
-/// Company#100          an object's existence cell
-/// Company#100.website  a property cell
-/// Founder[]#500        a list's own cell — its length
-/// Founder[]#500[0]     a list element
+/// Company:o-1234abcd            an object's existence cell
+/// Company:o-1234abcd.website    a property cell
+/// Founder[]:l-5678wxyz          a list's own cell — its length
+/// Founder[]:l-5678wxyz[0]       a list element
 /// ```
 ///
 /// This exists because of shell pipelines. A worker speaking the wire protocol has to name cells,
 /// and the structural JSON form is unusable from `jq`. Making the text form canonical — parsed and
 /// rendered from one place — keeps the CLI, the protocol and error messages consistent instead of
 /// growing three dialects.
+///
+/// **A colon, not parentheses.** `Company(o-1234abcd)` reads better, but parentheses are shell
+/// metacharacters and the worker protocol is deliberately shell-first: a form that needs quoting is
+/// a form that will eventually be typed unquoted.
+///
+/// The id after the colon is the whole PID (see [`Pid`]'s `Display`), so a rendered address names
+/// exactly one cell on exactly one branch. `borg_core::parse::cell_ref` also accepts the older
+/// `Company#100` shorthand **on input**; nothing renders it.
 impl fmt::Display for CellRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.buffer, &self.key) {
-            (BufferId::Object(name), CellKey::Pid(pid)) => write!(f, "{name}#{}", short(pid)),
+            (BufferId::Object(name), CellKey::Pid(pid)) => write!(f, "{name}:{pid}"),
             (BufferId::ObjectProp(name, field), CellKey::Pid(pid)) => {
-                write!(f, "{name}#{}.{field}", short(pid))
+                write!(f, "{name}:{pid}.{field}")
             }
-            (BufferId::List(elem), CellKey::Pid(pid)) => write!(f, "{elem}[]#{}", short(pid)),
+            (BufferId::List(elem), CellKey::Pid(pid)) => write!(f, "{elem}[]:{pid}"),
             (BufferId::ListElem(elem), CellKey::Elem(pid, i)) => {
-                write!(f, "{elem}[]#{}[{i}]", short(pid))
+                write!(f, "{elem}[]:{pid}[{i}]")
             }
             (buffer, key) => write!(f, "{buffer:?}/{key:?}"),
         }
-    }
-}
-
-/// The counter of an allocated PID, or a hash prefix for a content-addressed one.
-fn short(pid: &Pid) -> String {
-    match pid {
-        Pid::Allocated { counter, .. } => counter.to_string(),
-        Pid::Content { hash, .. } => hash[..6].iter().fold(String::new(), |mut acc, byte| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{byte:02x}");
-            acc
-        }),
     }
 }
 

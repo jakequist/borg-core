@@ -55,8 +55,10 @@ borg — an event-sourced data backend
   borg layer list | borg layer head
   borg frontier                        how far each producer has caught up
 
-Cells are written Struct#id.field, Struct#id, Element[]#id or Element[]#id[n].
-Values are 42, 1.5, true, false, ~ (tombstone) or @Struct#id (a reference).
+Cells are written Struct:pid.field, Struct:pid, Element[]:pid or Element[]:pid[n], where a pid
+looks like o-1234abcd and names the whole identity. Struct#100 is accepted on input as a
+shorthand for counter 100 on the root branch; what borg prints is always the canonical form.
+Values are 42, 1.5, true, false, ~ (tombstone) or @o-1234abcd (a reference).
 
 Options:
   --store <path>   store file (default ./borg.db)
@@ -103,13 +105,13 @@ async fn open(args: &Args) -> Result<Registry> {
     Registry::open(storage, Arc::new(NativeExecutor::new())).await
 }
 
-/// The branch shorthand PIDs are allocated against.
+/// The branch the `Struct#100` shorthand names ids on.
 ///
 /// A PID's branch component records where an object was *allocated*, not where it lives — the whole
 /// point of `(branch, allocator, counter)` is that ids never collide, so a fork can inherit an
-/// object without renaming it. Shorthand therefore always allocates against the root, or
+/// object without renaming it. The shorthand therefore always resolves against the root, or
 /// `Company#1` would mean a different object on every branch and a fork could never read what its
-/// parent wrote.
+/// parent wrote. A canonical address needs none of this: it carries its own branch.
 fn allocation_branch(registry: &Registry) -> Result<BranchId> {
     registry
         .default_branch()

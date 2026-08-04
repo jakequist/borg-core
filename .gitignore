@@ -2,3 +2,5 @@
 node_modules/
 dist/
 .nx/
+# Agent worktrees, not project state.
+.claude/worktrees/

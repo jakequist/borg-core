@@ -22,7 +22,9 @@ assert_field "$(borg get 'Company#1.is_investible')" "origin" "derived" \
     "the output is marked derived, and attributed to its producer"
 
 # Dependency capture is automatic: the script declared nothing, the server watched what it read.
-assert_contains "$(borg explain 'Company#1.is_investible')" "Company#1.website" \
+# Lineage names cells canonically, so ask the CLI what that address is rather than assuming.
+website="$(borg get 'Company#1.website' | head -1)"
+assert_contains "$(borg explain 'Company#1.is_investible')" "$website" \
     "lineage shows what the script actually read, without it declaring anything"
 
 # The invalidation story, end to end through a subprocess.

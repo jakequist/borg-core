@@ -4,11 +4,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../lib.sh"
 setup
 
-# A cell is addressed as Struct#id.field — the same shape everywhere in the CLI.
+# A cell is addressed as Struct:pid.field. `Company#100` is a documented input shorthand meaning
+# "the root branch, allocator 0, counter 100" — convenient to type, and never printed back.
 borg set 'Company#100.website' 9
 
 assert_eq "$(borg get 'Company#100.website' --value)" "9" \
     "a value written is a value read"
+
+# What comes back names the whole PID: kind, branch, allocator and counter. The shorthand carried
+# only the counter, so it meant a different object depending on what you assumed.
+canonical="$(borg get 'Company#100.website' | head -1)"
+assert_contains "$canonical" "Company:o-" "a cell reads back canonically, not in the shorthand"
+assert_eq "$(borg get "$canonical" --value)" "9" \
+    "and the canonical address is itself a cell address you can read"
 
 # Reads never return a bare value. Source data is ground truth, so it is always current.
 out="$(borg get 'Company#100.website')"
