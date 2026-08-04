@@ -495,6 +495,11 @@ greatest `reflects` ≤ L.
 > **Derived layers are droppable.** They are a cache that happens to live in the log. Garbage-collect
 > them and the fallback is recompute. No data loss is possible, because source is separate.
 
+Dropping them is an operation and not only a thought experiment: recompute rewinds a branch's
+watermarks so every producer owes its whole source buffer again, and the layers it writes shadow the
+ones it had. On a fork that is a replay of the world at the fork point, which is how §10.1's claim is
+checked rather than trusted.
+
 **Derived history is deterministic.** One producer run produces exactly one layer, and v1 performs
 **no coalescing**: a producer emits one derived layer per `(producer, source layer)` even when
 several source layers landed while it was busy. Two Borg instances replaying the same source log
@@ -939,6 +944,13 @@ branch.
 
 The claim it makes is: *if you replayed the world at layer W, you would get exactly this value.* The
 value may also still be correct at later layers; that is a separate question, answered by validation.
+
+**The claim is checkable, and is checked.** Fork at W, recompute the fork from source instead of
+letting it inherit what its parent derived, and compare. The second step is what §6.3's droppable
+derived layers make possible and `borg derive --rebuild` is what performs it — a fork's ancestors stay
+bounded at the fork point, so the producers re-run against exactly the world W names.
+`scenarios/100-watermark-truth` does this for every derived cell it can reach: a value its own
+watermark does not reproduce is a label the system had no right to write.
 
 ### 10.2 Validate vs. recompute
 

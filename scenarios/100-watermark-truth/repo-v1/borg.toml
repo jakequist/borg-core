@@ -1,0 +1,12 @@
+# The repo the watermark-truth scenario derives over. Two pipelines, one chained onto the other, and
+# a field that later changes type — enough provenance that a recomputed value is a real recomputation
+# and not one trivial hop.
+[repo]
+id = 1
+name = "atlas"
+
+[[pipelines]]
+command = "pipelines/band.sh"
+
+[[pipelines]]
+command = "pipelines/rating.sh"

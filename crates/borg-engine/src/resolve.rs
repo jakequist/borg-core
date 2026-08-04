@@ -66,6 +66,21 @@ impl FrontierTracker {
         }
     }
 
+    /// Forget that this producer has ever run here.
+    ///
+    /// Not `advance` running backwards — that direction is closed on purpose, because a late run
+    /// must not un-catch-up a producer that has since moved on. This is the different statement that
+    /// *nothing on this branch has been incorporated*, which is true exactly when the derived layers
+    /// standing behind the watermark are being thrown away and recomputed (§6.3). Its one caller is
+    /// [`crate::derive::DerivationEngine::recompute`], and going through `advance` would make the
+    /// two indistinguishable.
+    pub fn rewind(&self, branch: BranchId, producer: ProducerId) {
+        self.watermarks
+            .lock()
+            .unwrap()
+            .insert((branch, producer), LayerId(0));
+    }
+
     /// The layer through which *all* derived data on this branch is caught up — the minimum over
     /// every producer. Reading here gives a fully coherent snapshot, slightly in the past, as
     /// opposed to the ragged head (SPEC.md §10.5).
