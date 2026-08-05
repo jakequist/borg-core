@@ -10,18 +10,21 @@ describes, **update the spec in the same change**. A spec that lags the code is 
 ## Commands
 
 ```
-./check.sh                  # fmt, clippy -D warnings, all Rust tests, the TS SDK, all scenarios
+./check.sh                  # fmt, clippy -D warnings, all Rust tests, both SDKs, all scenarios
 cargo test --workspace      # Rust tests only
 bash scenarios/run-all.sh   # end-to-end CLI scenarios only (needs `cargo build -p borg-cli` first)
 cargo fmt
 ```
 
 ```
-cd packages/borg-sdk && pnpm install && pnpm run check   # typecheck, vitest, build
+cd packages/borg-sdk && pnpm install && pnpm run check          # typecheck, vitest, build
+cd packages/borg-sdk-py && PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
 The TypeScript steps need node and pnpm. `check.sh` skips them loudly where those are missing, and
-so does scenario 230 — everything else works everywhere.
+so does scenario 230. The Python SDK needs only a Python 3.11+ — its tests are `unittest` cases with
+no dependencies, so `pytest` runs them but nothing needs it — and scenario 240 skips loudly without
+one. Everything else works everywhere.
 
 ```
 cargo test --release -p borg-engine --test scale -- --ignored --nocapture
@@ -49,6 +52,7 @@ crates/borg-protocol        the worker wire contract
 crates/borg-engine          log, branches, defs, derivation, resolver, registry
 crates/borg-cli             the `borg` binary
 packages/borg-sdk           the TypeScript SDK: the author-side DSL and the worker protocol
+packages/borg-sdk-py        the Python SDK: the same, and the neutrality gate on the contract
 scenarios/                  end-to-end scenarios driving the real binary
 ```
 

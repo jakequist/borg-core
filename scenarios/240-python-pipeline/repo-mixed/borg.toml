@@ -1,0 +1,11 @@
+# One repo, two languages. `borg repo push` reads this, asks *every* file in `pipelines/` to describe
+# itself, and folds all the answers into one def layer — so a repo's language is a fact about a file.
+[repo]
+id = 2
+name = "startups"
+
+[[pipelines]]
+command = "pipelines/score.ts"
+
+[[pipelines]]
+command = "pipelines/summarise.py"

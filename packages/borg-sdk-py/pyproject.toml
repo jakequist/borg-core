@@ -1,0 +1,31 @@
+# The Python pipeline SDK. **Zero runtime dependencies** — `socket` and `json` from the standard
+# library are the whole transport, exactly as `node:net` is the whole of the TypeScript one.
+#
+# `hatchling` below is a *build* backend, not a dependency of the code: nothing it produces is
+# imported at runtime, and the package works from a checkout with `PYTHONPATH=src` and no installer
+# at all. That last property is why `check.sh` can run these tests on a machine with no `pip`.
+
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "borg-sdk"
+version = "0.1.0"
+description = "Author Borg repos in Python: structs, pipelines, and the worker protocol."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# Dev only. The tests are `unittest` cases, so `pytest` runs them and so does the standard library;
+# see README.md, *Development*.
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/borg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

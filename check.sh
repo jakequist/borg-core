@@ -27,6 +27,17 @@ else
     printf '  \033[33m⚠ skipped: node and pnpm are not both installed\033[0m\n'
 fi
 
+step "python"
+# The Python SDK's own tests. They are `unittest` cases with no dependencies, so any Python 3.11+
+# runs them — no pip, no virtualenv, no network. `pytest` runs the same files and is the nicer
+# runner; nothing requires it, which is what keeps this step from being a second optional toolchain.
+if command -v python3 >/dev/null 2>&1 \
+    && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    (cd packages/borg-sdk-py && PYTHONPATH=src python3 -m unittest discover -s tests -q)
+else
+    printf '  \033[33m⚠ skipped: python3 3.11+ is not installed\033[0m\n'
+fi
+
 step "scenarios"
 cargo build -p borg-cli
 bash scenarios/run-all.sh

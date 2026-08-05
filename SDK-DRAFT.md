@@ -60,7 +60,8 @@ The SDK is thinner than it looks, because the engine was built mediated-access-f
 7. **Python is a scheduled neutrality gate, not a parallel build.** A Python *pipeline* SDK lands
    after the TS one and before the client contract freezes. Python's sync `__getattr__` makes
    mediated access trivial — which is the point: if Python is trivial where TS needs machinery,
-   the machinery is ergonomics, not contract, and must not leak into the protocol.
+   the machinery is ergonomics, not contract, and must not leak into the protocol. **Run, and it
+   was**: `__getattr__` is four lines and sends byte-identical messages. §4.2 has the rest.
 
 ## 3. The v1 surfaces (verbose on purpose)
 
@@ -126,8 +127,102 @@ await tx.commit();                              // merge; throws ConflictError o
    - **`null` is absence in both directions**, collapsing "never written" and "tombstoned"; the store
      keeps the distinction and a pipeline has nothing different to do with it.
    - **`int()` refuses values past 2⁵³** rather than rounding them, and names `bigint()`.
-2. **Python pipeline SDK** — the neutrality gate. **Scenario 240**: the same pipeline in Python
-   against the same store; a mixed repo (one TS pipeline, one Python) in one push.
+2. **Python pipeline SDK** — the neutrality gate. **Built.** `packages/borg-sdk-py` (Python ≥3.11,
+   zero runtime dependencies, `unittest` cases that pytest also runs), **scenario 240**. It needed
+   **no Rust changes at all**, which was the first thing it was there to find out.
+
+   ### The verdict
+
+   **Nothing in the protocol was harder in Python, and nothing was impossible.** The two SDKs emit
+   the same `describe` payload *byte for byte* — scenario 240 asserts exactly that, by diffing the
+   describe output of the Python pipeline against 230's TypeScript one, which it mirrors field for
+   field. Same handshake, same messages, same socket, same stderr duplication. `borg repo push`
+   walks a directory of executables and never learns what any of them is written in; the only
+   per-language fact in the whole store is a path in `borg.producers.json`.
+
+   **Two things in the TS SDK turned out to be ergonomics wearing contract's clothes.** Neither had
+   leaked into the protocol, so neither cost anything — but both read as contract in §4.1 and in the
+   TS source, and they are not:
+
+   - **`await` is not the contract; it is JavaScript's.** `c.get("headcount")` here blocks on a
+     socket read and returns the value. Every semantic §2.1 defends — one wire message per access,
+     nothing preloaded, the read-set recorded server-side, field-granular invalidation — holds
+     identically with no `await` anywhere. The verbosity was never buying the semantics; it was
+     paying for JavaScript's event loop. *Property access is the same finding twice*: `c.headcount`
+     and `c.isInvestible = True` are four lines of `__getattr__`, send byte-identical messages, and
+     are tested. §2.1's `worker_thread` + `Atomics.wait` plan is therefore a TypeScript build item,
+     not an SDK-surface question — and the fact that Python could ship the sugar today and TS cannot
+     is the strongest available evidence that the sugar is not contract.
+   - **The request-serialising promise chain is machinery, not protocol.** `connection.ts` chains
+     every request behind the last so `Promise.all([c.get("a"), c.get("b")])` cannot cross two
+     replies. Nothing in synchronous Python can produce that overlap; the equivalent here is a
+     four-line mutex that only matters for a body that deliberately reaches for `threading`. The
+     protocol's "one reply per request" is contract. Everything the TS SDK does to survive an author
+     writing idiomatic concurrent JavaScript is not.
+
+   **One number in §4.1 above is stated as contract and is not.** "`int()` refuses values past 2⁵³"
+   is two rules glued together: *never silently round an integer*, which is contract and language-
+   neutral, and *2⁵³*, which is where a JS double stops being exact. The engine's `Int` is an `i64`
+   (`borg_core::parse` reads it with `i64::from_str`), so `borg.int_()` here refuses outside `i64`
+   and names `bigint()` at the engine's boundary. Copying 2⁵³ would have refused values the store
+   holds perfectly well, on the strength of a limitation Python does not have. The rule travelled;
+   the threshold did not, and §4.1's wording should not imply it did.
+
+   **Python needs one check TypeScript does not**, and it is this language's problem alone: `bool`
+   subclasses `int`, so `int_().encode(True)` would write `1` into an `Int` cell without complaint.
+   A silent type change, in the one table whose whole job is preventing them. It is handled in the
+   SDK, where a language's hazards belong, and asks nothing of the protocol.
+
+   **`Double` is the one type whose text is not identical across the three languages.** Rust never
+   uses exponent notation, Python does past `1e16`, JS uses it differently again. This is harmless
+   and worth stating once rather than rediscovering: a `Double` is not content-addressed, so its
+   spelling only has to *parse*, and all three read all three. The types where spelling **is**
+   identity — `String`, `BigInt`, `Binary` — have exactly one form in both SDKs, which is what
+   actually matters and what "canonical text" should be taken to mean.
+
+   ### What had to be reverse-engineered rather than read
+
+   These are documentation bugs, not design ones. Each was recovered from `borg-protocol`'s Rust
+   doc comments, `borg-exec-process`, or the bash worker in 030 — which means the second SDK could
+   be written from the first, but a third one written from `SPEC.md` alone could not.
+
+   - **§17.4 describes the handshake but never spells the exchange.** "Codecs are negotiated in a
+     handshake" does not say that the engine speaks first, that its message is
+     `{"version":1,"codecs":[…]}`, or that the worker's reply is the single key `{"codec":"json"}` —
+     which is not one of the `FromWorker` variants and so appears nowhere in the message table.
+   - **An `Invoke`'s `input` is an entity address the worker concatenates onto.** That
+     `Company:o-04068` + `"." + field` is how a cell address is built worker-side is stated in a
+     code comment in `borg-exec-process` and demonstrated in the bash worker. It is the single most
+     load-bearing fact about writing a worker and it is not in the spec.
+   - **Absence has two spellings and the worker must collapse them.** `{"value":null}` (never
+     written) and `{"value":"~"}` (tombstoned) both reach a worker; §17.4 mentions the tombstone
+     text but not that a `Get` may answer JSON `null`, and never says what a worker should do with
+     the difference. Both SDKs collapse it — §4.1 records that decision, but a first-time reader of
+     the spec meets it as a surprise.
+   - **Whose repo is it — the module or the directory?** §17.4 says a `derived_by` naming a producer
+     "the repo does not implement" is a push-time error. The engine means the *directory*: it
+     resolves ownership against every producer every executable described. Both SDKs mean the
+     *module*, because a module is all its `describe()` can see. So a repo of two files cannot have
+     one file declare a field the other file's pipeline owns — the SDK refuses it before the engine,
+     which would have accepted it. Scenario 240's mixed repo works around this by reading across the
+     boundary through `world`, which is stringly and needs no declaration. **This is a real seam and
+     the one thing here worth a design decision**: either the SDKs learn to describe a field owned
+     elsewhere (a `derived_by="name"` escape hatch with no local pipeline), or the spec says a
+     module is the unit and a repo of one language is one file.
+   - **`borg.toml`'s `[[pipelines]] command` entries are decorative.** `repo_push` walks
+     `pipelines/` and asks every file; nothing reads the manifest except a line-wise grep for the
+     first `id =`. Every scenario's `borg.toml` lists its pipelines and none of it is consulted.
+     Harmless today and a trap the moment somebody expects the list to select or exclude something.
+
+   ### What the gate did *not* find
+
+   No protocol element was Python-hostile. No message needed a new shape, no field needed a new
+   encoding, and no engine behaviour needed a flag. The `world.get(cell, borg.int_())` shape §5
+   guessed at — stringly with an optional field type — transferred without change, which is a second
+   language's worth of evidence for it. And the stderr duplication built for 230 is confirmed to be
+   transport-level rather than TypeScript-level: scenario 240 asserts a Python `print()` mid-round
+   reaches a human on stderr and touches neither the message stream nor the CLI's own stdout, with
+   nothing in `borg-exec-process` changed to make it so.
 3. **`borg serve` + TS client SDK** — client protocol module in `borg-protocol` (tx ops, resolve
    envelope, describe/def push), unix-socket server, per-connection transaction binding.
    **Scenario 250**: two concurrent SDK clients, S2's conflict through the socket; a client killed
@@ -153,4 +248,6 @@ await tx.commit();                              // merge; throws ConflictError o
   the describe payload, because that process's whole stdout *is* the payload. It fails immediately
   and loudly (`describe emitted unusable JSON`, quoting the text), which is a far better failure than
   a desynchronised worker — but it is the one place where the socket does not help, and an author who
-  hits it is the same author the socket was built for.
+  hits it is the same author the socket was built for. **The Python SDK has it identically** (a
+  `print()` at import time, or a library that logs on import), which confirms it is a property of
+  `describe` being a plain stdout invocation rather than of any one runtime.
