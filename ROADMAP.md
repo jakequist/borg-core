@@ -1044,6 +1044,53 @@ Left as it is because it is not obviously wrong: a derived field's shape is its 
 and a producer that changes its output type re-derives rather than migrating. But nothing *says* so,
 and the failure would arrive as an ownership violation at run time rather than as a rejection at push
 time. Worth a decision of its own rather than a rider.
+### A poisoning is operational state, and the log is what retires it
+
+§14 has been true of the engine and false of every CLI user since the CLI existed. `broken` producers
+lived in a `HashMap` on `DerivationEngine`, and the CLI is process-per-command — so the judgement
+died with the command that made it. The next `borg get` called a poisoned producer's output `stale`,
+which promises a catch-up that was never coming, and the next `borg derive` re-ran the failing code
+from scratch, burning the work and repeating whatever partial effects it had. The resolver never
+consulted the map at all, even in-process: `Freshness::Broken` was reachable only through the
+unreachable-version path.
+
+Where it belongs was the whole question, and it splits in two.
+
+- **The record is operational state, beside the store.** Not a value event and not a def event, and a
+  layer holds one or the other (§6.2). It is *discovered* — the same objection that moved field
+  ownership out of the log, in the opposite direction: ownership became declared, and this cannot,
+  because nobody writes it. In the log it would be forkable, mergeable and time-travellable, so a
+  fork would inherit a poisoning its own code never earned. It joins the pause flags, the transaction
+  table and the implementation table in the sidecar, for the reasons all three are there.
+- **The clearing edge is already in the log.** §14's recovery is *push a new ClientVersion*, and a
+  producer's ClientVersion is the def-layer it was pushed at (§9.2) — so a record that names the
+  version it was recorded against **expires by itself**. Nothing has to remember to clear it, no
+  command has to run in the right order, and a record restored from a backup cannot poison code that
+  has since been replaced. The record is not a fact in its own right; it is a claim about a fact the
+  log holds, which is what makes durable state outside the log safe here rather than merely
+  convenient.
+
+Storage was considered and rejected in one line: nothing above the provider line teaches a
+`StorageProvider` what derivation is (§17.1), and a poisoned producer is derivation through and
+through. So it reaches durability through a `PoisonProvider` of its own — in-memory for anything that
+*is* the process, a file for a client that is not.
+
+Three consequences that were not obvious going in:
+
+- **Recovery has to rewind the frontier.** A round advances every producer's watermark whether or not
+  it ran, so a producer skipped while broken stands at head claiming to have incorporated everything
+  it never saw. Without the rewind, "invalidates and recomputes its output" would be a promise the
+  next write happens to keep. The rewind is `recompute`'s, for the same reason.
+- **The watermark advancing while broken is right.** Holding it back would stall the settled frontier
+  and every `frontier reaches` on the branch behind one bad pipeline — branch-wide poisoning wearing
+  a different hat. The read envelope is the honest channel, and it now says `broken`.
+- **`--retry-broken` is not redundant with recovery.** A fix the log cannot see — a worker's
+  environment repaired, a service it calls back up — has no version bump to expire the record.
+  Retrying by *default* is what turns one bad deploy into the same failure repeated by every command.
+
+Not covered: a producer that has never succeeded writes no cells, so there is nothing for a read to
+label. `broken` is a label on a stored record (§10.4), and enumerating the cells a producer *might*
+have written is not a set anything can produce.
 
 ---
 

@@ -142,6 +142,10 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   its other route, is spent by the round `catch_up` opens at the bottom of the log, where the buffer
   is still empty. `borg derive --rebuild` runs it. This catches a pipeline pushed over already-derived
   data too. Same fix as the backlog entry above: settle a range (`ROADMAP.md`).
+- **A producer that has never succeeded has no cell to call `broken`.** §14's state is a label on a
+  stored record (§10.4), and a pipeline that threw on its first run wrote none, so its output reads
+  as simply absent. Enumerating the cells a producer *might* have written is not a set anything can
+  produce.
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.

@@ -35,6 +35,7 @@ use crate::branch::RoundOutcome;
 use crate::defs::DefView;
 use crate::index::{DependencyIndexProvider, Invocation};
 use crate::log::LayerManager;
+use crate::poison::{MemoryPoison, PoisonProvider, Poisoning};
 use crate::resolve::{FrontierTracker, InlineDerivation};
 use crate::seams::WorkGap;
 use crate::values::Values;
@@ -222,7 +223,11 @@ pub struct DerivationEngine {
     producers: Mutex<HashMap<ProducerId, ProducerDef>>,
     /// Producers poisoned by a runtime failure. Scoped to the producer, never the branch — which is
     /// why main never breaks because someone merged a bad pipeline (SPEC.md §14).
-    broken: Mutex<HashMap<(BranchId, ProducerId), String>>,
+    ///
+    /// Behind a provider because it has to **outlive the process that discovered it**: the CLI is
+    /// process-per-command, and a poisoning kept in this struct died with the command that recorded
+    /// it. See `crate::poison` for why it lives beside the store rather than in the log.
+    poison: Arc<dyn PoisonProvider>,
     /// How many invocations of one wave run at once. Deployment configuration, not a semantic —
     /// see [`DerivationEngine::set_parallelism`].
     parallelism: AtomicUsize,
@@ -250,9 +255,21 @@ impl DerivationEngine {
             defs,
             branches,
             producers: Mutex::new(HashMap::new()),
-            broken: Mutex::new(HashMap::new()),
+            poison: Arc::new(MemoryPoison::new()),
             parallelism: AtomicUsize::new(default_parallelism()),
         }
+    }
+
+    /// Keep poisonings somewhere they survive this process. SPEC.md §14.
+    ///
+    /// A builder rather than a constructor argument because the in-process default is right for
+    /// every caller that *is* the process — a test, a server — and wrong only for a client that
+    /// exits between commands. The one caller that needs this is the one that also has somewhere to
+    /// put it.
+    #[must_use]
+    pub fn with_poison(mut self, poison: Arc<dyn PoisonProvider>) -> Self {
+        self.poison = poison;
+        self
     }
 
     /// How many invocations may run at once while a round settles.
@@ -285,12 +302,92 @@ impl DerivationEngine {
         self.producers.lock().unwrap().insert(def.id, def);
     }
 
-    pub fn is_broken(&self, branch: BranchId, producer: ProducerId) -> Option<String> {
-        self.broken
+    /// Whether this producer is poisoned on this branch **as the branch's definitions now stand**.
+    /// SPEC.md §14.
+    ///
+    /// A record naming a ClientVersion the producer has since moved off has expired, not been
+    /// forgiven: pushing fixed code *is* §14's recovery, and the log is what says it happened. That
+    /// is the whole reason a durable record is safe to keep outside the log — see `crate::poison`.
+    ///
+    /// A producer with no definition resolvable in this process cannot be shown to have moved, so
+    /// its record stands. An unproven recovery is not a recovery.
+    pub fn is_broken(&self, branch: BranchId, producer: ProducerId) -> Result<Option<Poisoning>> {
+        let version = self.version_of(producer);
+        Ok(self
+            .poison
+            .poisoned(branch)?
+            .into_iter()
+            .find(|poisoning| poisoning.producer == producer)
+            .filter(|poisoning| version.is_none_or(|version| poisoning.applies_to(version))))
+    }
+
+    /// Every producer poisoned on this branch whose record has not expired — one per producer, the
+    /// failure that last happened. Whoever has to *report* a poisoning is rarely the process that
+    /// discovered it, which is the whole reason this is public.
+    pub fn broken(&self, branch: BranchId) -> Result<Vec<Poisoning>> {
+        Ok(self
+            .poison
+            .poisoned(branch)?
+            .into_iter()
+            .filter(|poisoning| {
+                self.version_of(poisoning.producer)
+                    .is_none_or(|version| poisoning.applies_to(version))
+            })
+            .collect())
+    }
+
+    /// Forget every live poisoning on this branch and put the work it skipped back in front of the
+    /// producer. Returns how many were cleared.
+    ///
+    /// The escape hatch for a fix that is **not** a def push — a worker's environment was repaired,
+    /// a service it calls came back — where nothing in the log moved and so nothing could expire the
+    /// record. Deliberately explicit: retrying by default is what turns one bad deploy into the same
+    /// failure repeated by every command, with whatever partial effects it had repeated too.
+    pub fn retry_broken(&self, branch: BranchId) -> Result<usize> {
+        let broken = self.broken(branch)?;
+        for poisoning in &broken {
+            self.revive(branch, poisoning.producer)?;
+        }
+        Ok(broken.len())
+    }
+
+    /// Expire the poisonings whose producer has been pushed again since. SPEC.md §14's recovery.
+    ///
+    /// Called where work is *discovered* rather than where a record is read, because reviving a
+    /// producer rewinds its frontier and that must not happen underneath a round already choosing
+    /// what to settle.
+    fn recover(&self, branch: BranchId) -> Result<()> {
+        for poisoning in self.poison.poisoned(branch)? {
+            let moved = self
+                .version_of(poisoning.producer)
+                .is_some_and(|version| !poisoning.applies_to(version));
+            if moved {
+                self.revive(branch, poisoning.producer)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear a poisoning and hand the producer back the work it missed.
+    ///
+    /// **The frontier goes back to nothing**, because a round advances every producer's watermark
+    /// whether or not it ran (§16.5) — so a producer skipped while broken is standing at head
+    /// claiming to have incorporated everything it never saw. Rewinding is what makes §14's
+    /// *invalidates and recomputes its output* true rather than a promise the next write happens to
+    /// keep, and it is the same rewind [`recompute`](Self::recompute) uses for the same reason.
+    fn revive(&self, branch: BranchId, producer: ProducerId) -> Result<()> {
+        self.poison.clear(branch, producer)?;
+        self.frontier.rewind(branch, producer);
+        Ok(())
+    }
+
+    /// The ClientVersion this process resolves for a producer, if it can resolve one at all.
+    fn version_of(&self, producer: ProducerId) -> Option<LayerId> {
+        self.producers
             .lock()
             .unwrap()
-            .get(&(branch, producer))
-            .cloned()
+            .get(&producer)
+            .map(|def| def.version)
     }
 
     fn producer_ids(&self) -> Vec<ProducerId> {
@@ -343,6 +440,11 @@ impl DerivationEngine {
         let Some(at) = self.layers.highest_source_layer(&path) else {
             return Ok(0);
         };
+        // Spent poisonings are dropped here too, though the rewind below would have covered the
+        // frontier half on its own: a record naming a ClientVersion nothing appoints any more is
+        // dead weight, and leaving it for a reader to filter out forever is how it starts being
+        // believed.
+        self.recover(branch)?;
         for producer in self.producer_ids() {
             self.frontier.rewind(branch, producer);
         }
@@ -357,6 +459,10 @@ impl DerivationEngine {
         let Some(head) = self.layers.head(branch) else {
             return Ok(0);
         };
+        // **Before the gap is measured, not after.** A producer whose code has been pushed again is
+        // no longer the producer that failed (SPEC.md §14), and reviving it rewinds its watermark —
+        // which is the work this call is about to go and find.
+        self.recover(branch)?;
         let from = self
             .producer_ids()
             .into_iter()
@@ -523,7 +629,7 @@ impl DerivationEngine {
                         executed += 1;
                         wave.push(derived);
                     }
-                    Err(err) => self.poison(branch, producer, err),
+                    Err(err) => self.record_poisoning(branch, producer, source_layer, &err)?,
                 }
             }
         }
@@ -538,7 +644,14 @@ impl DerivationEngine {
         let mut outcome = self.branches.merge_round(&round).await?;
         outcome.executed = executed;
 
-        // **The watermark advances whether or not every invocation landed.** A dropped invocation's
+        // **The watermark advances whether or not every invocation landed** — and whether or not a
+        // producer was skipped as broken. Holding a poisoned producer's watermark back would stall
+        // the settled frontier (§10.5) and every `frontier reaches` on the branch behind one bad
+        // pipeline, which is precisely the branch-wide poisoning §14 exists to avoid. What a client
+        // needs to know is carried by the read envelope instead, as `broken` rather than `stale`,
+        // and the work skipped here is handed back by [`revive`](Self::revive) on recovery.
+        //
+        // The same holds for an invocation the merge dropped, for a different reason. Its
         // cells are still dirty in the dependency index — its edges were recorded when it ran, on
         // this branch and not on the round's — and the layer that failed its guard is itself a
         // source layer a later round settles, which rediscovers it through the cell that moved.
@@ -577,7 +690,10 @@ impl DerivationEngine {
             let cells = self.cells_of(*layer).await?;
 
             for def in self.producer_defs() {
-                if self.is_broken(branch, def.id).is_some() {
+                // A poisoned producer is not scheduled at all — not even for the invocations that
+                // have nothing to do with whatever failed. §14 scopes `IllegalState` to the
+                // producer, and the producer is the unit that is judged broken (§9.2).
+                if self.is_broken(branch, def.id)?.is_some() {
                     continue;
                 }
                 // A producer already caught up past this layer has no business in this round —
@@ -613,14 +729,15 @@ impl DerivationEngine {
                     let runs = reruns.entry(invocation.clone()).or_insert(0);
                     *runs += 1;
                     if *runs > CYCLE_RERUN_LIMIT {
-                        self.poison(
+                        self.record_poisoning(
                             branch,
                             def.id,
-                            BorgError::ProducerCycle {
+                            source_layer,
+                            &BorgError::ProducerCycle {
                                 producer: def.id,
                                 runs: *runs,
                             },
-                        );
+                        )?;
                         break;
                     }
                     work.push((def.clone(), invocation));
@@ -872,11 +989,27 @@ impl DerivationEngine {
         }
     }
 
-    fn poison(&self, branch: BranchId, producer: ProducerId, err: BorgError) {
-        self.broken
-            .lock()
-            .unwrap()
-            .insert((branch, producer), err.to_string());
+    /// Judge a producer broken, against the ClientVersion it was running at.
+    ///
+    /// Recording the version is what makes the record self-expiring, and it is read back from the
+    /// same registration the run was dispatched through — so the version blamed is the one that
+    /// actually failed, not whatever the branch has moved to by the time anybody looks.
+    fn record_poisoning(
+        &self,
+        branch: BranchId,
+        producer: ProducerId,
+        since: LayerId,
+        err: &BorgError,
+    ) -> Result<()> {
+        self.poison.poison(
+            branch,
+            Poisoning {
+                producer,
+                version: self.version_of(producer).unwrap_or(LayerId(0)),
+                error: err.to_string(),
+                since,
+            },
+        )
     }
 
     /// Bring one cell up to date, recursing into whatever it was computed from.
@@ -968,7 +1101,10 @@ impl DerivationEngine {
             // Not an error: the read simply reports the lag it already had.
             return Ok(());
         };
-        if self.is_broken(branch, producer).is_some() {
+        // A poisoned producer does not run for a `current` read either. §10.5's contract is that the
+        // read pays for the computation, not that the computation is guaranteed — and the envelope
+        // it gets back says `broken`, which is the answer.
+        if self.is_broken(branch, producer)?.is_some() {
             return Ok(());
         }
         // Read at head, claim head. The two coincide here precisely because there is no round: what

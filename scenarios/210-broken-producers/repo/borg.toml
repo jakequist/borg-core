@@ -1,0 +1,8 @@
+# The working build of the `score` pipeline. `repo-broken/` is the same repo with the same producer
+# under the same name — a bad deploy of one pipeline, not a second pipeline.
+[repo]
+id = 1
+name = "risk"
+
+[[pipelines]]
+command = "pipelines/score.sh"

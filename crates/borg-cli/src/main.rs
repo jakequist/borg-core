@@ -11,7 +11,7 @@ use borg_core::{
     LayerAuthor, LayerId, LayerKind, MergeMode, ObjectTypeName, Origin, Ownership, ProducerId,
     RepoId, Resolved, Result, Transaction, Value, ValueType, Writer, parse,
 };
-use borg_engine::Registry;
+use borg_engine::{Poisoning, Registry};
 use borg_exec_native::NativeExecutor;
 use borg_storage_sqlite::SqliteStorage;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,8 @@ struct Args {
     count_only: bool,
     /// `--rebuild`. See [`derive`].
     rebuild: bool,
+    /// `--retry-broken`. See [`derive`].
+    retry_broken: bool,
     /// `--freshness`. What a read is willing to pay for (SPEC.md §10.5).
     freshness: FreshnessRequirement,
     /// `--settled`: read at the settled frontier rather than at the ragged head.
@@ -92,6 +94,7 @@ borg — an event-sourced data backend
   borg producer list                   registered producers
   borg derive [--count]                run producers until caught up
   borg derive --rebuild                recompute derived data from source, ignoring the cache
+  borg derive --retry-broken           run producers this branch has judged broken
   borg derive pause | resume | status  auto-derivation on this branch
 
   borg layer list | borg layer head
@@ -144,6 +147,13 @@ A paused branch needs no special vocabulary: its frontier stops advancing, and e
 data already reports how far behind it is. `borg derive` still works while paused — that is what
 makes pausing useful in an emergency.
 
+A producer that throws or cycles is **poisoned** — scoped to that producer, so main never breaks
+because someone shipped a bad pipeline. Its cells read `state: broken` instead of `stale`, because
+`stale` means a catch-up is coming and here none is; `borg explain` says what the error was, and
+`borg derive` skips it rather than running the failure again. Recovery is pushing fixed code: a
+producer's ClientVersion is the def-layer it was pushed at, and the poisoning names the version it
+was recorded against, so a new one retires it. `--retry-broken` is for a fix the log cannot see.
+
 Derived layers are a cache that happens to live in the log, and dropping them loses nothing because
 source is separate. `borg derive --rebuild` is that fallback: it forgets what has been derived here
 and recomputes it from source. Run on a fork, it recomputes the world as of the fork point without
@@ -159,7 +169,8 @@ Options:
   --tx <id>                 which open transaction to speak to (or $BORG_TX)
   --value                   print only the value
   --count                   print only a count
-  --rebuild                 `derive`: recompute from source instead of catching up"
+  --rebuild                 `derive`: recompute from source instead of catching up
+  --retry-broken            `derive`: run producers judged broken, instead of skipping them"
     );
     std::process::exit(2)
 }
@@ -172,6 +183,7 @@ fn parse_args() -> Args {
         value_only: false,
         count_only: false,
         rebuild: false,
+        retry_broken: false,
         freshness: FreshnessRequirement::Validated,
         settled: false,
         timeout: 0,
@@ -196,6 +208,7 @@ fn parse_args() -> Args {
             "--value" => args.value_only = true,
             "--count" => args.count_only = true,
             "--rebuild" => args.rebuild = true,
+            "--retry-broken" => args.retry_broken = true,
             "-h" | "--help" => usage(),
             _ => args.rest.push(arg),
         }
@@ -214,7 +227,15 @@ async fn main() {
 
 async fn open(args: &Args) -> Result<Registry> {
     let storage = Arc::new(SqliteStorage::open(&args.store)?);
-    Registry::open(storage, Arc::new(NativeExecutor::new())).await
+    // The poison table comes from beside the store even on the read path, and especially there:
+    // the reader is the one §14 owes an explanation to, and it is never the process that discovered
+    // the failure (SPEC.md §14).
+    Registry::open_with_poison(
+        storage,
+        Arc::new(NativeExecutor::new()),
+        Arc::new(FilePoison::new(args)),
+    )
+    .await
 }
 
 /// The branch the `Struct#100` shorthand names ids on.
@@ -572,6 +593,11 @@ async fn explain(args: &Args, cell: &str) -> Result<()> {
             lineage.authored_at
         ),
         None => outln!("  source, authored at {}{landed}", lineage.authored_at),
+    }
+    // §14 promises lineage that explains *why* a cell is broken, and this is the sentence. Said
+    // second, straight after the producer's name, because the two belong in one thought.
+    if let Some(why) = &lineage.broken {
+        outln!("  broken: {why}");
     }
     if !lineage.from.is_empty() {
         outln!("  from");
@@ -1635,14 +1661,17 @@ async fn open_deriving(args: &Args) -> Result<(Registry, Arc<borg_exec_process::
     // put the queue back that the pool exists to remove.
     .with_pool_size(parallelism);
     let executor = Arc::new(executor);
-    let registry = Registry::open(storage, Arc::clone(&executor) as Arc<_>).await?;
+    let registry = Registry::open_with_poison(
+        storage,
+        Arc::clone(&executor) as Arc<_>,
+        Arc::new(FilePoison::new(args)),
+    )
+    .await?;
     registry.engine.set_parallelism(parallelism);
 
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    let path = registry.branches.read_path(branch, None)?;
-    for def in registry.defs.view(&path).await?.producers() {
-        registry.engine.register(def.clone());
-    }
+    registry
+        .register_producers(branch_of(&registry, args.branch.as_deref())?)
+        .await?;
     Ok((registry, executor))
 }
 
@@ -1671,15 +1700,49 @@ fn derive_parallelism() -> usize {
 /// derives it again from source (§6.3). On a fork that is a replay of the world as of the fork
 /// point, which is the operation a watermark's meaning is defined in terms of (§10.1) and the one
 /// `scenarios/100-watermark-truth` uses to check that meaning holds.
+///
+/// **A broken producer is skipped, and said so.** §14 poisons a producer that threw or cycled, and
+/// running it again on the next command would repeat the failure, burn the work and repeat whatever
+/// partial effects it had. `--retry-broken` is the way to say *I fixed something the log cannot see*;
+/// pushing the producer again is the way §14 means, and needs no flag.
 async fn derive(args: &Args) -> Result<()> {
     let (registry, workers) = open_deriving(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
+
+    if args.retry_broken {
+        for (name, poisoning) in broken_here(args, &registry, branch)? {
+            eprintln!("note: retrying {name}, broken since {}", poisoning.since);
+        }
+        registry.engine.retry_broken(branch)?;
+    }
+    // Said *before* the work, because it is the explanation for the count printed after it. A
+    // producer poisoned during this run is different news, and is reported below.
+    let mut skipped = Vec::new();
+    for (name, poisoning) in broken_here(args, &registry, branch)? {
+        eprintln!(
+            "note: skipping {name} — broken since {}: {}",
+            poisoning.since, poisoning.error
+        );
+        skipped.push(poisoning.producer);
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "note: push fixed code to recover, or `borg derive --retry-broken` to run it anyway"
+        );
+    }
+
     let executed = if args.rebuild {
         registry.engine.recompute(branch).await?
     } else {
         registry.engine.catch_up(branch).await?
     };
     workers.shutdown().await;
+
+    for (name, poisoning) in broken_here(args, &registry, branch)? {
+        if !skipped.contains(&poisoning.producer) {
+            eprintln!("warning: {name} is now broken: {}", poisoning.error);
+        }
+    }
 
     if args.count_only {
         outln!("{executed}");
@@ -1711,8 +1774,22 @@ async fn auto_derive(args: &Args, branch: BranchId) -> Result<()> {
         return Ok(());
     }
     let (registry, workers) = open_deriving(args).await?;
+    let before: Vec<_> = broken_here(args, &registry, branch)?
+        .into_iter()
+        .map(|(_, poisoning)| poisoning.producer)
+        .collect();
     let caught_up = registry.engine.catch_up(branch).await;
     workers.shutdown().await;
+
+    // **A producer that broke while chasing this write is news, and only this process has it.** The
+    // write itself is fine — §14 scopes the failure to the producer — but the derived data that was
+    // about to follow is not coming, and saying nothing here is how somebody finds out from a
+    // `state: broken` an hour later.
+    for (name, poisoning) in broken_here(args, &registry, branch)? {
+        if !before.contains(&poisoning.producer) {
+            eprintln!("warning: {name} is now broken: {}", poisoning.error);
+        }
+    }
 
     if let Err(err) = caught_up {
         // Reported, not raised. The write this followed is ground truth whether or not anything has
@@ -1724,29 +1801,59 @@ async fn auto_derive(args: &Args, branch: BranchId) -> Result<()> {
     Ok(())
 }
 
-/// Which branches auto-derivation is paused on.
+/// Derivation's operational state, beside the store.
 ///
-/// Beside the store, like the producer-implementation table and for the same reason: this is
-/// **operational config, not log data**. Pausing does not change what is true, only when the system
-/// catches up. In the log it would be forkable, mergeable and time-travellable, and "was derivation
-/// paused at layer 400?" is not a question anybody has.
+/// Beside the store, like the producer-implementation table and the transaction table, and for the
+/// same reason: this is **operational state, not log data**. Neither half of it changes what is
+/// true. Pausing changes only when the system catches up; a poisoning is the engine's judgement
+/// about code, discovered at runtime. In the log both would be forkable, mergeable and
+/// time-travellable, and "was derivation paused at layer 400?" is not a question anybody has.
 ///
 /// Branch *ids*, not names: a branch may be renamed or unnamed, and the id is what the log uses.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct DerivationConfig {
     paused: Vec<u64>,
+    /// Producers judged broken. SPEC.md §14, and `borg_engine::poison` for why they belong here
+    /// rather than in the log.
+    broken: Vec<BrokenProducer>,
+}
+
+/// One poisoning, as this client writes it down.
+///
+/// The wire form lives here and not in the engine because the file is the CLI's, the way
+/// `producers.json` is: a server keeps the same facts somewhere else entirely, and neither of them
+/// is the engine's business.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct BrokenProducer {
+    branch: u64,
+    producer: u64,
+    /// The ClientVersion it was running at. This is what makes the record self-expiring, and what
+    /// makes §14's recovery — push fixed code — need no other machinery.
+    version: u64,
+    error: String,
+    since: u64,
 }
 
 fn derivation_path(args: &Args) -> PathBuf {
     args.store.with_extension("derivation.json")
 }
 
-fn paused_branches(args: &Args) -> Vec<u64> {
+fn load_derivation(args: &Args) -> DerivationConfig {
     std::fs::read_to_string(derivation_path(args))
         .ok()
         .and_then(|raw| serde_json::from_str::<DerivationConfig>(&raw).ok())
         .unwrap_or_default()
-        .paused
+}
+
+fn save_derivation(args: &Args, config: &DerivationConfig) -> Result<()> {
+    let raw =
+        serde_json::to_string_pretty(config).map_err(|err| BorgError::Storage(err.to_string()))?;
+    std::fs::write(derivation_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+}
+
+fn paused_branches(args: &Args) -> Vec<u64> {
+    load_derivation(args).paused
 }
 
 /// Turn auto-derivation on or off for one branch.
@@ -1755,14 +1862,117 @@ fn paused_branches(args: &Args) -> Vec<u64> {
 /// and a transaction that ends resumes what it paused rather than leaving a flag behind for a branch
 /// id that will never be written to again.
 fn set_paused(args: &Args, branch: BranchId, pause: bool) -> Result<()> {
-    let mut paused = paused_branches(args);
-    paused.retain(|id| *id != branch.0);
+    let mut config = load_derivation(args);
+    config.paused.retain(|id| *id != branch.0);
     if pause {
-        paused.push(branch.0);
+        config.paused.push(branch.0);
     }
-    let raw = serde_json::to_string_pretty(&DerivationConfig { paused })
-        .map_err(|err| BorgError::Storage(err.to_string()))?;
-    std::fs::write(derivation_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+    save_derivation(args, &config)
+}
+
+/// The poison table, beside the store. SPEC.md §14.
+///
+/// **This is the whole of what makes §14 true for a client that exits after every command.** The
+/// engine's own table is a `HashMap` in the process that discovered the failure; for the CLI that
+/// process is gone by the time anybody reads, so the next `borg get` used to call a broken
+/// producer's output `stale` — a promise of a catch-up that was never coming — and the next
+/// `borg derive` used to run the failing code again from scratch.
+struct FilePoison {
+    path: PathBuf,
+    /// Read once and held for the life of the command. One process does one thing here, so nothing
+    /// can move the file underneath it — and re-reading per lookup would put a syscall inside the
+    /// scheduler's per-producer loop.
+    table: std::sync::Mutex<Vec<BrokenProducer>>,
+}
+
+impl FilePoison {
+    fn new(args: &Args) -> Self {
+        Self {
+            path: derivation_path(args),
+            table: std::sync::Mutex::new(load_derivation(args).broken),
+        }
+    }
+
+    /// Write the table back, preserving the pause flags it shares the file with.
+    ///
+    /// Re-read rather than remembered, for the same reason [`set_paused`] re-reads: the two halves
+    /// are edited by different commands, and holding a whole-file snapshot across a command would
+    /// let one of them silently revert the other.
+    fn flush(&self, table: &[BrokenProducer]) -> Result<()> {
+        let mut config: DerivationConfig = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        config.broken = table.to_vec();
+        let raw = serde_json::to_string_pretty(&config)
+            .map_err(|err| BorgError::Storage(err.to_string()))?;
+        std::fs::write(&self.path, raw).map_err(|err| BorgError::Storage(err.to_string()))
+    }
+}
+
+impl borg_engine::PoisonProvider for FilePoison {
+    fn poisoned(&self, branch: BranchId) -> Result<Vec<Poisoning>> {
+        Ok(self
+            .table
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.branch == branch.0)
+            .map(|row| Poisoning {
+                producer: ProducerId(row.producer),
+                version: LayerId(row.version),
+                error: row.error.clone(),
+                since: LayerId(row.since),
+            })
+            .collect())
+    }
+
+    fn poison(&self, branch: BranchId, poisoning: Poisoning) -> Result<()> {
+        let mut table = self.table.lock().unwrap();
+        table.retain(|row| row.branch != branch.0 || row.producer != poisoning.producer.0);
+        table.push(BrokenProducer {
+            branch: branch.0,
+            producer: poisoning.producer.0,
+            version: poisoning.version.0,
+            error: poisoning.error,
+            since: poisoning.since.0,
+        });
+        self.flush(&table)
+    }
+
+    fn clear(&self, branch: BranchId, producer: ProducerId) -> Result<()> {
+        let mut table = self.table.lock().unwrap();
+        table.retain(|row| row.branch != branch.0 || row.producer != producer.0);
+        self.flush(&table)
+    }
+}
+
+/// What a human calls a producer. The log knows ids; only the implementation table knows names.
+fn producer_name(names: &Implementations, producer: ProducerId) -> String {
+    names
+        .producers
+        .iter()
+        .find(|impl_| impl_.id == producer.0)
+        .map_or_else(|| producer.to_string(), |impl_| impl_.name.clone())
+}
+
+/// Which producers are broken on this branch, under the names a human gave them. SPEC.md §14.
+///
+/// Everything that reports a poisoning goes through here, and everything reports it on **stderr**
+/// and never as a failure: a broken producer is not a broken command. `borg derive` still derives
+/// everything else, and a write followed by a poisoned pipeline is still a write that landed.
+fn broken_here(
+    args: &Args,
+    registry: &Registry,
+    branch: BranchId,
+) -> Result<Vec<(String, Poisoning)>> {
+    let names = load_impls(args);
+    Ok(registry
+        .engine
+        .broken(branch)?
+        .into_iter()
+        .map(|poisoning| (producer_name(&names, poisoning.producer), poisoning))
+        .collect())
 }
 
 async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
@@ -1790,5 +2000,16 @@ async fn derive_status(args: &Args) -> Result<()> {
         if paused { "paused" } else { "running" }
     );
     outln!("settled through {}", registry.settled(branch).await?);
+    // Registered so the poison table can be read against the ClientVersions the branch appoints —
+    // a record naming a version that has since been replaced is spent, and printing it would send
+    // somebody to fix code that has already been fixed (§14).
+    registry.register_producers(branch).await?;
+    for (name, poisoning) in broken_here(args, &registry, branch)? {
+        outln!(
+            "broken      {name} since {}: {}",
+            poisoning.since,
+            poisoning.error
+        );
+    }
     Ok(())
 }

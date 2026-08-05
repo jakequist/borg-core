@@ -341,7 +341,7 @@ async fn a_later_write_at_the_old_version_re_runs_the_migration() -> Result<()> 
     // Writing `C@v_to` into the very buffer it consumes `C@v_from` from must not read as a new
     // entity, or the migration would re-trigger itself forever.
     assert!(
-        h.engine.is_broken(BRANCH, UP).is_none(),
+        h.engine.is_broken(BRANCH, UP)?.is_none(),
         "a migration does not mistake its own output for its input"
     );
     Ok(())
@@ -485,7 +485,7 @@ async fn up_and_down_are_two_views_of_one_value_rather_than_a_cycle() -> Result<
         "the two directions settle instead of chasing each other"
     );
     assert!(
-        h.engine.is_broken(BRANCH, UP).is_none() && h.engine.is_broken(BRANCH, DOWN).is_none(),
+        h.engine.is_broken(BRANCH, UP)?.is_none() && h.engine.is_broken(BRANCH, DOWN)?.is_none(),
         "and neither is poisoned as a cycle"
     );
 

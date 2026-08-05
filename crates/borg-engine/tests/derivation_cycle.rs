@@ -351,7 +351,7 @@ async fn a_cycling_producer_poisons_itself_and_not_the_branch() -> Result<()> {
     h.engine.catch_up(BRANCH).await?;
 
     assert!(
-        h.engine.is_broken(BRANCH, SCORE).is_some(),
+        h.engine.is_broken(BRANCH, SCORE)?.is_some(),
         "a cycling producer is detected and poisoned"
     );
 
@@ -400,13 +400,14 @@ async fn a_producer_that_does_not_own_a_field_is_the_one_poisoned() -> Result<()
     h.engine.catch_up(BRANCH).await?;
 
     assert!(
-        h.engine.is_broken(BRANCH, SCORE).is_none(),
+        h.engine.is_broken(BRANCH, SCORE)?.is_none(),
         "the declared owner writes its own field unimpeded"
     );
     let rejection = h
         .engine
-        .is_broken(BRANCH, OTHER)
-        .expect("the producer that does not own the field is poisoned");
+        .is_broken(BRANCH, OTHER)?
+        .expect("the producer that does not own the field is poisoned")
+        .error;
     assert!(
         rejection.contains("may not write"),
         "and told why: {rejection}"
