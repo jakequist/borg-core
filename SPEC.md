@@ -10,7 +10,7 @@
 Borg is an event-sourced data backend. The long-term ambition is to subsume the modern use cases of
 ORMs, data pipelines, ETL and reverse-ETL. **Act 1 — this document — is the modern ORM.**
 
-Three ideas define the system. Everything else follows from them.
+Four ideas define the system. Everything else follows from them.
 
 **1. Definition changes are data changes.** Schema mutations travel the same event log, on the same
 branches, through the same merge machinery as value mutations. There is no offline migration ritual.
@@ -26,6 +26,17 @@ tells you what they reflect, how stale they may be, and where they came from. Th
 eager-vs-lazy from an architectural commitment into a scheduling policy that cannot affect
 correctness.
 
+**4. Every write is a transaction.** Nothing writes to a shared branch. A client forks, writes in
+isolation and merges; a derivation round does the same thing with `N` computations instead of one
+intent (§12, §16.5). What a writer *read* is what its commit is contingent on, so guards are
+automatic and the merge-conflict detector is the read-set that was already being captured for
+dependency tracking. There is one write path in the system, and it is the safe one.
+
+The fourth idea is the youngest and it arrived by deletion. Isolation used to be expressed as a
+bound on a read path — a *ceiling* — and a bound is a prefix being asked to express a filter. A fork
+point expresses the filter exactly, so the ceiling, the hole it left, and the machinery proposed to
+patch that hole all stopped existing rather than getting fixed (§16.5).
+
 ---
 
 ## 2. Glossary
@@ -35,14 +46,20 @@ correctness.
 | **Registry** | The root container. One per company, typically. Owns the branch tree and all repos. |
 | **Repo** | A namespace-less contribution unit. Teams define structs, fields, and producers through repos. |
 | **PID** | Point ID. Universal identifier for every non-primitive value. |
-| **Cell** | The universal addressable unit: `(pid, field)` or `(pid, index)`. |
-| **Buffer** | A physical partition of cells: one per struct for objects, global for interned values. |
+| **Cell** | The universal addressable unit: a buffer plus a key — a PID (an object property, or an object's existence) or a `(PID, index)` (a list element). The *field* is the buffer, not part of the key (§4.1). |
+| **Buffer** | A partition of cells, keyed by a def: one per struct, one per field, one per list def, one each for the untyped containers. Interned values are not cells and have no buffer (§4.2). |
 | **Def** | A definition — `ObjectDef`, `ListDef`. |
-| **Event** | A single mutation. Either a `ValueEvent` or a `DefEvent`. |
-| **Layer** | An ordered group of events. Belongs to exactly one branch. |
+| **Def-version** | The def-layer that most recently mutated **one** definition. The version half of every stored record. Not a whole-schema version (§5.3). |
+| **Event** | A single mutation, with an identity of its own. Either a `ValueEvent` or a `DefEvent`. An event names no layer; layers name events (§4.3). |
+| **Layer** | An ordered group of events, held **by reference**. Belongs to exactly one branch; one event may belong to many layers. The unit of atomicity (§6.2). |
 | **Branch** | First-class fork of the registry timeline. |
-| **ClientVersion** | A LayerId identifying the def-view an actor's code was authored against. |
+| **ClientVersion** | A LayerId identifying the def-view an actor's code was authored against. A whole schema; moves on every push (§5.4). |
+| **Transaction** | The only write path: fork, write in isolation, merge. A client transaction lands whole or not at all (§12). |
+| **Round** | Derivation as a transaction — the `N` producer invocations that settle one range of layers, forked and merged together, applying partially (§16.5). |
+| **Guard** | An assertion that nothing has touched a cell since a layer. Guards are **automatic**: what a writer read is what its commit is contingent on, and re-evaluating those reads against the parent *is* the merge-conflict detector (§12.1, §13). |
+| **Merge** | Replaying a child branch's layers onto its parent by **naming** their events, never by copying them (§13). |
 | **Producer** | Anything that computes derived data: a pipeline or a migration. |
+| **Reflects** | The source layer a derived layer brings the world up to. Derived data is addressed by `reflects`, never by derived LayerId (§6.3). |
 | **Watermark** | The source layer through which a derived value's inputs are fully incorporated. |
 | **Frontier** | The layer through which all derived data on a branch is caught up. |
 
@@ -542,7 +559,7 @@ follow the same state machine:
 | State | Meaning |
 |---|---|
 | `open` | exclusive to its owner; writes accumulate; invisible to every reader |
-| `sealed` | writes closed; durability and validation happen here (source layers validate guards at seal) |
+| `sealed` | writes closed; durability and validation happen here — a layer's own hand-written guards are checked at this edge, so a rejected layer never becomes visible (§12.4) |
 | `committed` | visible to readers — **this edge is what triggers dependent producers** |
 | `aborted` | discarded; never visible |
 
@@ -982,8 +999,8 @@ Materialization is **asynchronous and continuous**. A source write commits immed
 derivation engine chases it and advances watermarks. Nothing has to ask.
 
 Because every derived value states what it reflects, the scheduling policy **cannot affect
-correctness, only latency.** `NaiveEagerProducerPolicy` in v1; smarter prioritized policies later,
-provably without regression.
+correctness, only latency.** v1's policy is naive-eager and is written in one place rather than
+behind a trait (§17); smarter prioritized policies come later, provably without regression.
 
 That licence is what makes the *shape* of the chase an implementation matter. v1 runs it in the
 process that commits the layer: catch-up follows commit, before the caller returns. It is therefore
@@ -1275,6 +1292,14 @@ control, assembled entirely out of mechanisms that existed for other reasons.
 they read — so producers are writers like any other and there is exactly one write path in the
 system. Everything in this section applies to a round; §16.5 is where the two differences live.
 
+**There is exactly one exception, and it is the empty case.** A transaction forks the highest layer
+its branch can *see*, so a branch whose entire ancestry holds no layers has nothing to fork from,
+and a write there goes to the branch directly. That is safe rather than a hole: §8.0 makes every
+write contingent on definitions, definitions live in def layers, and a branch with no layers has
+none — so the write is going to be rejected whatever path it takes, and the direct path is what gets
+the caller *"no struct named `Wombat`"* instead of *"nothing to fork from"*. There is also nothing to
+isolate from, because anything concurrent would have left a layer.
+
 Three consequences:
 
 - **Every trunk layer is one complete intent.** Never a partial write, never two intents interleaved.
@@ -1347,8 +1372,13 @@ configured **idle timeout**: a transaction untouched for longer than that is rea
 
 Idle rather than elapsed, so a long but active transaction survives and an abandoned short one does
 not — the predictor of a doomed transaction is silence, not age. Reaping sweeps **opportunistically
-when a process opens the store**, the same place the indexes are already rebuilt (§16), so there is
+when a process opens the store**, the same moment the indexes are already rebuilt (§16), so there is
 no daemon and an idle store sweeps nothing because nothing is growing.
+
+The sweep sits *above* the store rather than inside it. Transaction state is operational state beside
+the store (§12.2), and the layer that opens a `StorageProvider` is the one place that must never
+learn what a sidecar file is (§17.1). So "when a process opens the store" means the process — for the
+CLI, its entry point; for a server, wherever it opens the store — and not the storage seam.
 
 The error when a client touches a reaped transaction must say *expired after N idle*, never *unknown
 transaction*. The first tells you what to do.
@@ -1364,29 +1394,46 @@ explicit.** A client that wants to walk away and come back wanted a branch (§7)
 
 ### 12.4 The guard mechanism
 
-v1 supports `ObjectTransaction` only. `ListTransaction` and others are deferred.
+A guard is one shape, whoever produced it:
 
-```ts
-type ObjectTransactionEvent = {
-  mutation: Event
-  guards: {
-    pid:    Pid
-    fields: FieldName[]
-    since:  LayerId
-  }[]
-}
+```
+Guard { cells: CellRef[], since: LayerId }
 ```
 
-A guard asserts that nothing has touched those cells since that layer. **Validated at seal** — before
-anything becomes visible, so a rejected transaction leaves no trace on the branch.
+It asserts that nothing has touched those cells since that layer. Note the currency: **the guard is
+over `CellRef` even though the read that produced it was over `CellAt`.** A guard is a question about
+a cell, and a write at any def-version is a write; the version survives only in the *subtraction*
+that decides which reads become guards, where it is load-bearing for exactly one producer (§16.5).
 
-Checked against a **cell-touch index** (`cell -> layers that wrote it`). Only *source* layers are
-recorded in it: guards may name source cells only, so a derived write can never appear in a guard,
-and derived layers are the enormous ones. Skipping them bounds the index by authored data rather than
-by everything the derivation engine produces.
+**`since` is the fork point, for every guard a transaction carries.** Recording the moment of each
+read instead is not merely unnecessary, it is unsound: a transaction's read path is bounded at the
+fork point (§7.2), so every read observes the parent as the parent stood *then*, whenever it happens.
+Using the read's own moment would ignore every parent write between the fork and the read — writes
+the transaction provably did not see, because they were above its bound — which is the exact set a
+guard exists to catch.
+
+**Two producers of guards, and they are checked at different edges.**
+
+| Guard | Produced by | Checked |
+|---|---|---|
+| automatic | the transaction's read-set, `since` = the fork point (§12.1) | at **merge**, against the parent's history since the fork point |
+| hand-written | a caller attaching one to a layer | at **seal**, against its own `since` — and again at merge, because a merged layer's guards are re-evaluated against the parent |
+
+The seal check is what makes a rejected layer leave no trace: nothing has become visible yet. The
+merge check is what makes guards the conflict detector (§13). They are the same question asked of two
+different histories, so they are one function asked twice rather than two.
+
+Both are checked against a **cell-touch index** (`cell -> layers that wrote it`). Only *source*
+layers are recorded in it: guards may name source cells only, so a derived write can never appear in
+a guard, and derived layers are the enormous ones. Skipping them bounds the index by authored data
+rather than by everything the derivation engine produces. A merge whose parent has had nothing
+written to it since the fork point answers its whole guard set from that index without touching a
+cell — which is why an uncontended round pays almost nothing for its guards.
 
 The index is queried along the **read path** (§7.2) rather than one branch, which is exactly what
 lets a child's guard be re-evaluated against its parent at merge time.
+
+v1 supports `ObjectTransaction` only. `ListTransaction` and others are deferred.
 
 **Guards may reference source cells only.** Guarding a derived field is meaningless — its value is a
 function of source data with a lag, so the guard would be checking a shadow. Guard the sources
@@ -1601,26 +1648,30 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
   │                  through it and is validated (§8).    │
   └───────────────────────────────────────────────────────┘
 
-  ┌─ DERIVATION (the cycle) ──────────────────────────────┐
+  ┌─ DERIVATION (the cycle, inside one round) ────────────┐
   │                                                        │
-  │    layer committed                                     │
-  │         │                                              │
+  │    a range of committed layers   ── fork ──► round     │
+  │         │                                     branch   │
   │         ▼                                              │
   │    Invalidator ──lookup──► DependencyIndex             │
   │         │                    fwd: invalidation         │
   │         │                    bwd: lineage              │
+  │         ▼                    (keyed on the trunk)      │
+  │    Scheduler     policy: eager and stateless (§16.4)   │
+  │         │        one wave, discovered whole            │
   │         ▼                                              │
-  │    Scheduler ◄── ProducerPolicyProvider                │
-  │         │                                              │
-  │         ▼                                              │
-  │    ProducerRuntime   opens a layer, runs user code,    │
-  │         │            read-proxy records and verifies   │
-  │         │            declared read/write sets          │
+  │    ProducerRuntime   a layer per invocation, run       │
+  │         │            concurrently; ProducerCtx         │
+  │         │            observes every cell access        │
   │         └──────────► commits ──┐                       │
   │                                │                       │
   │         ┌──────────────────────┘                       │
   │         ▼                                              │
-  │    (triggers the next producers)                       │
+  │    (its layers are the next wave — barrier between)    │
+  │         │                                              │
+  │         ▼                                              │
+  │    merge_round ──► trunk, guarded by what was read,    │
+  │                    applying partially (§16.5)          │
   └────────────────────────────────────────────────────────┘
 
   ┌─ READ ────────────────────────────────────────────────┐
@@ -1639,13 +1690,14 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 | `LayerManager` | layer identity and the state machine of §6.2; streaming commit |
 | `BranchManager` | branch tree, fork, merge, ancestry queries |
 | `DefRegistry` | defs, def-versions, ClientVersion resolution, live-version set |
-| `Invalidator` | walks a committing layer, converts it into dirty invocations |
-| `DependencyIndex` | bidirectional cell ↔ invocation graph; in-memory-primary |
+| `Invalidator` | walks every layer a round is settling — derived ones included (§9.6) — and converts it into dirty invocations |
+| `DependencyIndex` | bidirectional cell ↔ invocation graph; in-memory-primary; keyed on the **trunk**, never on a round's own branch |
 | `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, settles the whole gap as one transaction (§16.5) |
-| `ProducerRuntime` | executes user code; owns the read proxy that records and verifies read/write sets |
-| `Resolver` | read path: locate cell, migrate for version skew, validate, build envelope |
+| `ProducerRuntime` | executes user code through `ProducerCtx`, which observes every cell access — nothing is declared, so nothing can be mis-declared (§9.4) |
+| `Resolver` | read path: locate cell, migrate for version skew, validate, build envelope. Holds `InlineDerivation` — one method — rather than the engine, so the read path is a *client* of derivation (§10.5) |
 | `FrontierTracker` | per-producer watermarks, settled frontier, `frontier.reaches()` |
-| `CellTouchIndex` | `cell → layers that wrote it`; backs guard validation (§12) |
+| `CellTouchIndex` | `cell → layers that wrote it`, source layers only; backs guard validation (§12.4) |
+| `PoisonProvider` | which producers are broken, and the ClientVersion each judgement was made against (§14.2) |
 
 ### 16.2 Verbs
 
@@ -1653,7 +1705,8 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 |---|---|
 | Log | `open` · `seal` · `commit` · `abort` |
 | Branch | `fork` · `merge` |
-| Derivation | `invalidate` · `schedule` · `run` |
+| Transaction | `begin` · `get` · `set` · `commit` · `abort` |
+| Derivation | `invalidate` · `schedule` · `run` · `settle` |
 | Watermark | `validate` · `recompute` |
 | Read | `resolve` · `explain` |
 | Definition | `push` |
@@ -1680,7 +1733,19 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 7. **No membership test in the dependency index may be a linear scan.** A widely-shared upstream
    cell accumulates one dependent per invocation, and every one of them retracts itself on re-run.
    Vector membership turns a fan-out of `n` into `O(n²)` — measured, and the difference between
-   1.3s and 0.28s at 32k dependents. Sets everywhere the index dedupes or removes.
+   1.3s and 0.28s at 32k dependents. Sets everywhere the index dedupes or removes. The same rule
+   governs the round's own dedupes: a scan that only ever saw two candidates saw 128k the moment
+   the buffer scan moved to the top of a range (§9.6).
+8. **The dependency index is keyed on the trunk, never on a round's own branch.** A round branch is
+   where events land on the way through; the dependency graph is a fact about the data, which lives
+   on the trunk. Keyed on the round branch it would be discarded with the round, and an invocation
+   whose merge was rejected would never be rediscovered — rediscovery is a lookup by branch and
+   cell, and the edges would sit under a branch id nobody looks up. Partial application (§16.5) is
+   only safe because those edges are already on the trunk when the merge decides.
+9. **A round's applied subset is closed under the round's own dependencies.** Dropping an invocation
+   drops everything in the same round that read what it wrote, transitively. Otherwise the round
+   publishes a value derived from one that never landed, labelled with a watermark claiming exactly
+   the replay that would not reproduce it (§10.1).
 
 ### 16.4 The scheduler is stateless
 
@@ -1972,11 +2037,16 @@ without semantic change.
 |---|---|---|
 | `StorageProvider` | SQLite (`borg-storage-sqlite`), or in-memory | native Borg storage |
 | `DependencyIndexProvider` | in-memory, key-ranged | persistent, sharded by cell key |
-| `ProducerPolicyProvider` | `NaiveEagerProducerPolicy` | prioritized, incremental, batched |
 | `ExecutionProvider` | in-process Rust, or a subprocess over stdio (§17.4) | container over a socket |
-| `ErrorPolicyProvider` | `NaiveProducerPoisonPolicy` | partial / per-cell recovery |
 | `PoisonProvider` | in-memory for a server; a file beside the store for a process-per-command client (§14.2) | shared, with the rest of operational state |
-| `CodegenProvider` | — (deferred, §15) | TypeScript, Python, Rust, Go |
+| *(scheduling policy)* | not a trait yet — eager and stateless, hard-wired (§16.4) | `ProducerPolicyProvider`: prioritized, incremental, batched |
+| *(error policy)* | not a trait yet — a producer is poisoned whole (§14) | `ErrorPolicyProvider`: partial / per-cell recovery |
+| *(codegen)* | — (deferred, §15) | `CodegenProvider`: TypeScript, Python, Rust, Go |
+
+The bottom three are named intent, not code. A seam is worth its abstraction once there is a second
+implementation to hold, and for those three there is exactly one — so what exists is the policy
+itself, in one place, with the name reserved for when a second arrives. Saying so is the point: a
+table of providers that lists traits nobody wrote is a map a reader checks once and stops trusting.
 
 The dependency index is designed **in-memory-primary** rather than as a disk structure with a cache.
 This is a deliberate bet on the normalization thesis (§1): identity makes normalization free,
@@ -1988,17 +2058,40 @@ memory lookups.
 Deliberately minimal, so that a plain KV store and Postgres remain equally viable:
 
 ```
-get_cell(branch, cell, layer) -> (Event, landedAt)?
-author_event(open_layer, cell, EventDraft) -> EventId   // streaming; never buffered whole
-include_event(open_layer, EventId)              // membership — what makes merge not copy
-read_layer(layer) -> Iterator<Event>            // a layer's membership, in order
-read_membership(layer) -> [EventId]             // the same, as identities — what merge actually wants
-rebuild_read_index()                            // the index is a projection, and this proves it
-scan_buffer(branch, buffer, layer) -> Iterator   // engine-internal enumeration only
-open_layer / seal_layer / commit_layer / abort_layer
-intern(kind, bytes) -> Pid                       // content-addressed; no branch, no layer
+// Reads. A ReadPath, never a branch — see below.
+get_cell(path, cell, version) -> Landed?          // Landed = the event, plus where it landed here
+cell_versions(path, cell) -> [DefVersion]         // which versions this cell is materialized at
+scan_buffer(path, buffer) -> Iterator<Event>      // engine-internal enumeration only
+
+// Writing into an open layer.
+author_event(cell, EventDraft) -> EventId         // streaming; never buffered whole
+include_event(EventId)                            // membership — what makes merge not copy
+put_def(DefEvent)                                 // a layer holds values xor defs (§6.2)
+seal / abort
+
+// Reading the log back.
+read_layer(layer) -> Iterator<Event>              // a layer's membership, in order
+read_membership(layer) -> [EventId]               // the same, as identities — what merge wants
+read_def_layer(layer) -> [DefEvent]
+open_layer(branch, id) / commit_layer(sealed)
+put_layer_meta(Layer) / read_layers() / put_branch(Branch) / read_branches()
+rebuild_read_index()                              // the index is a projection, and this proves it
+
+// Interned values.
+intern(kind, bytes) -> Pid                        // content-addressed; no path, no layer
 read_interned(pid) -> bytes?
 ```
+
+**A read takes a `ReadPath`, not a branch.** The engine resolves ancestry (§7.2) and hands storage a
+list of `(branch, bound)` segments to walk outward; storage never learns what a branch *is*, which is
+what keeps branch semantics out of every backend. `open_layer` and the branch table take a `BranchId`
+because they are the log's *shape* rather than a question about it — a layer belongs to exactly one
+branch (§6.2), and that fact has to be durable.
+
+The layer and branch tables are here for the same reason: they are the structure of the log, not a
+projection of it. Everything else the engine holds — the dependency index, the cell-touch index,
+watermarks, poisonings — is a cache rebuildable by replaying committed layers, so none of it appears
+above.
 
 **Interning is unscoped, and that is the whole point.** `intern` takes no branch, no layer and no
 def-version, because a content PID has none (§3.1); a provider that scoped it would reintroduce
@@ -2199,9 +2292,11 @@ async through the derivation engine afterwards is a far larger change than payin
 - Stateless scheduler — work derived from watermark gaps, no queue
 - Watermarks, validate/recompute, provenance envelopes, `explain()`
 - Frontier tracking, `freshness` read modes, settled-frontier reads
-- Object transactions with source-only guards, validated at seal
+- Transactions as the only write path; object transactions with automatic, source-only guards
+- Rounds as transactions: settle a range, fork, apply partially, merge one layer per producer
 - Cell-touch index over source layers
-- Merge with guard-based conflict detection
+- Merge with guard-based conflict detection, naming events rather than copying them
+- Producer poisoning as durable operational state, expiring on the ClientVersion that recorded it
 - Distribution seams (§17.2) behind traits, naive in-process implementations
 - Serializable command/response form for every engine operation
 
@@ -2215,7 +2310,7 @@ async through the derivation engine afterwards is a far larger change than payin
 - **All generated SDKs** (§15) — they arrive with the network layer
 - Network / server layer — v1 is a library exercised by Rust tests
 - Actual distribution — only the seams (§17.2)
-- Coalescing of derived layers across source layers
+- `O(1)` merge — a parent layer referencing a child's event set rather than enumerating it (§13)
 - `down`-migration validation
 - `expectedFreshAt` ETAs
 - Referential integrity / dangling-reference prevention

@@ -75,6 +75,17 @@ These are load-bearing. Breaking one is a design change, not a refactor, and nee
    value is served *and labelled*, never silently served or withheld.
 9. **A layer holds value events xor def events.** This is what makes "the def-version at layer L"
    well-defined.
+10. **Every write is a transaction: fork, write, merge.** Guards are the transaction's own read-set
+    with `since` = the fork point, and re-evaluating them against the parent *is* the merge-conflict
+    detector (§12, §13). The one exception is a branch whose whole ancestry is empty, which has
+    nothing to fork from — see `ROADMAP.md`, *An empty branch's first write is not a transaction*.
+11. **The dependency index is keyed on the trunk, never on a round's own branch** (§16.3). Keyed on
+    the round branch it would be discarded with the round, and an invocation whose merge was
+    rejected would never be rediscovered. Partial application is only safe because of this.
+12. **A round's applied subset is closed under the round's own dependencies** (§16.5). Drop an
+    invocation and everything in that round which read what it wrote goes too, transitively —
+    otherwise the round publishes a value derived from one that never landed, wearing a watermark
+    that replaying would not reproduce.
 
 ## Conventions
 
@@ -113,7 +124,7 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   the primitive; the loop is what an in-process deriver removes.
 - A watermark is a `LayerId` like any other, so nothing stops one being compared with a layer id
   that is not a source layer. Four bugs have come from that family already; `ROADMAP.md`'s
-  *Deferred, still* records what a `Watermark` newtype would cost and why it is its own change.
+  *Deferred features* records what a `Watermark` newtype would cost and why it is its own change.
 - **A round forks before it knows whether it has any work**, so a source layer that dirties nothing
   still costs a branch row. Forking lazily means threading the round's read path into the scheduler
   rather than its branch id, which is a real restructuring for a row.
@@ -121,8 +132,9 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   transaction's *state*, which is what makes it unusable, and leaves the branch row; a round holds no
   state outside the process running it, so an abandoned one leaves a branch row and derived layers
   nothing can reach. Whether spent branches are collected or kept as history is a real choice
-  (SPEC-DRAFT §7.5) and should not be made by a janitor as a side effect. Note this is now **two**
-  branches per `borg set`: the transaction's, and the round's.
+  (`ROADMAP.md`, *Concerns carried over from the transactional-model draft*) and should not be made
+  by a janitor as a side effect. Note this is now **two** branches per `borg set`: the transaction's,
+  and the round's.
 - **The reap sweep lives in the CLI, not in `Registry::open`.** §12.3 says "when a process opens the
   store", and for this client that is `run()`. The transaction table is a filesystem sidecar like the
   pause flags and the producer table; `Registry::open` sits below the provider line, where a
@@ -133,11 +145,12 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   values and every label on them are unaffected and are what `scenarios/200-determinism` sweeps;
   nothing can ask the other question, because derived data is addressed by `reflects` and never by
   derived LayerId. This is deliberate — see `ROADMAP.md`, *Settling a range is a schedule change*.
-- **Every `borg set` now costs four layers** — one on its transaction branch, one on the parent
-  naming it, and then a round which is one derived layer per producer on its own branch plus one per
-  producer on the parent. Forks are `O(1)` and layers are cheap, but `Registry::open` replays the log
-  on every CLI invocation, so the `O(log)` open grows with it. SPEC-DRAFT §7.4 flagged this; the
-  fan-out benchmark cannot see it, because it drives the engine rather than the CLI.
+- **Every `borg set` now costs four layers** in the one-producer case — one on its transaction
+  branch, one on the parent naming it, and then a round, which is one derived layer per *invocation*
+  on its own branch and one per *producer* on the parent (§16.5). Forks are `O(1)` and layers are
+  cheap, but `Registry::open` replays the log on every CLI invocation, so the `O(log)` open grows
+  with it. The transactional-model draft flagged this; the fan-out benchmark cannot see it, because
+  it drives the engine rather than the CLI.
 - **A producer that has never succeeded has no cell to call `broken`.** §14's state is a label on a
   stored record (§10.4), and a pipeline that threw on its first run wrote none, so its output reads
   as simply absent. Enumerating the cells a producer *might* have written is not a set anything can
