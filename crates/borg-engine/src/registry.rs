@@ -20,6 +20,7 @@ use crate::defs::DefRegistry;
 use crate::derive::DerivationEngine;
 use crate::index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};
 use crate::log::LayerManager;
+use crate::poison::{MemoryPoison, PoisonProvider};
 use crate::resolve::{FrontierTracker, InlineDerivation, Resolver};
 use crate::seams::InProcessSequencer;
 use crate::touch::CellTouchIndex;
@@ -41,6 +42,9 @@ pub struct Registry {
     pub engine: Arc<DerivationEngine>,
     pub resolver: Resolver,
     pub frontier: Arc<FrontierTracker>,
+    /// Which producers are broken here, and why. Public because the client that has to *report* a
+    /// poisoning is not the one that discovered it (SPEC.md §14).
+    pub poison: Arc<dyn PoisonProvider>,
     /// Text ↔ value, for the surfaces that speak text. Every client-facing write goes through
     /// `intern` and every client-facing read through `render`, so a string is a string on the way in
     /// and on the way out (§3.4).
@@ -48,10 +52,27 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Open a store and restore everything derivable from it.
+    /// Open a store and restore everything derivable from it, keeping poisonings in this process.
+    ///
+    /// Right for anything that *is* the process — a test, a server. A client that exits between
+    /// commands wants [`open_with_poison`](Self::open_with_poison), or §14's judgement dies with the
+    /// command that made it.
     pub async fn open(
         storage: Arc<dyn StorageProvider>,
         executor: Arc<dyn ExecutionProvider>,
+    ) -> Result<Self> {
+        Self::open_with_poison(storage, executor, Arc::new(MemoryPoison::new())).await
+    }
+
+    /// Open a store against a poison table that outlives this process. SPEC.md §14.
+    ///
+    /// Not a `StorageProvider` concern and deliberately not one: nothing above the provider line
+    /// teaches storage what derivation is, and a poisoned producer is derivation through and
+    /// through. See `crate::poison` for where it belongs instead and why.
+    pub async fn open_with_poison(
+        storage: Arc<dyn StorageProvider>,
+        executor: Arc<dyn ExecutionProvider>,
+        poison: Arc<dyn PoisonProvider>,
     ) -> Result<Self> {
         let touches = Arc::new(CellTouchIndex::new());
         let index: Arc<dyn DependencyIndexProvider> = Arc::new(MemoryDependencyIndex::new());
@@ -81,15 +102,18 @@ impl Registry {
         let defs = Arc::new(DefRegistry::new(Arc::clone(&layers), Arc::clone(&storage)));
         let values = Arc::new(Values::new(Arc::clone(&storage)));
 
-        let engine = Arc::new(DerivationEngine::new(
-            Arc::clone(&storage),
-            Arc::clone(&layers),
-            Arc::clone(&index),
-            executor,
-            Arc::clone(&frontier),
-            Arc::clone(&defs),
-            Arc::clone(&branches),
-        ));
+        let engine = Arc::new(
+            DerivationEngine::new(
+                Arc::clone(&storage),
+                Arc::clone(&layers),
+                Arc::clone(&index),
+                executor,
+                Arc::clone(&frontier),
+                Arc::clone(&defs),
+                Arc::clone(&branches),
+            )
+            .with_poison(Arc::clone(&poison)),
+        );
 
         let registry = Self {
             resolver: Resolver::new(
@@ -101,13 +125,17 @@ impl Registry {
                 // is: `InlineDerivation` says "bring this cell up to date" and nothing else
                 // (SPEC.md §10.5).
                 Arc::clone(&engine) as Arc<dyn InlineDerivation>,
-            ),
+            )
+            // The same table the engine writes to. Two views of one fact — the scheduler stops
+            // running a poisoned producer, the reader is told that is why (SPEC.md §14).
+            .with_poison(Arc::clone(&poison)),
             storage,
             layers,
             branches,
             defs,
             engine,
             frontier,
+            poison,
             values,
         };
         registry
@@ -179,6 +207,20 @@ impl Registry {
         let path = self.branches.read_path(branch, None)?;
         let view = self.defs.view(&path).await?;
         Ok(view.producers().map(|def| def.id).collect())
+    }
+
+    /// Tell the derivation engine which producers this branch defines.
+    ///
+    /// Definitions travel the log and implementations do not (§9.2), so this is half of joining the
+    /// two — and it is what puts a **ClientVersion** in front of the engine, which is what a
+    /// poisoning is checked against (§14). An engine that has not been told cannot tell a producer
+    /// that has been fixed from one that has not.
+    pub async fn register_producers(&self, branch: BranchId) -> Result<()> {
+        let path = self.branches.read_path(branch, None)?;
+        for def in self.defs.view(&path).await?.producers() {
+            self.engine.register(def.clone());
+        }
+        Ok(())
     }
 
     /// The layer to read at for a coherent snapshot of this branch. SPEC.md §10.5.

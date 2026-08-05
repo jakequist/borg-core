@@ -137,6 +137,10 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   producer on the parent. Forks are `O(1)` and layers are cheap, but `Registry::open` replays the log
   on every CLI invocation, so the `O(log)` open grows with it. SPEC-DRAFT §7.4 flagged this; the
   fan-out benchmark cannot see it, because it drives the engine rather than the CLI.
+- **A producer that has never succeeded has no cell to call `broken`.** §14's state is a label on a
+  stored record (§10.4), and a pipeline that threw on its first run wrote none, so its output reads
+  as simply absent. Enumerating the cells a producer *might* have written is not a set anything can
+  produce.
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.

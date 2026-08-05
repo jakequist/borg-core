@@ -7,6 +7,7 @@
 use crate::branch::BranchManager;
 use crate::defs::DefRegistry;
 use crate::index::DependencyIndexProvider;
+use crate::poison::{MemoryPoison, PoisonProvider, Poisoning};
 use borg_core::{
     BranchId, CellAt, CellRef, ClientVersion, DefVersion, Derivation, Freshness,
     FreshnessRequirement, LayerId, Origin, ProducerId, ReadPath, Resolved, Result, Value,
@@ -173,6 +174,10 @@ pub struct Lineage {
     pub landed_at: LayerId,
     pub fresh_as_of: LayerId,
     pub from: Vec<LineageEdge>,
+    /// Why this value stopped moving, when its producer is poisoned (SPEC.md §14). `explain` is
+    /// where §14's *"lineage explaining why"* is actually said — the envelope carries the state, and
+    /// a state without a reason sends whoever read it looking through logs for one.
+    pub broken: Option<String>,
 }
 
 pub struct Resolver {
@@ -181,6 +186,9 @@ pub struct Resolver {
     defs: Arc<DefRegistry>,
     branches: Arc<BranchManager>,
     inline: Arc<dyn InlineDerivation>,
+    /// The same table the derivation engine writes to. Two views of one fact: the scheduler stops
+    /// running a poisoned producer, and the reader is told that is why (SPEC.md §14, §10.4).
+    poison: Arc<dyn PoisonProvider>,
 }
 
 impl Resolver {
@@ -197,7 +205,20 @@ impl Resolver {
             defs,
             branches,
             inline,
+            poison: Arc::new(MemoryPoison::new()),
         }
+    }
+
+    /// Read poisonings from where they actually live. SPEC.md §14.
+    ///
+    /// The default is the in-process table, which is right for a resolver sharing a process with the
+    /// engine and empty for one that is not — so a client that exits between commands must pass the
+    /// same durable table its deriver was given, or its reads will call a broken producer's output
+    /// merely stale.
+    #[must_use]
+    pub fn with_poison(mut self, poison: Arc<dyn PoisonProvider>) -> Self {
+        self.poison = poison;
+        self
     }
 
     /// Read one cell, with provenance.
@@ -301,6 +322,18 @@ impl Resolver {
             }
         };
 
+        // **A poisoned producer overrides what validation concluded, rather than refining it.**
+        // Validation answers *how far can this value honestly claim to be correct*, and its answer
+        // here is `stale` — which promises a catch-up. For a producer that threw or cycled no
+        // catch-up is coming until somebody pushes new code (SPEC.md §14), and a client told `stale`
+        // will wait for one. `fresh_as_of` is left where validation put it: the value really is
+        // correct through there, and the news is that it will not move.
+        let state = if self.poisoning(branch, producer).await?.is_some() {
+            Freshness::Broken
+        } else {
+            state
+        };
+
         Ok(Resolved {
             value: (!record.value.is_tombstone()).then_some(record.value),
             origin: Origin::Derived,
@@ -315,6 +348,37 @@ impl Resolver {
             },
             by: Some(producer),
         })
+    }
+
+    /// Whether the producer that owns a cell is poisoned on this branch. SPEC.md §14.
+    ///
+    /// Two lookups, and the first is the one that matters for cost: a branch with nothing broken —
+    /// every branch, almost always — answers from the poison table alone and never folds anything.
+    /// Only a branch that has something recorded pays to find out which ClientVersion its producer
+    /// stands at now.
+    ///
+    /// That version is read from the branch **as it stands**, not through the layer or the
+    /// ClientVersion this read is pinned to. Whether the broken code has since been replaced is a
+    /// fact about the branch, and a reader on an older view is not entitled to a different answer
+    /// about it than a reader on a newer one.
+    async fn poisoning(&self, branch: BranchId, producer: ProducerId) -> Result<Option<Poisoning>> {
+        let recorded = self.poison.poisoned(branch)?;
+        let Some(poisoning) = recorded
+            .into_iter()
+            .find(|poisoning| poisoning.producer == producer)
+        else {
+            return Ok(None);
+        };
+        let version = self
+            .defs
+            .view(&self.branches.read_path(branch, None)?)
+            .await?
+            .producers()
+            .find(|def| def.id == producer)
+            .map(|def| def.version);
+        Ok(version
+            .is_none_or(|version| poisoning.applies_to(version))
+            .then_some(poisoning))
     }
 
     /// Whether this cell is already correct as of the layer being read, so that computing it would
@@ -527,9 +591,20 @@ impl Resolver {
             }
         }
 
+        let produced_by = found.event.derivation.as_ref().map(|d| d.producer);
+        // §14 promises lineage that explains *why* a cell is broken, and this is where that sentence
+        // is. Source data has no producer and so can never be broken, which falls out.
+        let broken = match produced_by {
+            Some(producer) => self
+                .poisoning(branch, producer)
+                .await?
+                .map(|poisoning| poisoning.error),
+            None => None,
+        };
+
         Ok(Some(Lineage {
             cell: target,
-            produced_by: found.event.derivation.as_ref().map(|d| d.producer),
+            produced_by,
             authored_at: found.event.authored,
             landed_at: found.landed_at,
             fresh_as_of: found
@@ -538,6 +613,7 @@ impl Resolver {
                 .as_ref()
                 .map_or(found.landed_at, |d| d.fresh_as_of),
             from,
+            broken,
         }))
     }
 }

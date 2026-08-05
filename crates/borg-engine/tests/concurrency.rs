@@ -543,7 +543,7 @@ async fn a_client_write_landing_mid_round_still_settles() -> Result<()> {
         }
         for producer in [FIRST, SECOND, THIRD] {
             assert!(
-                h.engine.is_broken(BRANCH, producer).is_none(),
+                h.engine.is_broken(BRANCH, producer)?.is_none(),
                 "run {run}: nothing was poisoned by the interruption"
             );
         }

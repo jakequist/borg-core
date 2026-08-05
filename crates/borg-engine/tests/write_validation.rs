@@ -150,8 +150,8 @@ impl Harness {
         self.engine.catch_up(self.branch).await?;
         // A producer failure poisons the producer rather than the branch (SPEC.md §14), so the
         // rejection is read back from there rather than from `catch_up`'s return.
-        match self.engine.is_broken(self.branch, id) {
-            Some(message) => Err(BorgError::Execution(message)),
+        match self.engine.is_broken(self.branch, id)? {
+            Some(poisoning) => Err(BorgError::Execution(poisoning.error)),
             None => Ok(()),
         }
     }

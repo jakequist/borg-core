@@ -1,0 +1,8 @@
+# The same repo, the same producer name, broken code. Producer ids are derived from the name, so
+# pushing this is a deploy over the top of `repo/` rather than the arrival of something new.
+[repo]
+id = 1
+name = "risk"
+
+[[pipelines]]
+command = "pipelines/score.sh"

@@ -1110,7 +1110,7 @@ other branch?" is now a question with an answer: a merged event is one event nam
 | `current` | `freshAsOf == requested layer`. Guaranteed correct. Source cells are always this. |
 | `unvalidated` | Behind, but unchecked. Cheap to resolve. |
 | `stale` | A dependency is known to have moved. Definitely out of date. |
-| `broken` | The producer threw or cycled. `IllegalState`, scoped to this cell. |
+| `broken` | The producer threw or cycled. `IllegalState`, scoped to the producer (§14) — so this is not a worse `stale` but a different fact: nothing is catching up, and nothing will until code is pushed. |
 | `tombstoned` | Explicitly removed (§8.1), or reached through a dangling reference (§8.2). |
 
 For source cells `landedAt` and `freshAsOf` collapse — source data is written once and correct
@@ -1456,10 +1456,63 @@ and everything else keeps working.
 This means **main never breaks because someone merged a bad pipeline.** It is also strictly less
 machinery than branch-wide poisoning, since no broken-layer-range tracking is needed.
 
-Recovery: fix the producer and push a new ClientVersion, which invalidates and recomputes its output.
+### 14.1 What a poisoned producer costs
+
+Three things follow, and each is a promise to a different reader:
+
+- **Its cells read `broken`, not `stale`** (§10.4). The two are not degrees of the same thing.
+  `stale` says a catch-up is coming and a client may wait for it; for a poisoned producer none is
+  coming until somebody pushes code, and a client told `stale` waits forever. The state overrides
+  what validation concluded rather than refining it — `freshAsOf` is left where validation put it,
+  because the value really is correct through there and the news is only that it will not move.
+  The last good value is still served: a broken cell is labelled, never withheld (§10.4).
+- **`explain` says why**, carrying the error the producer raised. A state without a reason sends
+  whoever read it looking through logs for one.
+- **It is not scheduled**, including for the invocations that have nothing to do with what failed,
+  and including for a `freshness: 'current'` read that asked to pay for a computation. The producer
+  is the unit that is judged. Re-running it on the next command would repeat the failure, burn the
+  work, and repeat whatever partial effects it had.
+
+**Its watermark still advances.** Holding it back would stall the settled frontier (§10.5) and every
+`frontier.reaches` on the branch behind one bad pipeline — which is the branch-wide poisoning this
+section exists to avoid. The read envelope is the channel that carries the news instead, and the work
+skipped meanwhile is handed back at recovery.
+
+### 14.2 Where poisoning lives
+
+A poisoning is **operational state, not log data**, kept beside the store rather than in it — in the
+same class as the pause flags (§9.6) and the producer-implementation table (§9.2).
+
+It is not a value event and not a def event, and a layer holds one or the other (§6.2). It is
+*discovered*, the way field ownership used to be before it became declared (§8), so nobody wrote it
+and there is no author to attribute it to. In the log it would be forkable, mergeable and
+time-travellable: a fork would inherit a poisoning its own code never earned, and a merge would carry
+one back onto a branch that is working. *"Was P broken at layer 400?"* is not a question anybody has.
+It is not storage's concern either — nothing above the provider line teaches a `StorageProvider` what
+derivation is (§17.1) — so it reaches durability through a provider of its own.
+
+**Recovery is the log's, even though the record is not.** Fix the producer and push a new
+ClientVersion, which invalidates and recomputes its output. A producer's ClientVersion is the
+def-layer it was pushed at (§9.2), so a poisoning that **names the version it was recorded against**
+expires by itself: it applies while the branch still appoints that version, and stops the moment a
+push moves it. Nothing has to remember to clear it, no command has to be run in the right order, and
+a record restored from a backup cannot poison code that has since been replaced. The record is not a
+fact in its own right — it is a claim about a fact the log holds, and the log decides whether the
+claim is still live.
+
+Recovery hands back the work the producer missed: its watermark is rewound, so the layers skipped
+while it was broken are re-derived rather than silently passed over. A fix the log *cannot* see — a
+worker's environment repaired, a service it calls back up — has no expiry to wait for, and is spelled
+`borg derive --retry-broken`. Retrying by default is what turns one bad deploy into the same failure
+repeated by every command.
 
 v1 is deliberately strict elsewhere — whole-merge rejection rather than partial application. Softening
 these edges is later work.
+
+**A producer that has never succeeded has no cells to report anything.** `broken` is a label on a
+stored record (§10.4), and a pipeline that threw on its first run wrote none — so its output reads as
+simply absent. Saying more would mean materializing an envelope for every cell a producer *might*
+have written, which is not a set anything can enumerate.
 
 ---
 
@@ -1827,6 +1880,7 @@ without semantic change.
 | `ProducerPolicyProvider` | `NaiveEagerProducerPolicy` | prioritized, incremental, batched |
 | `ExecutionProvider` | in-process Rust, or a subprocess over stdio (§17.4) | container over a socket |
 | `ErrorPolicyProvider` | `NaiveProducerPoisonPolicy` | partial / per-cell recovery |
+| `PoisonProvider` | in-memory for a server; a file beside the store for a process-per-command client (§14.2) | shared, with the rest of operational state |
 | `CodegenProvider` | — (deferred, §15) | TypeScript, Python, Rust, Go |
 
 The dependency index is designed **in-memory-primary** rather than as a disk structure with a cache.
