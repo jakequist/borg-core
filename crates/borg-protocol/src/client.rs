@@ -140,7 +140,8 @@ pub enum Request {
         #[serde(default)]
         branch: Option<String>,
     },
-    /// A struct's definition, structured — this is what codegen reads (SPEC.md §15, SDK-DRAFT §4.4).
+    /// A struct's definition, structured. What a *debugging* client reads about one struct it can
+    /// already name.
     DefShow {
         #[serde(default)]
         branch: Option<String>,
@@ -149,6 +150,20 @@ pub enum Request {
         /// know what Rust reserves.
         #[serde(rename = "struct")]
         struct_name: String,
+    },
+    /// **The whole def view of a branch — what codegen reads** (SPEC.md §15, SDK-DRAFT §4.4).
+    ///
+    /// The one message added after `borg serve` shipped, and it was added rather than composed
+    /// because neither half of it could be. [`Request::DefShow`] answers about a struct you can
+    /// already name, and codegen's entire job is to not know the names in advance — there was no
+    /// enumeration on the socket at all. And the ClientVersion a generated module has to stamp
+    /// itself with is the branch's *def*-version, which is not [`Request::BranchHead`]: head moves
+    /// on every data write, and a def-version moves only on a def push (SPEC.md §5.3). Two facts,
+    /// one round trip, because they are the same read: a client that took them separately could be
+    /// handed a schema and a version from either side of a push.
+    DefView {
+        #[serde(default)]
+        branch: Option<String>,
     },
 }
 
@@ -189,6 +204,9 @@ pub enum Response {
         layer: String,
     },
     Def(StructDef),
+    /// The answer to [`Request::DefView`]: every struct the branch declares, and the def-version
+    /// they were read at.
+    Defs(SchemaDef),
     Lineage(Lineage),
     /// Anything that went wrong and is not a conflict: an unparsable cell, a write the definitions
     /// reject, a transaction that expired. The message is the one the CLI would have printed, which
@@ -242,6 +260,22 @@ pub struct BranchInfo {
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<FieldDef>,
+}
+
+/// A branch's definitions, whole. The input to codegen (SPEC.md §15).
+///
+/// **`version` is the ClientVersion a module generated from this would carry** (SPEC.md §5.3, §5.4)
+/// — the branch's def-version, the same thing `borg def version` prints. It is deliberately part of
+/// this message rather than a second one, because a generated module's stamp has to be the version
+/// of *the schema it was generated from* and nothing else.
+///
+/// Structs come sorted by name, and each struct's fields sorted by name, so that regenerating an
+/// unchanged schema produces an unchanged file. A generator whose output reordered itself would put
+/// noise in every diff and make "did the schema move?" unanswerable by looking.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SchemaDef {
+    pub version: String,
+    pub structs: Vec<StructDef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -335,7 +369,21 @@ mod tests {
                 branch: None,
                 struct_name: "Company".into(),
             },
+            Request::DefView { branch: None },
         ]
+    }
+
+    fn struct_def() -> StructDef {
+        StructDef {
+            name: "Company".into(),
+            fields: vec![FieldDef {
+                name: "headcount".into(),
+                ty: "Int".into(),
+                derived_by: None,
+                repo: 1,
+                version: "L4".into(),
+            }],
+        }
     }
 
     fn responses() -> Vec<Response> {
@@ -360,15 +408,10 @@ mod tests {
                 branch: "b1".into(),
                 layer: "L500".into(),
             },
-            Response::Def(StructDef {
-                name: "Company".into(),
-                fields: vec![FieldDef {
-                    name: "headcount".into(),
-                    ty: "Int".into(),
-                    derived_by: None,
-                    repo: 1,
-                    version: "L4".into(),
-                }],
+            Response::Def(struct_def()),
+            Response::Defs(SchemaDef {
+                version: "L4".into(),
+                structs: vec![struct_def()],
             }),
             Response::Lineage(Lineage {
                 cell: "Company:o-1234abcd.is_investible".into(),
@@ -474,6 +517,27 @@ mod tests {
             }),
             r#"{"def_show":{"branch":null,"struct":"Company"}}"#
         );
+        assert_eq!(
+            one(&Request::DefView { branch: None }),
+            r#"{"def_view":{"branch":null}}"#
+        );
+    }
+
+    /// The version a generated module stamps itself with is a **def**-layer, in the same text form
+    /// as everything else on this wire — and it travels with the schema it describes rather than in
+    /// a message of its own, so a generator cannot pair one branch's structs with another's version
+    /// (SPEC.md §5.3, SDK-DRAFT §4.4).
+    #[test]
+    fn the_def_view_carries_the_client_version_its_schema_would_be_generated_at() {
+        let json = serde_json::to_value(Response::Defs(SchemaDef {
+            version: "L4".into(),
+            structs: vec![struct_def()],
+        }))
+        .unwrap();
+        assert_eq!(json["defs"]["version"], "L4");
+        assert!(json["defs"]["version"].is_string(), "not a JSON number");
+        assert_eq!(json["defs"]["structs"][0]["name"], "Company");
+        assert_eq!(json["defs"]["structs"][0]["fields"][0]["version"], "L4");
     }
 
     /// Everything a shell client may leave out, left out — the fields it would otherwise have to

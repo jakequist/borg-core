@@ -1,0 +1,7 @@
+{
+  // The same project, compiling `bad.ts` instead. A separate file because the scenario's claim is
+  // that this one **fails**, and a build that always fails is not a build anybody can trust to be
+  // failing for the stated reason.
+  "extends": "./tsconfig.json",
+  "include": ["gen", "bad.ts"]
+}

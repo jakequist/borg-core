@@ -1,5 +1,5 @@
 /**
- * The connection to the engine: newline-delimited JSON, in strict request/response order.
+ * The worker's connection to the engine. §17.4.
  *
  * ## Why a socket
  *
@@ -13,130 +13,25 @@
  * The stdio path is still implemented, because the transport is the engine's choice and not this
  * library's, and because a worker started by hand has no socket to connect to.
  *
- * ## Requests are serialised
- *
- * The protocol is one reply per request on one stream, so two requests in flight would read each
- * other's answers. `await Promise.all([c.get("a"), c.get("b")])` is a thing an author will write on
- * the first day, so it has to be correct rather than merely discouraged: every request queues behind
- * the last, and the concurrency simply does not buy anything.
+ * The framing itself lives in [`./lines.js`](./lines.js), because the client protocol (§17.5) is the
+ * same framing carrying a different message set.
  */
 
 import { createConnection, type Socket } from "node:net";
-import { StringDecoder } from "node:string_decoder";
-import type { Readable, Writable } from "node:stream";
+import { BorgProtocolError, LineStream, type MessageStream } from "./lines.js";
 import type { FromWorker, ToWorker } from "./protocol.js";
 
 /** The environment variable the engine names the socket in. */
 export const SOCKET_ENV = "BORG_WORKER_SOCKET";
 
-export class BorgProtocolError extends Error {
-  override readonly name = "BorgProtocolError";
-}
-
-export interface Connection {
-  /** The next message from the engine, or `null` once it has hung up. */
-  receive(): Promise<ToWorker | null>;
-  send(message: FromWorker | { codec: string }): void;
-  /** Send one request and read its reply, with nothing else able to interleave. */
-  request(message: FromWorker): Promise<ToWorker>;
-  close(): void;
-}
+export { BorgProtocolError } from "./lines.js";
 
 /**
- * A newline-delimited message stream over any duplex pair.
- *
- * The decoder is `StringDecoder` rather than `chunk.toString()` because a multi-byte character can
- * straddle two chunks, and a repo whose strings are ASCII today will not be forever.
+ * The worker half of §17.4. `{ codec: string }` is in the send type because the handshake reply is
+ * not one of the `FromWorker` variants — it is a single key `codec` and appears in no message table,
+ * which SDK-DRAFT §4.2 records as one of the things a second SDK had to reverse-engineer.
  */
-class LineConnection implements Connection {
-  #decoder = new StringDecoder("utf8");
-  #pending = "";
-  #ready: string[] = [];
-  #waiting: ((line: string | null) => void)[] = [];
-  #ended = false;
-  #turn: Promise<unknown> = Promise.resolve();
-
-  readonly #output: Writable;
-  readonly #closer: () => void;
-
-  constructor(input: Readable, output: Writable, closer: () => void) {
-    this.#output = output;
-    this.#closer = closer;
-    input.on("data", (chunk: Buffer) => this.#absorb(this.#decoder.write(chunk)));
-    input.on("end", () => this.#finish());
-    input.on("close", () => this.#finish());
-    input.on("error", () => this.#finish());
-  }
-
-  #absorb(text: string): void {
-    this.#pending += text;
-    let newline = this.#pending.indexOf("\n");
-    while (newline >= 0) {
-      const line = this.#pending.slice(0, newline).trim();
-      this.#pending = this.#pending.slice(newline + 1);
-      // Blank lines are ignored rather than fatal, matching the engine's own reader.
-      if (line.length > 0) this.#deliver(line);
-      newline = this.#pending.indexOf("\n");
-    }
-  }
-
-  #deliver(line: string): void {
-    const waiter = this.#waiting.shift();
-    if (waiter) waiter(line);
-    else this.#ready.push(line);
-  }
-
-  #finish(): void {
-    if (this.#ended) return;
-    this.#ended = true;
-    for (const waiter of this.#waiting.splice(0)) waiter(null);
-  }
-
-  #line(): Promise<string | null> {
-    const ready = this.#ready.shift();
-    if (ready !== undefined) return Promise.resolve(ready);
-    if (this.#ended) return Promise.resolve(null);
-    return new Promise((resolve) => this.#waiting.push(resolve));
-  }
-
-  async receive(): Promise<ToWorker | null> {
-    const line = await this.#line();
-    if (line === null) return null;
-    try {
-      return JSON.parse(line) as ToWorker;
-    } catch {
-      throw new BorgProtocolError(`the engine sent something that is not JSON: ${line}`);
-    }
-  }
-
-  send(message: FromWorker | { codec: string }): void {
-    this.#output.write(`${JSON.stringify(message)}\n`);
-  }
-
-  request(message: FromWorker): Promise<ToWorker> {
-    // Chained on the previous request rather than run beside it — see the header. The chain is kept
-    // whatever happens, so one rejected request does not let the next one jump the queue.
-    const turn = this.#turn.then(
-      () => this.#exchange(message),
-      () => this.#exchange(message),
-    );
-    this.#turn = turn.catch(() => undefined);
-    return turn;
-  }
-
-  async #exchange(message: FromWorker): Promise<ToWorker> {
-    this.send(message);
-    const reply = await this.receive();
-    if (reply === null) {
-      throw new BorgProtocolError("the engine hung up in the middle of an invocation");
-    }
-    return reply;
-  }
-
-  close(): void {
-    this.#closer();
-  }
-}
+export type Connection = MessageStream<ToWorker, FromWorker | { codec: string }>;
 
 /** Connect however the engine asked to be spoken to. */
 export async function connect(env: NodeJS.ProcessEnv = process.env): Promise<Connection> {
@@ -144,15 +39,26 @@ export async function connect(env: NodeJS.ProcessEnv = process.env): Promise<Con
   if (path === undefined || path === "") {
     // No socket on offer: the engine is speaking over this process's own pipes, and everything
     // written to stdout from here on is a protocol message.
-    return new LineConnection(process.stdin, process.stdout, () => process.stdin.pause());
+    return new LineStream(process.stdin, process.stdout, () => process.stdin.pause());
   }
+  const socket = await openUnixSocket(path, `${SOCKET_ENV}=${path}`);
+  return new LineStream(socket, socket, () => socket.end());
+}
+
+/**
+ * A connected unix socket, or an error naming where it was asked to connect.
+ *
+ * Shared with the client SDK: "connection refused" without an address is the least useful error a
+ * socket can produce, and both halves of this package have exactly one address to name.
+ */
+export async function openUnixSocket(path: string, what: string): Promise<Socket> {
   const socket = await new Promise<Socket>((resolve, reject) => {
     const attempt = createConnection(path);
     attempt.once("connect", () => resolve(attempt));
     attempt.once("error", (err: Error) =>
-      reject(new BorgProtocolError(`${SOCKET_ENV}=${path}: ${err.message}`)),
+      reject(new BorgProtocolError(`${what}: ${err.message}`)),
     );
   });
   socket.setNoDelay(true);
-  return new LineConnection(socket, socket, () => socket.end());
+  return socket;
 }

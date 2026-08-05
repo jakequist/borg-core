@@ -10,31 +10,11 @@
 # pipeline claims is a push-time error, and that a repo id stated twice is checked rather than
 # ignored.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SDK="$(cd "$HERE/../../packages/borg-sdk" && pwd)"
+source "$HERE/../ts-lib.sh"
 
-# `check.sh` runs everywhere, and not everywhere has a JavaScript runtime. Skipping loudly beats
-# failing: this scenario's subject is an optional toolchain, and the engine's half of it is covered
-# by `borg-exec-process`'s transport tests, which need nothing but cargo.
-skip() {
-    echo "  ⚠ SKIPPED: $1" >&2
-    echo "    230 needs node and pnpm; the socket transport itself is covered by" >&2
-    echo "    crates/borg-exec-process/tests/transport.rs, which needs neither." >&2
-    exit 0
-}
-
-command -v node >/dev/null 2>&1 || skip "node is not installed"
-command -v pnpm >/dev/null 2>&1 || skip "pnpm is not installed"
-# Running a `.ts` file directly needs the type stripping Node enabled by default in 22.18.
-node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=18)?0:1)' \
-    || skip "node $(node -v) cannot run a .ts file directly (needs 22.18+)"
-
-# Build the SDK if nothing has, or if it is older than its sources. `check.sh` normally gets here
-# first; running this scenario on its own should still work.
-if [ ! -f "$SDK/dist/index.js" ] || [ -n "$(find "$SDK/src" -newer "$SDK/dist/index.js" -print -quit)" ]; then
-    echo "  … building borg-sdk" >&2
-    (cd "$SDK" && pnpm install --silent && pnpm exec tsc -p tsconfig.build.json) \
-        || skip "borg-sdk would not build"
-fi
+need_node "230 needs node and pnpm; the socket transport itself is covered by" \
+          "crates/borg-exec-process/tests/transport.rs, which needs neither."
+build_sdk
 
 source "$HERE/../lib.sh"
 setup
@@ -43,9 +23,8 @@ setup
 # it — which is exactly what a real repo would have, and is how `import { borg } from "borg-sdk"`
 # resolves from a pipeline file.
 cp -r "$HERE/repo" "$HERE/repo-unclaimed" "$WORK/"
-mkdir -p "$WORK/repo/node_modules" "$WORK/repo-unclaimed/node_modules"
-ln -s "$SDK" "$WORK/repo/node_modules/borg-sdk"
-ln -s "$SDK" "$WORK/repo-unclaimed/node_modules/borg-sdk"
+link_sdk "$WORK/repo"
+link_sdk "$WORK/repo-unclaimed"
 
 # Counting invocations means being the one who asks, so the automation is paused and the rounds are
 # stepped by hand — exactly as 030 does.

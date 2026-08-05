@@ -1,11 +1,14 @@
 # borg-sdk
 
-Author a Borg repo in TypeScript: declare structs, write pipelines, serve them to the engine.
+Borg in TypeScript. **Two entry points, deliberately opposite:**
 
-This is the **author-side** half of the SDK story. The consumer-side client — transactions, `fork`,
-`commitAndMerge` — is a separate artifact and is not here yet. Same name, opposite directions:
-the `Company` below is the *source* of a definition, and the client's `Company` will be *generated
-from* one.
+- `borg-sdk` — the **author side**. Declare structs, write pipelines, serve them to the engine.
+- `borg-sdk/client` — the **consumer side**. Read and write through transactions over `borg serve`.
+
+Same struct name, opposite directions. The `Company` below is the *source* of a definition; a
+client's `Company` is *generated from* one by `borg generate` and carries the def-version it was
+generated at. One package because they share what matters — the value conversion table and the
+message framing — and a second package would have meant a second copy of both.
 
 ```ts
 #!/usr/bin/env node
@@ -66,8 +69,15 @@ facts, so both fail at push time rather than mid-round.
 | `bool()`      | `boolean`       | `true` / `false` |                                                   |
 | `binary()`    | `Uint8Array`    | `0xdeadbeef`     | whole octets only                                 |
 | `bigint()`    | `bigint`        | `-129n`          | reads with or without the suffix, writes with it  |
-| `ref(N)`      | `Ref`           | `@o-1234abcd`    |                                                   |
+| `ref(N)`      | `Ref`           | `@o-1234abcd`    | `Ref<"N">`, a branded string, on the client side   |
 | `list(T)`     | `Ref`           | `@l-5678wxyz`    | the handle; element access is not in v1           |
+
+**One row has two carriers**, and it is the only one. A pipeline gets a `Ref` object, whose
+`.cell(struct, field)` is how it builds the address for a `world` hop; a client gets the PID as a
+branded string, because its next move is always `tx.object(Struct, it)` and because a class cannot
+carry the target struct in its *type* — there is one `Ref` class for every struct, and the brand is
+per struct. The client's conversion is defined in terms of the pipeline's, so the wire text and the
+validation are shared: two carriers is a language question, two tables would be a contract one.
 
 Two rules that are easy to get wrong and are therefore enforced:
 
@@ -83,6 +93,53 @@ Two rules that are easy to get wrong and are therefore enforced:
 `world.get(cell)` / `world.set(cell, value)` are the random-access hops beyond the input entity, and
 are stringly in v1: a cell is its text address, a value is its text form unless you pass a field type
 to convert with (`world.get(cell, borg.int())`). Generated types slot into that second argument.
+
+## The client half: `borg-sdk/client`
+
+```ts
+import { ConflictError } from "borg-sdk/client";
+import { Company, createBorgContext } from "./borg.generated.js";  // borg generate --lang ts -o .
+
+const bc = await createBorgContext({ socket: process.env.BORG_SOCKET! });
+const tx = await bc.branch("main").begin();
+
+const c = tx.object(Company, "o-100");        // a handle; no I/O yet
+const hc = await c.get("headcount");          // read → recorded server-side → guarded at commit
+await c.set("headcount", (hc ?? 0) + 1);
+
+try {
+  await tx.commit();
+} catch (err) {
+  if (err instanceof ConflictError) console.error(`${err.cell} moved under us`);
+}
+```
+
+**Nothing is cached and nothing is retried.** Every access is a wire message, as on the author side
+and for the same reason: the engine records the read-set, and that read-set *is* the transaction's
+guard. Preloading the object would make the guard object-granular. `ConflictError` is contract, not
+an implementation detail — a rejected commit names the cell that moved, and what to do about that is
+the application's decision, so there is no `transact(fn)` retry wrapper.
+
+**`get` is the value; `resolve` is the value and its provenance.** Both are one round trip, because
+the protocol never answers a read with a bare value — `get` is discarding an envelope, not saving a
+message. Use `resolve` when you need `state` (`current` / `stale` / `broken` / …), `origin`, or which
+producer computed it. Reads outside a transaction always answer the envelope, because they buy no
+protection at commit and the envelope is the only thing telling you how much to trust them.
+
+The one place the shortcut refuses to shorten: a `broken` cell throws rather than answering `null`.
+`broken` means *no value is reachable at your version* — a value written past a schema change with no
+`down` migration, or a producer that failed — and answering `null` would turn that into "nothing was
+ever written here", which is a different fact.
+
+**Generated code is pinned to a schema.** `createBorgContext` in a generated module sends the
+def-layer it was generated at, so a client that has not been regenerated keeps writing the shape it
+knows and reads newer values back through `down` migrations. That is the point of generating rather
+than hand-writing: an un-generated client has no version to state and is read as "the schema as it
+stands", which is honest but is not the same thing.
+
+Reference fields come back as branded strings — `Ref<"Employee">` is the PID at runtime and the
+target struct to the compiler, so `tx.object(Company, employeeRef)` will not compile. Fields a
+producer owns are emitted `readonly`, so neither will a write to one.
 
 ## The socket, and why your stdout is yours
 
@@ -117,6 +174,14 @@ strips types without a build step. On older Node, compile the pipeline or write 
 compiler to *emit* something — enums, parameter properties, namespaces. Code an author might copy
 from here has to run under type stripping.
 
-**There is no nx here, and no workspace file.** Both arrive with the second TypeScript package, which
-is when a build graph starts paying for itself; one package with `tsc` and `vitest` does not need
-one. `pnpm-lock.yaml` lives in this directory for the same reason.
+**There is no nx here, and no workspace file.** Both arrive with the second TypeScript *package* —
+which the client was deliberately not made into. It shares `values.ts` and `lines.ts` with the author
+side, and splitting it out would have meant either duplicating the conversion table (two tables for
+one contract, which is the thing the Python gate exists to prevent) or standing up a workspace to
+share it. One package with `tsc` and `vitest` still does not need a build graph. `pnpm-lock.yaml`
+lives in this directory for the same reason.
+
+`test/generated/borg.generated.ts` is `borg generate`'s output for a fixture schema, checked in
+unedited: `crates/borg-cli/src/generate.rs` asserts the emitter still produces exactly it, and
+`pnpm run typecheck` asserts it is valid TypeScript. Regenerate it with
+`BORG_UPDATE_GOLDEN=1 cargo test -p borg-cli`.

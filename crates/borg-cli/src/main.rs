@@ -20,6 +20,7 @@ use ops::Ops;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod generate;
 mod ops;
 mod serve;
 mod sidecar;
@@ -65,8 +66,14 @@ struct Args {
     /// `--tx`. Which open transaction a `borg tx …` command speaks to. See [`transaction_id`].
     tx: Option<String>,
     /// `--socket`. Where `borg serve` listens, and where every other command is told to look when
-    /// the store is being served (see [`crate::serve`]).
+    /// the store is being served (see [`crate::serve`]). `borg generate` also *speaks* to it.
     socket: Option<PathBuf>,
+    /// `--lang`. Which SDK `borg generate` emits.
+    lang: String,
+    /// `-o` / `--out`. Where `borg generate` writes its module.
+    out: Option<PathBuf>,
+    /// `--watch`. See [`crate::generate`].
+    watch: bool,
     rest: Vec<String>,
 }
 
@@ -110,6 +117,8 @@ borg — an event-sourced data backend
   borg frontier reaches <layer>        wait until every producer has incorporated it
 
   borg serve --socket <path>           serve this store's client protocol on a unix socket
+  borg generate --lang ts -o <dir>     emit a typed client, pinned to this branch's def-version
+  borg generate ... --watch            and rewrite it whenever that def-version moves
 
 Cells are written Struct:pid.field, Struct:pid, Element[]:pid or Element[]:pid[n], where a pid
 looks like o-1234abcd and names the whole identity. Struct#100 is accepted on input as a
@@ -161,6 +170,15 @@ disconnects can reconnect and name the same handle, and one that never comes bac
 other idle transaction. **One process serves a store**: while a store is served, every other borg
 invocation against it is refused and told the socket to speak to.
 
+`borg generate` writes the other half: a TypeScript module holding an interface and a runtime
+descriptor per struct, and a `createBorgContext` with **this branch's def-version baked in as the
+client's ClientVersion**. That stamp is the point. borg itself has no generated code and so is
+authored anew on every invocation, but a generated client was authored once, and keeping working
+after the schema moves on is what `down` migrations are for (§5.4). Regenerating is how you adopt a
+new schema; not regenerating is supported. Generation reads through the socket when the store is
+being served and opens the store directly when it is not, because a served store would otherwise
+have to be stopped to generate against it.
+
 A paused branch needs no special vocabulary: its frontier stops advancing, and every read of derived
 data already reports how far behind it is. `borg derive` still works while paused — that is what
 makes pausing useful in an emergency.
@@ -185,7 +203,10 @@ Options:
   --settled                 read at the settled frontier, not at the ragged head
   --timeout <seconds>       how long `frontier reaches` waits (default 0)
   --tx <id>                 which open transaction to speak to (or $BORG_TX)
-  --socket <path>           `serve`: the unix socket to listen on
+  --socket <path>           `serve`: the socket to listen on; `generate`: the one to read through
+  --lang <name>             `generate`: which SDK to emit (ts)
+  -o, --out <dir>           `generate`: where to write the module
+  --watch                   `generate`: rewrite it whenever the def-version moves
   --value                   print only the value
   --quiet                   `derive`: print the bare invocation count, without the prose
   --outstanding             `derive`: report pending work as a query, deriving nothing
@@ -212,6 +233,9 @@ fn parse_args() -> Args {
         timeout: 0,
         tx: None,
         socket: None,
+        lang: "ts".to_string(),
+        out: None,
+        watch: false,
         rest: Vec::new(),
     };
     let mut raw = std::env::args().skip(1);
@@ -223,6 +247,9 @@ fn parse_args() -> Args {
             "--freshness" => args.ops.freshness = freshness(raw.next().as_deref()),
             "--settled" => args.ops.settled = true,
             "--socket" => args.socket = raw.next().map(PathBuf::from),
+            "--lang" => args.lang = raw.next().unwrap_or_else(|| usage()),
+            "-o" | "--out" => args.out = raw.next().map(PathBuf::from),
+            "--watch" => args.watch = true,
             "--timeout" => {
                 args.timeout = raw
                     .next()
@@ -274,14 +301,22 @@ async fn run(args: Args) -> Result<()> {
     // safe, and they were not before `borg serve` either — what serve changes is that the second
     // process is now likely rather than hypothetical. So a served store refuses everyone else by
     // name, and says where the socket is (see `crate::serve`).
-    if verb != "serve" {
+    //
+    // `generate` is the one exception, and it is not an exemption: it does not open a served store
+    // either, it *connects to the socket* instead. That is SDK-DRAFT §2.6's remote-connection future
+    // arriving for exactly one read-only command — see `crate::generate` for why it stops there.
+    if verb != "serve" && verb != "generate" {
         serve::refuse_if_served(&args.ops)?;
     }
 
     // Reaping sweeps **opportunistically, when a process opens the store** — the same place the
     // indexes are already rebuilt — so there is no daemon, and an idle store sweeps nothing because
-    // nothing is growing (SPEC.md §12).
-    ops::reap_transactions(&args.ops)?;
+    // nothing is growing (SPEC.md §12). Not for `generate`, which may not be touching this store's
+    // files at all: sweeping a served store's transaction table from a second process is exactly the
+    // thing the lock exists to prevent.
+    if verb != "generate" {
+        ops::reap_transactions(&args.ops)?;
+    }
 
     match (verb, rest.as_slice()) {
         ("init", _) => init(&args).await,
@@ -314,6 +349,19 @@ async fn run(args: Args) -> Result<()> {
         ("derive", _) => derive(&args).await,
         ("frontier", ["reaches", layer]) => frontier_reaches(&args, layer).await,
         ("frontier", _) => frontier(&args).await,
+        ("generate", _) => {
+            let out = args.out.clone().unwrap_or_else(|| usage());
+            generate::run(
+                &args.ops,
+                &generate::Generate {
+                    lang: args.lang.clone(),
+                    out,
+                    watch: args.watch,
+                    socket: args.socket.clone(),
+                },
+            )
+            .await
+        }
         _ => usage(),
     }
 }

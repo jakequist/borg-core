@@ -1,7 +1,7 @@
 {
   "name": "borg-sdk",
   "version": "0.1.0",
-  "description": "Author Borg repos in TypeScript: structs, pipelines, and the worker protocol.",
+  "description": "Borg in TypeScript: the author-side DSL, and the client generated code is built on.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -11,6 +11,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
     }
   },
   "files": [

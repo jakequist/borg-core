@@ -1603,22 +1603,33 @@ have written, which is not a set anything can enumerate.
 
 ## 15. Code Generation
 
-**Generated SDKs are deferred out of v1.** A generated client needs a transport to reach the engine,
-and v1 has no network layer — building one competes directly with building the engine.
+Generated SDKs were deferred out of v1 because a generated client needs a transport to reach the
+engine, and building one competed directly with building the engine. **They arrived with §17.5**, as
+that deferral said they would: `borg generate --lang ts -o <dir>` emits one module per branch.
 
-When SDKs arrive they will come with a socket/network layer, and the generation contract is:
+The generation contract, now realised:
 
-- Generated from the registry's defs at a chosen layer; that layer becomes the client's ClientVersion.
-- Derived fields are known statically now that ownership is declared (§8), so a generator can mark
-  them read-only. v1 emits everything as writable and lets the runtime rejection do the work; the
-  static marking is deferred with the SDKs themselves.
-- Reads return the provenance envelope of §10.4.
+- **Generated from the branch's def view at a layer, and that layer becomes the client's
+  ClientVersion.** It is baked into the module and sent in the handshake (§5.4, §17.5), which is what
+  makes an old generated client a first-class actor rather than a stale one: it keeps writing the
+  shape it knows and keeps reading through `down` migrations. Regenerating is how a schema change is
+  adopted; not regenerating is a supported state. Generation reads the def view through the socket
+  when the store is served and opens the store when it is not, because §17.5's advisory lock would
+  otherwise make "stop the server to regenerate" a workflow.
+- **Derived fields are marked read-only.** Ownership is declared (§8), so it is a static fact, and
+  the earlier plan to emit everything as writable and lean on the runtime rejection was explicitly
+  deferred "with the SDKs themselves" — this is them.
+- **Reads return the provenance envelope of §10.4.** A generated handle offers both the value and the
+  envelope; the value-shaped shortcut refuses a `broken` cell rather than answering `null`, because
+  §9.3 forbids substituting "there is nothing here" for "there is no path to a value from your
+  version".
 - TypeScript first, then Python, Rust, Go.
 
-**The v1 constraint that makes this possible later:** every engine operation must have a
-**serializable command/response form** — no callbacks, no borrowed references escaping the API
-surface, no in-process-only affordances. This is nearly free now and expensive to retrofit; it is the
-difference between "add a transport" and "redesign the API."
+**The v1 constraint that made this possible:** every engine operation has a **serializable
+command/response form** — no callbacks, no borrowed references escaping the API surface, no
+in-process-only affordances. It was nearly free at the time and would have been expensive to
+retrofit; it was the difference between "add a transport" and "redesign the API", and §17.5 was
+indeed only a transport.
 
 ---
 
@@ -2330,6 +2341,15 @@ operations are the ones the CLI already has: `tx_begin`, `tx_get`, `tx_set`, `tx
 coincidence: the CLI is the testbed for what a client is like to use, so a protocol needing an
 operation the CLI lacks would be evidence about the CLI.
 
+One message is not a lifted subcommand, and it is worth saying why. **`def_view` returns a branch's
+whole def view and the def-version it was read at**, which is what codegen reads (§15). Neither half
+could be composed from the rest: `def_show` answers about a struct you can already name, and a
+generator's whole job is to not know the names in advance; and the version a generated module stamps
+itself with is the branch's *def*-version, which is not `branch_head` — head moves on every data
+write and a def-version moves only on a def push (§5.3). They travel together in one message because
+they are one read: taken separately, a generator could be handed a schema and a version from either
+side of a push.
+
 **Everything travels as canonical text**, layer ids included — `"L120"`, the form §10.4's envelope is
 printed in. A `by` is a `ProducerId`, which is a hash spanning the whole `u64` range, and JSON has no
 integers; the same rounding that corrupts a producer id in a sidecar file would corrupt it here.
@@ -2392,8 +2412,11 @@ destination is the CLI connecting to the socket rather than being turned away by
 - `Set`, `Map`
 - Aggregation pipelines
 - Mid-list insertion
-- **All generated SDKs** (§15) — they arrive with the network layer
-- Network / server layer — v1 is a library exercised by Rust tests
+- ~~**All generated SDKs** (§15) — they arrive with the network layer~~ — and they did: `borg serve`
+  (§17.5) is that layer, and `borg generate --lang ts` is the generator. TypeScript only; Python,
+  Rust and Go remain out.
+- ~~Network / server layer — v1 is a library exercised by Rust tests~~ — §17.5. A **local** unix
+  socket, with one process serving a store; actual distribution is still out.
 - Actual distribution — only the seams (§17.2)
 - `O(1)` merge — a parent layer referencing a child's event set rather than enumerating it (§13)
 - `down`-migration validation

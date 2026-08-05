@@ -258,6 +258,26 @@ pub async fn def_show(args: &Ops, name: &str) -> Result<ObjectDef> {
         .ok_or_else(|| BorgError::Storage(format!("no struct named `{name}`")))
 }
 
+/// A branch's definitions, whole, and the def-version they were read at. What codegen reads
+/// (SPEC.md §15, SDK-DRAFT §4.4).
+///
+/// **Both facts from one open**, which is the reason this is not `def_show` in a loop beside
+/// `def_version`. A generated module stamps itself with the version of the schema it was generated
+/// from; taking the two separately would let a def push land in between and produce a module whose
+/// stamp names a schema it does not contain.
+///
+/// Sorted here rather than by the caller, so that `borg generate` and the socket answer in the same
+/// order and a regenerated file is byte-identical when nothing moved.
+pub async fn def_view(args: &Ops) -> Result<(LayerId, Vec<ObjectDef>)> {
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let path = registry.branches.read_path(branch, None)?;
+    let view = registry.defs.view(&path).await?;
+    let mut structs: Vec<ObjectDef> = view.objects().cloned().collect();
+    structs.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((registry.defs.head(&path), structs))
+}
+
 /// The def-version in force on a branch — the ClientVersion a client generated right now would carry
 /// (SPEC.md §5.3, §5.4). A def-version *is* a layer id; there is no separate scheme.
 pub async fn def_version(args: &Ops) -> Result<LayerId> {

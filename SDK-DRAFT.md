@@ -93,16 +93,20 @@ invocations. One artifact, two modes — matching the bash worker's shape.
 ### Client (consumer-side)
 
 ```ts
-const bc = createBorgContext({ socket: process.env.BORG_SOCKET });  // version baked in by codegen
+const bc = await createBorgContext({ socket: process.env.BORG_SOCKET });  // version baked in by codegen
 
 const tx = await bc.branch("main").begin();
 const c = tx.object(Company, "o-100");          // a handle; no I/O yet
 const hc = await c.get("headcount");            // read → recorded → guard
+const seen = await c.resolve("headcount");      // the same read, with its §10.4 envelope
 await c.set("headcount", 400);                  // write, isolated on the tx branch
 await tx.commit();                              // merge; throws ConflictError on a tripped guard
 ```
 
 `ConflictError` is contract; the auto-retrying `bc.transact(fn)` wrapper is later sugar.
+
+*As built*, `createBorgContext` is awaited — it connects and handshakes, and an error at construction
+is better than one at first use. The `resolve` line is §4.4's envelope split.
 
 ## 4. Build order and acceptance scenarios (numbering continues from 220)
 
@@ -246,8 +250,11 @@ await tx.commit();                              // merge; throws ConflictError o
      serialised, because the ops layer opens and drops registries around derivation; holding one
      open is a change to derivation's lifecycle and is the next real server's first job.
 
-   The TS client SDK and the WebSocket listener are **not** built. The transport trait
-   (`serve::Transport` / `serve::Peer`) is the seam the latter slots into, per §5.
+   **Client half now built too** — `packages/borg-sdk/src/client.ts`, exported as `borg-sdk/client`,
+   with **scenario 260** driving it against a real server. The WebSocket listener is still not built;
+   the transport trait (`serve::Transport` / `serve::Peer`) is the seam it slots into, per §5. What
+   the client build settled is in §4.4, because everything interesting about it turned out to be a
+   codegen question wearing a client's clothes.
 
    **`def push` and `repo push` are not on the socket, and that leaves a gap worth naming.** Both
    read from a *filesystem* — a JSON file, a directory of pipeline scripts — and `repo push` writes
@@ -259,18 +266,97 @@ await tx.commit();                              // merge; throws ConflictError o
    same question as `ExecutionProvider`'s container future (§17.3) and should not be pre-empted by
    adding a `def_push` message that only works when the client and the server share a disk.
 4. **Codegen** — `borg generate --lang ts -o ...` emitting typed structs + `createBorgContext` with
-   the ClientVersion stamp; `--watch`. **Scenario 260**: generate, compile a client against it,
-   def-push a migration, regenerate, old-versioned client still reads through `down` (the SDK twin
-   of scenario 080's second half).
+   the ClientVersion stamp; `--watch`. **Built.** `crates/borg-cli/src/generate.rs`, **scenario 260**
+   (generate, compile, run — including a deliberately wrong program that must *fail* to compile) and
+   **scenario 270**, which is scenario 080's second half arriving in the SDK: generate at v1, push a
+   migration, regenerate to v2, and the v1-generated client — unchanged, unrecompiled — still reads
+   dates while the v2 one sees years.
+
+   ### What the two builds settled
+
+   - **The value carrier is one table; the *shape* of a struct is not.** Client conversions are the
+     same `values.ts` a pipeline uses, and where a client wants a different carrier it is defined in
+     terms of the shared one rather than beside it (`refText` is `ref` with the wrapper taken off).
+     One entry in that table is per-language ergonomics — see the ref decision below — and none of it
+     is protocol.
+   - **`get` is the value and `resolve` is the value with its §10.4 envelope, at one round trip
+     either way.** §17.5 never answers a read with a bare value, so `get` discards an envelope rather
+     than saving a message, and it is defined as `resolve().value` so there is literally one read
+     path. This is the split the CLI already has — `borg get --value` against the full print — and it
+     is the same split for the same reason: an envelope in the middle of arithmetic is a tax on the
+     common case, where the state is `current` and always will be.
+
+     **With one exception, and it is the interesting one.** A `broken` read is not "no value"; it is
+     *no value reachable from this version, for a reason* (§9.3, §14). Returning `null` for it would
+     collapse it into "nothing was ever written here", which is the exact substitution §9.3 forbids
+     the engine from making — so `get` throws `BorgStateError` carrying the envelope, and `resolve`
+     returns it labelled. `stale` and `unvalidated` do not throw: those are real values that are
+     merely behind, which is what the freshness mode asked for.
+   - **A reference reaches a client as a branded string, not as the pipeline SDK's `Ref` object.**
+     This answers §5's open question, and the reasoning is that the two sides do different things
+     with a reference. A pipeline's next move is `world.get(ref.cell("Employee", "name"))`, so an
+     object with a `.cell()` on it earns its keep. A client's next move is always
+     `tx.object(Employee, it)`, so an object would exist only to be unwrapped — and, decisively, a
+     class cannot carry the *target struct* in its type, because there is one `Ref` class for every
+     struct. `Ref<"Employee">` can, which is what makes `tx.object(Company, employeeRef)` a compile
+     error. A list field yields `Ref<"Employee[]">`: its value is the handle to the list and not the
+     elements (§4.2), so element access is still deferred with the rest of the list story.
+   - **Derived fields are emitted `readonly`, which SPEC §15 had deferred "with the SDKs
+     themselves".** These are the SDKs themselves. One word in the generated interface plus a
+     `WritableKeys` mapped type in the SDK turns a client write to a producer-owned field into a
+     compile error, and the generated file stays readable — which matters, because it is the first
+     Borg code a user reads.
+   - **`borg generate` reads through the socket when the store is served and opens the store when it
+     is not**, decided per read rather than by a flag, and it says which it did. A served store
+     refuses every other invocation (§17.5), so a generator that could only open a file would fail
+     exactly when a developer is most likely to run it. This is §2.6's remote-connection future
+     arriving for one read-only command, and deliberately not for the write path: `generate` needs
+     none of the answers the general case needs about transactions or about who owns a write. 260
+     asserts the two paths emit a byte-identical module.
+   - **One message was added to §17.5, and neither half of it could be composed.** `def_show` answers
+     about a struct you can already name and codegen's whole job is to not know the names; and the
+     stamp a module needs is the branch's *def*-version, which is not `branch_head` — head moves on
+     every `borg set`. So `def_view` returns both, in one round trip, because they are one read: a
+     generator that took them separately could be handed a schema and a version from either side of a
+     push. `DefView::objects()` in the engine is the one supporting addition.
+
+   ### Where the protocol pinched
+
+   Both are reported rather than worked around, and neither is a hack in the code.
+
+   - **There is no server push, so `--watch` polls.** §17.5 is one request, one response, in order,
+     with no correlation ids because there is nothing to correlate; a notification would be a change
+     of shape and not a field. The loop polls the def view, which is at least the *right* thing to
+     poll — head would rewrite the file on every data write. It is cheap and it is honest, and it is
+     the first thing a subscription would replace.
+   - **A rejected handshake is answered and then hung up on, and whether the client sees the answer
+     is a race.** `serve::session` sends the error and returns, which closes the socket; a client that
+     writes its first request before reading gets an EPIPE that discards the very answer it was
+     racing. The server never acknowledges an *accepted* handshake either — it has nothing to say — so
+     a client cannot distinguish "accepted" from "not answered yet" except by asking something. The
+     fix is a lingering close on the server (write, shut down the write half, drain), which is work in
+     `Peer` and not in the SDK.
 5. **Sugar** (unscheduled): sync-over-async pipelines, `transact` retry, ownership inference,
-   `hasMany` (blocked on aggregations).
+   `hasMany` (blocked on aggregations). Nothing in §4 is now unbuilt except the WebSocket listener,
+   which §5 has always said lands with the browser client rather than with the transport trait.
 
 ## 5. Open questions carried
 
 - WebSocket server: in `borg serve` from day one or when the browser client lands? (Lean: the
   transport trait supports it from day one; the actual HTTP listener lands with the browser work.)
-- Codegen for list/ref fields: how a `Ref` renders in a typed client (a typed handle, presumably —
-  `c.get("employees")` yielding refs the client can `tx.object(...)` through).
+- **How far does the CLI-over-socket wedge go?** `borg generate` now connects to the socket rather
+  than being refused by it (§4.4), which is the first instance of §2.6's eventual shape. It was safe
+  because generate only reads. The next candidates are `borg get` and `borg explain`, which are also
+  pure reads and would remove most of the annoyance of a served store — but the moment a *write*
+  command goes this way, `--tx` / `$BORG_TX` / only-one-open have to mean something over a socket,
+  and §4.3 already records that they cannot. So the honest boundary may be "reads connect, writes are
+  refused", which is a strange thing to have to explain, or the answer may be that the whole CLI
+  becomes a client and the shell affordances become client-side state. Not decided.
+- ~~Codegen for list/ref fields: how a `Ref` renders in a typed client.~~ **Answered by the build**:
+  a branded string, `Ref<"Employee">`, which is the PID at runtime and the target struct to the
+  compiler. Not a handle and not the pipeline SDK's `Ref` object — §4.4 has the reasoning. What is
+  *still* open is the element half: a list field yields the handle to the list, and addressing
+  `Employee[]:l-….[3]` through a generated type waits on the rest of the list story (§18).
 - Whether `world` (pipeline random access) takes generated types or stays stringly in v1. **Partly
   answered by the build**: it is stringly, with an optional second argument taking the same
   `FieldType` the DSL already produces (`world.get(cell, borg.int())`). That is where a generated

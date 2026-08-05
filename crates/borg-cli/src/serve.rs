@@ -50,7 +50,7 @@ use crate::sidecar::{self, Sidecar};
 use borg_core::{BorgError, MergeRejection, Result};
 use borg_protocol::client::{
     BranchInfo, ClientHello, Envelope, FieldDef, Lineage, LineageInput, Request, Response,
-    StructDef,
+    SchemaDef, StructDef,
 };
 use borg_protocol::{Codec, ProtocolError, ServerHello, negotiate};
 use std::io::BufReader;
@@ -107,26 +107,41 @@ impl Drop for Lock {
     }
 }
 
-/// Refuse to touch a store somebody is serving, and say where to find them.
+/// The socket a live server is answering this store on, if there is one.
 ///
-/// Called by every command except `serve` itself. A stale record — one whose socket does not answer
-/// — is cleared here rather than reported, because a lock nobody holds is not information.
-pub fn refuse_if_served(args: &Ops) -> Result<()> {
-    let record: Serving = sidecar::load(&args.store);
+/// A stale record — one whose socket does not answer — is cleared here rather than reported, because
+/// a lock nobody holds is not information.
+///
+/// **Two callers, and they do opposite things with the answer**, which is the point of it being a
+/// question rather than a refusal. Every ordinary command turns it into [`refuse_if_served`]; `borg
+/// generate` turns it into a *connection*, because it only reads and the socket is the one way to
+/// read a served store. That is the remote-connection future of SDK-DRAFT §2.6 arriving for exactly
+/// one read-only command, and deliberately not for the write path.
+pub fn served_on(store: &Path) -> Option<(PathBuf, u32)> {
+    let record: Serving = sidecar::load(store);
     if record.socket.is_empty() {
-        return Ok(());
+        return None;
     }
     let socket = PathBuf::from(&record.socket);
     if !is_listening(&socket) {
-        let _ = std::fs::remove_file(sidecar::path::<Serving>(&args.store));
-        return Ok(());
+        let _ = std::fs::remove_file(sidecar::path::<Serving>(store));
+        return None;
     }
+    Some((socket, record.pid))
+}
+
+/// Refuse to touch a store somebody is serving, and say where to find them.
+///
+/// Called by every command except `serve` and `generate`. See [`served_on`].
+pub fn refuse_if_served(args: &Ops) -> Result<()> {
+    let Some((socket, pid)) = served_on(&args.store) else {
+        return Ok(());
+    };
     Err(BorgError::Storage(format!(
-        "{} is being served on {} (pid {}) — one process serves a store, so this command would be \
-         the second writer. Speak to the socket, or stop the server.",
+        "{} is being served on {} (pid {pid}) — one process serves a store, so this command would \
+         be the second writer. Speak to the socket, or stop the server.",
         args.store.display(),
-        record.socket,
-        record.pid
+        socket.display(),
     )))
 }
 
@@ -528,25 +543,41 @@ async fn answer(base: &Ops, request: Request) -> Response {
             struct_name,
         } => ops::def_show(&base.on(branch), &struct_name)
             .await
-            .map(|object| {
-                Response::Def(StructDef {
-                    name: object.name.to_string(),
-                    fields: object
-                        .fields
-                        .values()
-                        .map(|def| FieldDef {
-                            name: def.name.to_string(),
-                            ty: def.ty.to_string(),
-                            // By id, because an id is all the log holds — only the implementation
-                            // table knows what a human called it (§9.2).
-                            derived_by: def.ownership.producer().map(|p| p.to_string()),
-                            repo: def.declaring_repo.0,
-                            version: def.version.to_string(),
-                        })
-                        .collect(),
+            .map(|object| Response::Def(struct_def(&object)))
+            .unwrap_or_else(failed),
+
+        Request::DefView { branch } => ops::def_view(&base.on(branch))
+            .await
+            .map(|(version, structs)| {
+                Response::Defs(SchemaDef {
+                    version: version.to_string(),
+                    structs: structs.iter().map(struct_def).collect(),
                 })
             })
             .unwrap_or_else(failed),
+    }
+}
+
+/// A struct definition as the wire carries it. One renderer for [`Request::DefShow`],
+/// [`Request::DefView`] and `borg generate`'s direct-store path, because a struct is a struct — and
+/// codegen reading a different shape depending on whether it went through a socket would be the one
+/// bug that only shows up on a served store.
+pub fn struct_def(object: &borg_core::ObjectDef) -> StructDef {
+    StructDef {
+        name: object.name.to_string(),
+        fields: object
+            .fields
+            .values()
+            .map(|def| FieldDef {
+                name: def.name.to_string(),
+                ty: def.ty.to_string(),
+                // By id, because an id is all the log holds — only the implementation table knows
+                // what a human called it (§9.2).
+                derived_by: def.ownership.producer().map(|p| p.to_string()),
+                repo: def.declaring_repo.0,
+                version: def.version.to_string(),
+            })
+            .collect(),
     }
 }
 

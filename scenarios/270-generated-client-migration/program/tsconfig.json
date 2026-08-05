@@ -1,0 +1,24 @@
+{
+  // Both generated modules and both clients, compiled together. That is the point: `gen/v1` and
+  // `gen/v2` are two modules generated from the same branch at two def-versions, and each client
+  // annotates `founded` with the type its own module declares. If the two modules were the same
+  // shape, one of these two files would not compile.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["gen", "client-v1.ts", "client-v2.ts"]
+}

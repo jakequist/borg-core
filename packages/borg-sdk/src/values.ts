@@ -258,6 +258,51 @@ export function list<T>(element: FieldType<T>): FieldType<Ref> {
   return make(`${element.wireType}[]`, reference.decode, reference.encode);
 }
 
+/**
+ * A field declared `Any`. Its text is its value, because nothing declared it a shape.
+ *
+ * Exists so that codegen has an honest answer for a field the schema left open, rather than either
+ * refusing to emit the struct or guessing a type. `~` is still refused on the way in, for the same
+ * reason [`string`] refuses it: it is the tombstone form on every field, so a write of those two
+ * characters would not read back.
+ */
+export function untyped(): FieldType<string> {
+  const inner = string();
+  return make("Any", inner.decode, inner.encode);
+}
+
+/**
+ * A reference as a **client** holds it: the PID itself, branded with the struct it points at.
+ *
+ * `RefText<"Employee">` is a `string` at runtime and an `Employee` reference to the compiler, which
+ * is what makes `tx.object(Company, employeeRef)` a compile error. SDK-DRAFT §5 records why the
+ * client gets a branded string where a pipeline gets a [`Ref`]: a client's next move with a
+ * reference is always `tx.object(Struct, it)`, so an object wrapper would exist only to be
+ * unwrapped, and the wrapper cannot carry the *target struct* in its type — a `Ref` is one class for
+ * every struct, and the brand is per struct.
+ */
+export type RefText<S extends string = string> = string & { readonly __struct: S };
+
+/**
+ * The client-side carrier for a reference field, **defined in terms of [`ref`]** rather than beside
+ * it. Same wire text, same validation, same error messages; only what lands in the caller's hands
+ * differs. Two carriers for one type is a language question; two conversion tables would be a
+ * contract question, and this SDK has one table.
+ */
+export function refText<S extends string>(struct: S): FieldType<RefText<S>> {
+  const wire = ref(struct);
+  return make(
+    struct,
+    (text) => wire.decode(text).pid as RefText<S>,
+    (value) => {
+      if (typeof value !== "string") {
+        return fail(`a ${struct} field takes a reference, not ${describeJs(value)}`);
+      }
+      return wire.encode(new Ref(value));
+    },
+  );
+}
+
 /** What the caller actually passed, for an error message that saves a debugging session. */
 function describeJs(value: unknown): string {
   if (value === null) return "null (pass null through set() to delete the cell)";
