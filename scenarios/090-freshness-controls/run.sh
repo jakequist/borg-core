@@ -78,7 +78,7 @@ assert_fails "computing one cell inline does not claim the producer has caught u
 
 # --- `borg derive` still works while paused ---------------------------------------------------------
 
-assert_eq "$(borg derive --count)" "1" \
+assert_derives 1 \
     "pause means do not auto-derive, not refuse to derive: the round still runs when asked"
 assert_contains "$(borg frontier reaches "$stale_at")" "reached" \
     "and a round, unlike an inline computation, does advance the frontier"

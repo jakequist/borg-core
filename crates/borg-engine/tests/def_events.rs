@@ -174,6 +174,58 @@ async fn a_repo_may_not_mutate_a_field_it_did_not_declare() -> Result<()> {
 }
 
 #[tokio::test]
+async fn a_migration_may_not_be_appointed_for_a_field_a_producer_owns() -> Result<()> {
+    let h = Harness::new();
+    let main = h.branches.create_root(None).await?;
+
+    h.push(
+        main,
+        vec![DefEvent::DeclareField {
+            struct_name: "Company".into(),
+            field: "tier".into(),
+            ty: ValueType::Int,
+            repo: SALES,
+            ownership: Ownership::Derived(ProducerId(7)),
+        }],
+    )
+    .await?;
+
+    let outcome = h
+        .push(
+            main,
+            vec![DefEvent::MutateField {
+                struct_name: "Company".into(),
+                field: "tier".into(),
+                ty: ValueType::String,
+                repo: SALES,
+                up: ProducerId(50),
+                down: None,
+            }],
+        )
+        .await;
+
+    // The point is *when* and *why*, not merely that it fails. Before this, the push was accepted
+    // and P50 was appointed to write a field P7 owns — a contradiction that surfaced later as an
+    // ownership violation from whichever round happened to run the migration.
+    let Err(err) = outcome else {
+        panic!("a producer owns `Company.tier`, so nothing can be appointed to migrate it");
+    };
+    let said = err.to_string();
+    assert!(
+        said.contains("derived by P7"),
+        "the rejection names the producer whose field it is, so the push can be fixed: {said}"
+    );
+
+    // And the definitions are untouched: a rejected push leaves nothing behind.
+    assert_eq!(
+        h.field_type(main, "Company", "tier").await?,
+        Some(ValueType::Int),
+        "a rejected def push does not move the field it was rejected over"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_def_pushed_on_a_child_is_invisible_to_the_parent() -> Result<()> {
     let h = Harness::new();
     let main = h.branches.create_root(None).await?;

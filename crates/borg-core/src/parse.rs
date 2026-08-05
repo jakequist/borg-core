@@ -420,19 +420,6 @@ pub fn render_interned(pid: &Pid, bytes: &[u8]) -> String {
     }
 }
 
-/// A struct name parsed out of a cell address, for commands that name a type rather than a cell.
-pub fn buffer_of(cell: &CellRef) -> &BufferId {
-    &cell.buffer
-}
-
-/// The element index of a list cell, if it has one.
-pub const fn index_of(cell: &CellRef) -> Option<u64> {
-    match cell.key {
-        CellKey::Elem(_, index) => Some(index),
-        CellKey::Pid(_) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -323,7 +323,8 @@ async fn two_producers_writing_sibling_fields_of_one_object_both_land() -> Resul
     Ok(())
 }
 
-/// The interleaving the ceiling is most exposed to, constructed rather than waited for.
+/// The interleaving that motivated rounds-as-transactions (a client landing mid-round),
+/// constructed rather than waited for. Under the fork model it must be unobservable.
 ///
 /// The upstream producer refuses to commit until the downstream has read the cell it is about to
 /// write, so the downstream reads an absent input on *every* run rather than on some of them. The
@@ -506,7 +507,8 @@ async fn a_migration_pair_running_together_does_not_overwrite_its_own_input() ->
     Ok(())
 }
 
-/// A client writing while a round settles is the case the round's ceiling is exposed to.
+/// A client writing while a round settles: under the fork model the write is above the round's
+/// fork point and simply not in its read path (§16.5).
 ///
 /// §16.5's ceiling is *"the highest layer that is either ≤ L, or is a derived layer with
 /// `reflects == L`"*, and a `ReadPath` bound can only express a prefix of that — so a source layer

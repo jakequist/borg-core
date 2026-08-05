@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# **S13 — a migration and a concurrent client write.** SPEC-DRAFT §9, SPEC.md §9.3, §12, §16.5.
+# **S13 — a migration and a concurrent client write.** `ROADMAP.md`, *Acceptance scenarios*;
+# SPEC.md §9.3, §12, §16.5.
 #
 # Migrations work (`080-migration`). Concurrency works (`140`, `160`). They had never met, and this
 # is the pair that broke: a migration is the **only** producer whose output shares a `CellRef` with a
@@ -86,7 +87,7 @@ assert_eq "$(borg get 'Company#1.founded' --value --client-version "$v1")" "1998
 # The dropped invocation is not lost work — its edges were recorded on the trunk when it ran, and the
 # layer that failed its guard is a source layer some later round settles. That round has already run
 # here, which is why nothing is outstanding.
-assert_eq "$(borg derive --count)" "0" \
+assert_derives 0 \
     "the rejected round cost a re-run, not the value: nothing is left outstanding"
 
 # --- 2. a migration's merge landing under an open transaction is not a conflict --------------------
@@ -138,4 +139,4 @@ assert_eq "$(borg get 'Company#3.rating' --value)" "" \
 borg derive >/dev/null
 assert_eq "$(borg get 'Company#3.founded' --value)" "1981" \
     "and the write that won is migrated like any other"
-assert_eq "$(borg derive --count)" "0" "with nothing outstanding behind it"
+assert_derives 0 "with nothing outstanding behind it"

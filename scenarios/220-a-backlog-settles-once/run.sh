@@ -68,7 +68,7 @@ reflected="$(printf '%s\n' "$layers" | sed -n 's/.*reflects \(L[0-9]*\).*/\1/p' 
 assert_eq "$reflected" "$top" \
     "both reflecting the top of the range ($top), which is the layer their watermark now names"
 
-assert_eq "$(borg derive --count)" "0" \
+assert_derives 0 \
     "and the branch settles rather than chasing the derived layers it just merged"
 
 # --- a fourth write is an ordinary round ------------------------------------------------------------

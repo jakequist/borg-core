@@ -58,7 +58,11 @@ impl LayerHandle {
 
     /// Append a def mutation. A layer holds value events *xor* def events (SPEC.md §6.2), so a
     /// layer taking these takes no cells.
-    pub async fn put_def(&mut self, event: borg_core::DefEvent) -> Result<()> {
+    /// `pub(crate)` for the same reason `put` is: value writes have exactly one door
+    /// (`WriteSession`), and def events must have exactly one too (`DefRegistry::push`, which
+    /// validates the fold before anything commits). A public method here would let anyone holding
+    /// `Registry.layers` append def events that no collision or ownership check ever saw.
+    pub(crate) async fn put_def(&mut self, event: borg_core::DefEvent) -> Result<()> {
         if self.layer.kind != LayerKind::Value {
             return self.open.put_def(event).await;
         }
@@ -238,7 +242,8 @@ impl LayerManager {
     /// rather than making the commit illegal — refusing to commit a transaction because it looked at
     /// derived data would be a strange reward for looking. It could not trip anyway: the touch index
     /// records source layers only (§12), so a derived cell is never in it, and asking the question
-    /// costs a storage read per cell per version on a set §7.7 says is unbounded.
+    /// costs a storage read per cell per version on a set that is unbounded (ROADMAP.md, open
+    /// questions).
     ///
     /// `GuardOnDerivedCell` therefore stays what it always was — the answer to a client *writing* a
     /// guard by hand on a cell it cannot usefully guard.

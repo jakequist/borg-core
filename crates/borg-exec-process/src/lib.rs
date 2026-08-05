@@ -46,7 +46,7 @@
 
 use async_trait::async_trait;
 use borg_core::{AllocatorId, BorgError, BranchId, Pid, Result, parse};
-use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
+use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef, ValueCodec};
 use borg_protocol::{
     Codec, Description, FromWorker, ServerHello, ToWorker, VERSION, WorkerHello, negotiate,
     read_message, write_message,
@@ -353,12 +353,15 @@ impl ExecutionProvider for ProcessExecutor {
 }
 
 /// A cell value as the text a worker reads. Interning stays the engine's business (§3.4).
+///
+/// Takes the **codec** and not the whole context, because rendering is all it does: nothing here can
+/// reach a cell, and so nothing here can record a dependency the worker did not ask for.
 async fn render(
-    ctx: &mut dyn ProducerCtx,
+    codec: &mut dyn ValueCodec,
     value: Option<borg_core::Value>,
 ) -> Result<Option<String>> {
     match value {
-        Some(value) => Ok(Some(ctx.render(&value).await?)),
+        Some(value) => Ok(Some(codec.render(&value).await?)),
         None => Ok(None),
     }
 }

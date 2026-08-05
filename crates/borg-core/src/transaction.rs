@@ -97,7 +97,7 @@ impl Transaction {
     }
 
     /// How many reads and writes this transaction is carrying. For `borg tx list` and for the
-    /// operator asking why a commit is expensive (§7.7).
+    /// operator asking why a commit is expensive (ROADMAP.md's open questions (unbounded guard sets)).
     pub fn size(&self) -> (usize, usize) {
         (self.reads.len(), self.writes.len())
     }
@@ -105,7 +105,7 @@ impl Transaction {
 
 /// A derivation round, as a transaction. SPEC.md §16.5.
 ///
-/// A round forks the branch at the source layer it settles, runs every producer on that fork, and
+/// A round forks the branch at the top of the range it settles (reflects is the top *source* layer), runs every producer on that fork, and
 /// merges when it settles. That fork point *is* what the round can see, so `reflects` is true by
 /// construction rather than maintained — which is the whole of what replaced the round ceiling.
 ///
@@ -213,7 +213,7 @@ impl Round {
     /// write at any version is a write and the touch index keys on `CellRef`.
     ///
     /// Borrowed rather than cloned, because a round's guard set is the sum of its producers'
-    /// read-sets and is unbounded (§7.7).
+    /// read-sets and is unbounded (ROADMAP.md, open questions).
     pub fn guards(&self) -> Vec<(LayerId, Vec<&CellRef>)> {
         let produced: BTreeSet<&CellAt> = self
             .invocations

@@ -272,7 +272,10 @@ impl StorageProvider for MemoryStorage {
         // a cell materialized at two versions is two rows within one — one per version, because a
         // version is part of the record key (§4.3) and hiding one of them would hide a migration's
         // output from the only enumeration the engine has.
-        let mut seen: Vec<CellRef> = Vec::new();
+        // A set, not a Vec: this scan now runs at the top of a settled range over a full buffer,
+        // which is exactly the shape that turned two Vec::contains into 88 seconds elsewhere
+        // (CLAUDE.md invariant 5).
+        let mut seen: std::collections::HashSet<CellRef> = std::collections::HashSet::new();
         let mut rows = Vec::new();
         for (branch, bound) in &path.segments {
             let mut segment = Vec::new();

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# **S16 — the determinism sweep.** SPEC-DRAFT §9, SPEC.md §9.6, §16.5.
+# **S16 — the determinism sweep.** `ROADMAP.md`, *Acceptance scenarios*; SPEC.md §9.6, §16.5.
 #
 # One workload with real contention in it, replayed from an empty store many times at high
 # parallelism, asserting that the **settled result is byte-identical every run**. Nothing here
@@ -122,7 +122,7 @@ digest() {
         printf '%s.founded@v1  %s\n' "$i" \
             "$(borg get "Company#$i.founded" --value --client-version "$V1")"
     done
-    printf 'outstanding  %s\n' "$(borg derive --count)"
+    printf 'outstanding  %s\n' "$(borg derive --quiet)"
 }
 
 # --- run it -----------------------------------------------------------------------------------------

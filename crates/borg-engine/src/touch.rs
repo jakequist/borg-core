@@ -73,25 +73,15 @@ impl CellTouchIndex {
         }))
     }
 
-    /// The first layer strictly after `since` that touched this cell, anywhere along the path.
+    /// The first cell in the set that has been touched since that layer, with the layer that did it.
+    ///
+    /// **Batched, and only batched.** A round's guard set is one probe per cell it read, and taking
+    /// the lock per probe is the cost that shows up (§7.7: read-sets are unbounded) — so the
+    /// per-cell form this replaced is gone rather than kept beside it, and there is no cheap-looking
+    /// call left to reach for in a loop.
     ///
     /// Walking the whole path rather than one branch is what lets a child's guard be re-evaluated
     /// against its parent at merge time (SPEC.md §13).
-    pub fn touched_since(
-        &self,
-        path: &ReadPath,
-        cell: &CellRef,
-        since: LayerId,
-    ) -> Result<Option<LayerId>> {
-        let inner = self.inner.lock().unwrap();
-        Ok(Self::lookup(&inner, path, cell, since))
-    }
-
-    /// The first cell in the set that has been touched since that layer, with the layer that did it.
-    ///
-    /// The batched form, because a round's guard set is one probe per cell it read and taking the
-    /// lock per probe is the cost that shows up (§7.7 of the transactional draft: read-sets are
-    /// unbounded). Same question as [`touched_since`](Self::touched_since), asked once.
     pub fn first_touched_since<'a>(
         &self,
         path: &ReadPath,

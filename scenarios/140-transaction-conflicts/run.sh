@@ -24,7 +24,7 @@ borg set 'Company#2.name' Rival >/dev/null
 # case where "guard what you read and did not write" has to be read carefully. The read happened
 # *before* the write, so it observed the parent and is a real dependency on it; it is only a read
 # that follows the transaction's own write that must not be guarded (which is 130's S4). Collapse the
-# two and compare-and-swap becomes impossible, which SPEC-DRAFT §2 promises falls straight out of
+# two and compare-and-swap becomes impossible, which §12.1 promises falls straight out of
 # reading a cell before writing it.
 
 # increment <tx> — read the counter through a transaction, then write one more than what it said.

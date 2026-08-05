@@ -15,6 +15,14 @@ borg repo push "$HERE"/../030-shell-pipeline/repo
 assert_contains "$(borg producer list)" "invest" \
     "the script described itself, and the server recorded a producer definition"
 
+# A producer id is a hash of the producer's *name*, so it uses the whole u64 range — and JSON has no
+# integers. Written as a number, `jq` and every browser silently round anything above 2^53, and the
+# id comes back naming a producer that does not exist. The sidecar these shell pipelines are meant to
+# read writes it as a string.
+id="$(borg producer list | awk '{print $2}' | tr -d P)"
+assert_contains "$(cat "$WORK/borg.producers.json")" "\"id\": \"$id\"" \
+    "the producer table writes ids as strings, so a JSON tool cannot round one into another producer"
+
 # …and its definitions came from the same `describe`, in the same def layer. The repo is the only
 # thing that knows `is_investible` exists, so after B it is the only thing that *can* declare it.
 schema="$(borg def show Company)"
@@ -50,15 +58,15 @@ assert_contains "$(borg explain 'Company#1.is_investible')" "$website" \
 
 # The invalidation story, end to end through a subprocess — driven by the *string* field.
 borg set 'Company#2.website' rival.ai
-assert_eq "$(borg derive --count)" "1" \
+assert_derives 1 \
     "changing one input re-runs exactly one invocation"
 assert_eq "$(borg get 'Company#2.is_investible' --value)" "true" "and the output follows"
 
 # The numeric field it also reads, to show the two are tracked alike.
 borg set 'Company#2.headcount' 3
-assert_eq "$(borg derive --count)" "1" "the number it read is a tracked dependency too"
+assert_derives 1 "the number it read is a tracked dependency too"
 assert_eq "$(borg get 'Company#2.is_investible' --value)" "false" "and it flips the answer back"
 
 borg set 'Company#1.employees' 40
-assert_eq "$(borg derive --count)" "0" \
+assert_derives 0 \
     "writing a field the script never read runs nothing at all"

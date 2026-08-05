@@ -63,7 +63,11 @@ pub struct WorkGap {
     pub producer: ProducerId,
     /// Exclusive lower bound — the producer's current watermark.
     pub from: LayerId,
-    /// Inclusive upper bound — the branch head at the time of asking.
+    /// Inclusive upper bound — where the branch head stands in the **source** stream at the time of
+    /// asking. A source position and not the head itself, because a watermark points into the source
+    /// stream (§6.3) and the two ends of a range have to be commensurable: a settled branch's head is
+    /// a derived layer above every watermark, and comparing against it would report every settled
+    /// branch as permanently behind.
     pub to: LayerId,
 }
 

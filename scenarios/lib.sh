@@ -58,6 +58,19 @@ assert_field() {
     pass "$4"
 }
 
+# assert_derives <count> <description> [borg args...]
+#
+# Run a round and assert how many invocations it took. `0` is the settled case, and it is a stronger
+# claim than `borg derive status --outstanding` makes: that one queries the frontier, this one runs
+# the round and finds it had nothing to do — which is what "the branch is a fixpoint" means.
+#
+# Here rather than spelled out seventeen times because the spelling is the part that keeps changing:
+# knowing that the bare count comes from `--quiet` is one fact, and it now lives in one place.
+assert_derives() {
+    local want="$1" desc="$2"; shift 2
+    assert_eq "$(borg derive --quiet "$@")" "$want" "$desc"
+}
+
 # assert_fails <description> -- <command...>
 assert_fails() {
     local desc="$1"; shift; shift

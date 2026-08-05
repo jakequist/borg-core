@@ -132,7 +132,7 @@ assert_field "$out" "origin" "derived" "the old client is told its view is a com
 
 # `up` and `down` are two projections of one value, not a cycle. Neither is triggered by the other's
 # output, so the world settles instead of ping-ponging until the cycle detector fires (§9.3, §16.6).
-assert_eq "$(borg derive --count)" "0" "everything has settled — the two directions do not chase"
+assert_derives 0 "everything has settled — the two directions do not chase"
 
 # --- Without a `down`, an old client is told it is broken --------------------------------------------
 

@@ -347,6 +347,19 @@ impl DefView {
                         field: field.to_string(),
                     });
                 }
+                // **A migration cannot be appointed for a field a producer owns.** Ownership is
+                // checked before the migration exemption is reached ([`check_ownership`]), so the
+                // migrations this event names would be forbidden to write the field it names them
+                // for — the push would be accepted and the failure would arrive later, as an
+                // ownership violation, from whichever round happened to run them. Refusing here says
+                // why, once, to whoever pushed it.
+                if let Ownership::Derived(owner) = existing.ownership {
+                    return Err(BorgError::MigrationOnDerivedField {
+                        struct_name: struct_name.clone(),
+                        field: field.to_string(),
+                        owner,
+                    });
+                }
                 let from = DefVersion(existing.version);
                 existing.ty = ty.clone();
                 existing.version = at;

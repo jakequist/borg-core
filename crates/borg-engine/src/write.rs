@@ -43,7 +43,25 @@
 //! naming a producer as a field's `up` or `down` arrives with the `MutateField`, so a `down`
 //! migration's own view, which is by definition older than that event, cannot see it.
 //!
-//! Both are folded along the **full ancestry of the branch that owns the data**, which for a
+//! ## Four setters, and why they are not two
+//!
+//! `set`/`set_text` are the client pair and `set_derived`/`set_text_derived` the producer pair —
+//! (value | text) crossed with an axis that is not really an axis, since which pair is correct is
+//! decided by the session's own `writer`. A `WriteSession<Client>`/`WriteSession<Producer>` split
+//! would collapse them to two and make the wrong combination unrepresentable, and it was weighed
+//! again after the round-as-a-transaction work settled. It is still not worth it, and the reason is
+//! concrete rather than a matter of taste: `tests/write_validation.rs` chooses its `Writer` at run
+//! time, because varying the writer against a fixed field *is* what those tests are about, and under
+//! a type-state split every one of them would have to invent a `Derivation` it has nothing to say
+//! about in order to exercise the permission check. A producer writing without lineage is a mistake
+//! in production and a legitimate fixture in a test of §8, and a type cannot tell them apart.
+//!
+//! What the split would have bought is bought instead by there being **no example of the wrong call
+//! anywhere in the tree** — see `set`.
+//!
+//! ## Which ancestry
+//!
+//! Both views are folded along the **full ancestry of the branch that owns the data**, which for a
 //! producer running inside a round is the trunk and not the round's own branch (§16.5). A round
 //! isolates *data*: its fork point is what makes `reflects` true. Definitions are not data — a layer
 //! holds value events xor def events (§6.2), so derivation never commits a def layer, and the fork
@@ -75,7 +93,8 @@ pub struct WriteSession {
     defs: DefView,
     /// The definitions in force on the branch. Permission is checked here.
     authority: DefView,
-    /// The ancestry this session's *data* reads resolve through, bounded by the round's ceiling
+    /// The ancestry this session's *data* reads resolve through — for a round, its own branch
+    /// bounded at head, then the trunk bounded at the fork point (§16.5)
     /// where there is one.
     path: ReadPath,
     writer: Writer,
@@ -88,7 +107,7 @@ pub struct WriteSession {
     /// **Client sessions only.** A producer's read-set already comes from `ProducerCtx`, and a
     /// derived layer may hold millions of mutations that must never be buffered whole (§6.2) — so
     /// recording every cell a producer writes would break the one constraint the log is built
-    /// around. A client transaction's sets are unbounded too (§7.7), and that is a cost it has
+    /// around. A client transaction's sets are unbounded too (ROADMAP.md, open questions: unbounded guard sets), and that is a cost it has
     /// chosen: it is going to carry them to its own commit either way.
     observed: Vec<CellAt>,
     authored: Vec<CellRef>,
@@ -155,7 +174,7 @@ impl WriteSession {
     ///
     /// Every probe precedes every write to the same cell within one session, which is what lets a
     /// caller drain these in a batch and still get the ordering rule
-    /// ([`Transaction::observe`](crate::transaction::Transaction::observe)) right.
+    /// ([`Transaction::observe`](borg_core::transaction::Transaction::observe)) right.
     pub fn observed(&self) -> &[CellAt] {
         &self.observed
     }
@@ -197,6 +216,13 @@ impl WriteSession {
     }
 
     /// Write a value.
+    ///
+    /// **The client path.** A producer wants [`set_derived`](Self::set_derived): a record's `origin`
+    /// comes from the session's writer and so is right either way, but its *lineage* comes from the
+    /// argument, and a derived record with no read-set is one nothing can invalidate and nothing can
+    /// validate — it reads as permanently unvalidated and contributes no edge to the dependency
+    /// index. The pairing is a convention rather than a type; see the module header for why it was
+    /// left one.
     pub async fn set(&mut self, cell: &CellRef, value: Value) -> Result<()> {
         self.put(cell, value, None).await
     }

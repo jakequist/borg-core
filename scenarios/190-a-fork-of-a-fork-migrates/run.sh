@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# **S15 — a second-order fork with a migration.** SPEC-DRAFT §9, SPEC.md §7.4, §9.3, §13.
+# **S15 — a second-order fork with a migration.** `ROADMAP.md`, *Acceptance scenarios*;
+# SPEC.md §7.4, §9.3, §13.
 #
 # `080-migration` proves a migration works across **one** fork. Branch chains deeper than one fork
 # have been exercised for definitions (`070-branch-visibility`) and never for migrations, and the two
@@ -124,6 +125,6 @@ assert_eq "$(borg get 'Company#1.founded' --value --client-version "$v1")" "1999
 assert_eq "$(borg get 'Company#2.founded' --value)" "" \
     "and the data the middle branch authored did not cross with its schema"
 
-assert_eq "$(borg derive --count)" "0" "the root settles"
-assert_eq "$(borg derive --count --branch child)" "0" "so does the branch in the middle"
-assert_eq "$(borg derive --count --branch grandchild)" "0" "and so does the one that started it"
+assert_derives 0 "the root settles"
+assert_derives 0 "so does the branch in the middle" --branch child
+assert_derives 0 "and so does the one that started it" --branch grandchild

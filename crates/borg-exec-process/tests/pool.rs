@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use borg_core::{
     BranchId, CellRef, ClientVersion, DefVersion, LayerId, Pid, PidKind, ProducerId, Result, Value,
 };
-use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
+use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef, ValueCodec};
 use borg_exec_process::ProcessExecutor;
 use std::collections::HashSet;
 use std::io::Write;
@@ -71,6 +71,10 @@ impl ProducerCtx for Silent {
     async fn set_text(&mut self, _cell: &CellRef, _text: &str) -> Result<()> {
         Ok(())
     }
+}
+
+#[async_trait]
+impl ValueCodec for Silent {
     async fn intern(&mut self, _input: borg_core::ValueInput) -> Result<Value> {
         unreachable!("this worker writes nothing")
     }

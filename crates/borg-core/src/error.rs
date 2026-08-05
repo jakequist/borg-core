@@ -34,6 +34,24 @@ pub enum BorgError {
         field: String,
     },
 
+    /// A `MutateField` naming migrations for a field a producer owns. SPEC.md §8, §9.3.
+    ///
+    /// Rejected at push rather than at run time, which is where it used to surface: ownership is
+    /// checked against the declaration naming the field's writer *before* the migration exemption is
+    /// reached, so the appointed migration would have been forbidden to write the very field it was
+    /// appointed for — an `OwnershipViolation` from a producer nobody had done anything wrong with,
+    /// arriving whenever the round that ran it happened to run.
+    #[error(
+        "`{struct_name}.{field}` is derived by {owner}, so no migration can be appointed for it: a \
+         derived field's shape is its producer's business, and a producer that changes its output \
+         re-derives rather than migrating"
+    )]
+    MigrationOnDerivedField {
+        struct_name: ObjectTypeName,
+        field: String,
+        owner: ProducerId,
+    },
+
     /// A write that the definitions in force do not permit. SPEC.md §5.1, §8.
     ///
     /// Boxed because these carry a lot of context on purpose — a rejected write should tell you

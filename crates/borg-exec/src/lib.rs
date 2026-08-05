@@ -20,13 +20,51 @@ pub struct ProducerRef {
     pub version: ClientVersion,
 }
 
+/// Text ↔ value, for a runtime that holds no store handle.
+///
+/// **Deliberately not part of [`ProducerCtx`]'s own method set**, though every `ProducerCtx` is one.
+/// Everything on `ProducerCtx` is *cell* access: scoped to a branch, a layer and a def-version, and
+/// recorded into the read-set as it happens (SPEC.md §9.4). Nothing here is any of those things.
+/// Interning is unscoped — no branch, no layer, no version (§17.1) — so there is nothing that could
+/// later change and invalidate anything, and rendering is a pure function of content already
+/// resolved. Two kinds of thing sat side by side in one list, and the only warning that they were
+/// different was a sentence in a doc comment.
+///
+/// Mediated all the same, and for the reason cell access is: a producer runtime holds no store
+/// handle, and content-addressed values have no identity until a store has seen them (§3.1). A
+/// runtime that reached around this to intern for itself would be a second writer into the store,
+/// which is precisely what the `ExecutionProvider` contract exists to prevent.
+///
+/// Separating it means a caller that only needs the codec can say so: `borg-exec-process` renders
+/// cell values for the wire and takes this rather than the whole context, so it cannot reach a
+/// dependency-recording method by accident.
+#[async_trait]
+pub trait ValueCodec: Send {
+    /// Turn a parsed value into a storable one, interning `String`, `Binary` and `BigInt` content.
+    ///
+    /// **Not recorded as a dependency** — see the trait header.
+    async fn intern(&mut self, input: ValueInput) -> Result<Value>;
+
+    /// Render a value as the text a worker reads, resolving interned content back to its bytes.
+    ///
+    /// This is what makes interning invisible to producers (§3.4): a pipeline asking for
+    /// `company.website` is handed `acme.ai`, never `@s-1a2b3c` plus a second round trip to resolve
+    /// it. Nothing above this line needs to know that strings are content-addressed at all.
+    async fn render(&mut self, value: &Value) -> Result<String>;
+}
+
 /// The mediated view of the world given to running producer code.
+///
+/// Every method here is **cell access**, and every one of them is recorded — which is what makes
+/// dependency capture automatic and exact, with nothing for a producer author to declare or
+/// mis-declare (SPEC.md §9.4). The value codec a producer also needs is [`ValueCodec`], a supertrait
+/// rather than more methods, because it answers a different kind of question; see there.
 ///
 /// **Async from day one**, even though the v1 in-process implementation only ever returns ready
 /// futures. A socket-backed provider performs a round-trip per cell read, and retrofitting async
 /// through the derivation engine afterwards is a far larger change than paying for it now.
 #[async_trait]
-pub trait ProducerCtx: Send {
+pub trait ProducerCtx: ValueCodec + Send {
     /// Read a cell through this producer's own def-view — the schema its code was authored against
     /// (SPEC.md §5.4). The record it resolves to is the one at the *field's* def-version as that
     /// view names it (§5.3). Recorded into the read-set, including reads that find nothing, since
@@ -68,24 +106,6 @@ pub trait ProducerCtx: Send {
     /// the guessing that type-directed parsing removes, and would make `true` unstorable in a
     /// `String` field over the wire while the CLI stored it fine.
     async fn set_text(&mut self, cell: &CellRef, text: &str) -> Result<()>;
-
-    /// Turn a parsed value into a storable one, interning `String`, `Binary` and `BigInt` content.
-    ///
-    /// Mediated for the same reason cell access is: a producer runtime holds no store handle, and
-    /// content-addressed values have no identity until a store has seen them (SPEC.md §3.1). A
-    /// runtime that reached around this to intern for itself would be a second writer into the
-    /// store, which is precisely what the `ExecutionProvider` contract exists to prevent.
-    ///
-    /// **Not recorded as a dependency.** Interning is unscoped — no branch, no layer, no version
-    /// (§17.1) — so there is nothing here that could later change and invalidate anything.
-    async fn intern(&mut self, input: ValueInput) -> Result<Value>;
-
-    /// Render a value as the text a worker reads, resolving interned content back to its bytes.
-    ///
-    /// This is what makes interning invisible to producers (§3.4): a pipeline asking for
-    /// `company.website` is handed `acme.ai`, never `@s-1a2b3c` plus a second round trip to resolve
-    /// it. Nothing above this line needs to know that strings are content-addressed at all.
-    async fn render(&mut self, value: &Value) -> Result<String>;
 }
 
 #[async_trait]

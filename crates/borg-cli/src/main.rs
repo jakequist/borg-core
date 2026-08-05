@@ -14,9 +14,12 @@ use borg_core::{
 use borg_engine::{Poisoning, Registry};
 use borg_exec_native::NativeExecutor;
 use borg_storage_sqlite::SqliteStorage;
+use sidecar::Sidecar;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod sidecar;
 
 const ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(0);
 
@@ -47,7 +50,11 @@ struct Args {
     /// `--client-version`. See [`client_version`].
     version: Option<LayerId>,
     value_only: bool,
-    count_only: bool,
+    /// `--quiet`. See [`derive`] — it selects an output *format*, and does not make the command a
+    /// query.
+    quiet: bool,
+    /// `--outstanding`. See [`derive_status`].
+    outstanding: bool,
     /// `--rebuild`. See [`derive`].
     rebuild: bool,
     /// `--retry-broken`. See [`derive`].
@@ -92,10 +99,11 @@ borg — an event-sourced data backend
 
   borg repo push <dir>                 push a repo: defs and pipelines
   borg producer list                   registered producers
-  borg derive [--count]                run producers until caught up
+  borg derive [--quiet]                run producers until caught up
   borg derive --rebuild                recompute derived data from source, ignoring the cache
   borg derive --retry-broken           run producers this branch has judged broken
   borg derive pause | resume | status  auto-derivation on this branch
+  borg derive --outstanding            what each producer has yet to incorporate — runs nothing
 
   borg layer list | borg layer head
   borg frontier                        how far each producer has caught up
@@ -168,7 +176,8 @@ Options:
   --timeout <seconds>       how long `frontier reaches` waits (default 0)
   --tx <id>                 which open transaction to speak to (or $BORG_TX)
   --value                   print only the value
-  --count                   print only a count
+  --quiet                   `derive`: print the bare invocation count, without the prose
+  --outstanding             `derive`: report pending work as a query, deriving nothing
   --rebuild                 `derive`: recompute from source instead of catching up
   --retry-broken            `derive`: run producers judged broken, instead of skipping them"
     );
@@ -181,7 +190,8 @@ fn parse_args() -> Args {
         branch: None,
         version: None,
         value_only: false,
-        count_only: false,
+        quiet: false,
+        outstanding: false,
         rebuild: false,
         retry_broken: false,
         freshness: FreshnessRequirement::Validated,
@@ -206,7 +216,8 @@ fn parse_args() -> Args {
             }
             "--tx" => args.tx = raw.next(),
             "--value" => args.value_only = true,
-            "--count" => args.count_only = true,
+            "--quiet" => args.quiet = true,
+            "--outstanding" => args.outstanding = true,
             "--rebuild" => args.rebuild = true,
             "--retry-broken" => args.retry_broken = true,
             "-h" | "--help" => usage(),
@@ -691,10 +702,10 @@ const REMEMBERED_TRANSACTIONS: usize = 64;
 ///
 /// A transaction spans several CLI processes, so it needs somewhere to keep two things: which branch
 /// it forked, and what it has read so far. That goes here, with the pause flags and the
-/// producer-implementation table (§9.2), for the same reason they do — it is **operational state,
-/// not log data**, and it dies when the transaction ends. In the log it would be forkable,
-/// mergeable and time-travellable, and "which transactions were open at layer 400" is not a question
-/// anybody has.
+/// producer-implementation table (§9.2), for the same reason they do — see `crate::sidecar`.
+///
+/// Every id in this file is a layer or a branch id, which are sequential counters; there is no
+/// producer id in it, and so nothing that needs `sidecar::producer_id`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Transactions {
@@ -739,21 +750,16 @@ struct Spent {
     fate: String,
 }
 
-fn transactions_path(args: &Args) -> PathBuf {
-    args.store.with_extension("transactions.json")
+impl Sidecar for Transactions {
+    const EXTENSION: &'static str = "transactions.json";
 }
 
 fn load_transactions(args: &Args) -> Transactions {
-    std::fs::read_to_string(transactions_path(args))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    sidecar::load(&args.store)
 }
 
 fn save_transactions(args: &Args, table: &Transactions) -> Result<()> {
-    let raw =
-        serde_json::to_string_pretty(table).map_err(|err| BorgError::Storage(err.to_string()))?;
-    std::fs::write(transactions_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+    sidecar::save(&args.store, table)
 }
 
 fn now() -> u64 {
@@ -802,7 +808,7 @@ fn spell_duration(seconds: u64) -> String {
 /// A reaped transaction's *state* is dropped, which is what makes it unusable: nothing can be
 /// written through it and its layers can never merge. Its branch row is left where it is, because
 /// whether spent branches are reaped or kept as history is a real choice and is deliberately not
-/// being made by a janitor as a side effect (SPEC-DRAFT §7.5).
+/// being made by a janitor as a side effect (ROADMAP.md, open questions).
 fn reap_transactions(args: &Args) -> Result<()> {
     let mut table = load_transactions(args);
     if table.open.is_empty() {
@@ -1380,29 +1386,26 @@ struct Implementations {
     producers: Vec<Implementation>,
 }
 
+impl Sidecar for Implementations {
+    const EXTENSION: &'static str = "producers.json";
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Implementation {
+    /// A string, and this is the file that made the case for it — see `sidecar::producer_id`.
+    #[serde(with = "sidecar::producer_id")]
     id: u64,
     name: String,
     source: String,
     command: PathBuf,
 }
 
-fn impls_path(args: &Args) -> PathBuf {
-    args.store.with_extension("producers.json")
-}
-
 fn load_impls(args: &Args) -> Implementations {
-    std::fs::read_to_string(impls_path(args))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    sidecar::load(&args.store)
 }
 
 fn save_impls(args: &Args, impls: &Implementations) -> Result<()> {
-    let raw =
-        serde_json::to_string_pretty(impls).map_err(|err| BorgError::Storage(err.to_string()))?;
-    std::fs::write(impls_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+    sidecar::save(&args.store, impls)
 }
 
 /// Push a repo: ask each script to describe itself, record its definitions in the log, and remember
@@ -1411,6 +1414,12 @@ fn save_impls(args: &Args, impls: &Implementations) -> Result<()> {
 /// **Definitions and producers land in one def layer.** A producer and the field it writes must
 /// arrive together or not at all: after §8, a producer cannot write anything unless its output field
 /// is declared, and half a push would leave a pipeline that is registered and legally mute.
+///
+/// **Nothing is printed until everything has been accepted.** A push is decided as a whole, and the
+/// checks that can reject it — a `derived_by` naming a producer the repo does not implement, a type
+/// change with no `up`, a migration no field appoints, and the def layer's own validation — are
+/// spread through the walk that also builds the report. Printing as it went meant a rejected push
+/// listed half a schema first, which reads as a partial success and is not one.
 async fn repo_push(args: &Args, dir: &str) -> Result<()> {
     let dir = PathBuf::from(dir);
     let repo = read_repo_id(&dir)?;
@@ -1436,6 +1445,8 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
 
     let mut impls = load_impls(args);
     let mut events = Vec::new();
+    // Held back until the push is accepted — see the header.
+    let mut report: Vec<String> = Vec::new();
     for (command, description) in &described {
         for spec in &description.producers {
             let id = ProducerId(spec.id());
@@ -1447,7 +1458,7 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                 declaring_repo: repo,
             }));
             remember(&mut impls, id, &spec.name, &spec.source, command);
-            outln!("{} -> {id}", spec.name);
+            report.push(format!("{} -> {id}", spec.name));
         }
     }
 
@@ -1519,6 +1530,17 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                     // are named — a repo cannot say "mutate from String" because it does not know
                     // what it is mutating from, and on another branch the answer differs.
                     Some(existing) if existing.ty != ty => {
+                        // Asked before the missing-`up` question, because for a derived field the
+                        // answer is not "name a migration" — no migration can be appointed for it at
+                        // all, so advising one would send the author to write code the next push
+                        // would reject.
+                        if let Some(owner) = existing.ownership.producer() {
+                            return Err(BorgError::MigrationOnDerivedField {
+                                struct_name: struct_name.clone(),
+                                field: field.name.clone(),
+                                owner,
+                            });
+                        }
                         let Some(up) = up else {
                             return Err(BorgError::Storage(format!(
                                 "{what} changes from {} to {ty}, which needs an `up` migration to \
@@ -1534,7 +1556,7 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                             up,
                             down,
                         });
-                        outln!("{what} {} -> {}", existing.ty, field.ty);
+                        report.push(format!("{what} {} -> {}", existing.ty, field.ty));
                     }
                     _ => {
                         let owner = match &field.derived_by {
@@ -1551,7 +1573,7 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                             repo,
                             ownership: ownership(owner),
                         });
-                        outln!("{what} {}", field.ty);
+                        report.push(format!("{what} {}", field.ty));
                     }
                 }
             }
@@ -1576,6 +1598,10 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
     }
     drop(registry);
     save_impls(args, &impls)?;
+    // Everything is accepted and committed, so this is a report rather than a running commentary.
+    for line in report {
+        outln!("{line}");
+    }
     auto_derive(args, branch).await
 }
 
@@ -1706,6 +1732,14 @@ fn derive_parallelism() -> usize {
 /// partial effects it had. `--retry-broken` is the way to say *I fixed something the log cannot see*;
 /// pushing the producer again is the way §14 means, and needs no flag.
 async fn derive(args: &Args) -> Result<()> {
+    // `--outstanding` names a query wherever it appears, and this is the spelling somebody reaches
+    // for first. Running a round because the flag was attached to the verb rather than to `status`
+    // would be the one outcome a caller asking what is outstanding did not want.
+    if args.outstanding {
+        let registry = open(args).await?;
+        let branch = branch_of(&registry, args.branch.as_deref())?;
+        return outstanding(args, &registry, branch).await;
+    }
     let (registry, workers) = open_deriving(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
 
@@ -1744,7 +1778,10 @@ async fn derive(args: &Args) -> Result<()> {
         }
     }
 
-    if args.count_only {
+    // `--quiet` chooses a *format*, not a mode. The command ran the round either way; a caller that
+    // only wants to know what is left to do wants `borg derive status --outstanding`, which runs
+    // nothing.
+    if args.quiet {
         outln!("{executed}");
     } else {
         outln!("{executed} invocation(s)");
@@ -1804,10 +1841,10 @@ async fn auto_derive(args: &Args, branch: BranchId) -> Result<()> {
 /// Derivation's operational state, beside the store.
 ///
 /// Beside the store, like the producer-implementation table and the transaction table, and for the
-/// same reason: this is **operational state, not log data**. Neither half of it changes what is
-/// true. Pausing changes only when the system catches up; a poisoning is the engine's judgement
-/// about code, discovered at runtime. In the log both would be forkable, mergeable and
-/// time-travellable, and "was derivation paused at layer 400?" is not a question anybody has.
+/// same reason (`crate::sidecar`): neither half of this changes what is true. Pausing changes only
+/// when the system catches up; a poisoning is the engine's judgement about code, discovered at
+/// runtime. In the log both would be forkable, mergeable and time-travellable, and "was derivation
+/// paused at layer 400?" is not a question anybody has.
 ///
 /// Branch *ids*, not names: a branch may be renamed or unnamed, and the id is what the log uses.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -1819,6 +1856,10 @@ struct DerivationConfig {
     broken: Vec<BrokenProducer>,
 }
 
+impl Sidecar for DerivationConfig {
+    const EXTENSION: &'static str = "derivation.json";
+}
+
 /// One poisoning, as this client writes it down.
 ///
 /// The wire form lives here and not in the engine because the file is the CLI's, the way
@@ -1827,6 +1868,7 @@ struct DerivationConfig {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct BrokenProducer {
     branch: u64,
+    #[serde(with = "sidecar::producer_id")]
     producer: u64,
     /// The ClientVersion it was running at. This is what makes the record self-expiring, and what
     /// makes §14's recovery — push fixed code — need no other machinery.
@@ -1835,21 +1877,12 @@ struct BrokenProducer {
     since: u64,
 }
 
-fn derivation_path(args: &Args) -> PathBuf {
-    args.store.with_extension("derivation.json")
-}
-
 fn load_derivation(args: &Args) -> DerivationConfig {
-    std::fs::read_to_string(derivation_path(args))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<DerivationConfig>(&raw).ok())
-        .unwrap_or_default()
+    sidecar::load(&args.store)
 }
 
 fn save_derivation(args: &Args, config: &DerivationConfig) -> Result<()> {
-    let raw =
-        serde_json::to_string_pretty(config).map_err(|err| BorgError::Storage(err.to_string()))?;
-    std::fs::write(derivation_path(args), raw).map_err(|err| BorgError::Storage(err.to_string()))
+    sidecar::save(&args.store, config)
 }
 
 fn paused_branches(args: &Args) -> Vec<u64> {
@@ -1878,7 +1911,9 @@ fn set_paused(args: &Args, branch: BranchId, pause: bool) -> Result<()> {
 /// producer's output `stale` — a promise of a catch-up that was never coming — and the next
 /// `borg derive` used to run the failing code again from scratch.
 struct FilePoison {
-    path: PathBuf,
+    /// The store, not the sidecar's own path: the file is named from it, and naming it in one place
+    /// is what keeps this and `load_derivation` reading the same file.
+    store: PathBuf,
     /// Read once and held for the life of the command. One process does one thing here, so nothing
     /// can move the file underneath it — and re-reading per lookup would put a syscall inside the
     /// scheduler's per-producer loop.
@@ -1888,7 +1923,7 @@ struct FilePoison {
 impl FilePoison {
     fn new(args: &Args) -> Self {
         Self {
-            path: derivation_path(args),
+            store: args.store.clone(),
             table: std::sync::Mutex::new(load_derivation(args).broken),
         }
     }
@@ -1899,14 +1934,9 @@ impl FilePoison {
     /// are edited by different commands, and holding a whole-file snapshot across a command would
     /// let one of them silently revert the other.
     fn flush(&self, table: &[BrokenProducer]) -> Result<()> {
-        let mut config: DerivationConfig = std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        let mut config: DerivationConfig = sidecar::load(&self.store);
         config.broken = table.to_vec();
-        let raw = serde_json::to_string_pretty(&config)
-            .map_err(|err| BorgError::Storage(err.to_string()))?;
-        std::fs::write(&self.path, raw).map_err(|err| BorgError::Storage(err.to_string()))
+        sidecar::save(&self.store, &config)
     }
 }
 
@@ -1991,9 +2021,19 @@ async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
 /// **A pause needs no other vocabulary.** A paused branch's frontier stops advancing and every read
 /// of derived data already reports how far behind it is — so there is nothing to add to the read
 /// envelope, because a pause *is* lag and the freshness machinery already describes lag.
+///
+/// `--outstanding` is the **read-only** half, and the only one there is: it prints the gap between
+/// each producer's watermark and head (§16.4) and runs nothing. It deliberately does not report an
+/// invocation *count*, because there is no honest way to have one without scheduling — work is
+/// implied by the gap plus the dependency index, and the only thing that turns the implication into
+/// a number is a round that forks a branch and walks the changesets. `borg derive --quiet` is that
+/// round, and its number is what it did rather than what was owed.
 async fn derive_status(args: &Args) -> Result<()> {
     let registry = open(args).await?;
     let branch = branch_of(&registry, args.branch.as_deref())?;
+    if args.outstanding {
+        return outstanding(args, &registry, branch).await;
+    }
     let paused = paused_branches(args).contains(&branch.0);
     outln!(
         "auto-derivation {} on {branch}",
@@ -2010,6 +2050,39 @@ async fn derive_status(args: &Args) -> Result<()> {
             poisoning.since,
             poisoning.error
         );
+    }
+    Ok(())
+}
+
+/// What each producer has yet to incorporate. SPEC.md §16.4.
+///
+/// A pure query over the frontier and the log: no executor is built, no round is forked, nothing is
+/// written. That is the whole reason it exists — asking "is anything outstanding" used to mean
+/// running `borg derive` and reading the count it printed, which answers the question by doing the
+/// work.
+async fn outstanding(args: &Args, registry: &Registry, branch: BranchId) -> Result<()> {
+    // Producers are registered so that the engine can be asked about the ones this branch *defines*
+    // rather than the ones this process happens to have seen.
+    registry.register_producers(branch).await?;
+    let names = load_impls(args);
+    let mut any = false;
+    for producer in registry.producers_of(branch).await? {
+        let Some(gap) = registry.engine.pending(branch, producer) else {
+            continue;
+        };
+        any = true;
+        // Both ends are positions in the *source* stream, which is the only stream a watermark is
+        // comparable with (§6.3) — so on a settled branch this says nothing rather than naming the
+        // derived layer the last round merged.
+        outln!(
+            "outstanding {:<16} incorporated through {}, owes up to {}",
+            producer_name(&names, producer),
+            gap.from,
+            gap.to
+        );
+    }
+    if !any {
+        outln!("nothing outstanding");
     }
     Ok(())
 }

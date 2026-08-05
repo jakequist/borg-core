@@ -4,8 +4,9 @@
 //! `fork` and `merge` mean and the code is made to agree.
 
 use borg_core::{
-    BranchId, CellRef, ClientVersion, DefEvent, DefVersion, LayerAuthor, LayerId, MergeMode,
-    Ownership, Pid, PidKind, ProducerId, RepoId, Result, Value, ValueType, Writer,
+    BranchId, CellAt, CellRef, ClientVersion, DefEvent, DefVersion, Derivation, LayerAuthor,
+    LayerId, MergeMode, Ownership, Pid, PidKind, ProducerId, RepoId, Result, Value, ValueType,
+    Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, InProcessSequencer, LayerManager, WriteSession,
@@ -350,7 +351,15 @@ async fn merge_skips_derived_layers() -> Result<()> {
     // producer the def declares as `is_investible`'s owner.
     let mut derived = h.session(feature, Writer::Producer(SCORE)).await?;
     derived
-        .set(&prop(acme, "is_investible"), Value::Bool(true))
+        .set_derived(
+            &prop(acme, "is_investible"),
+            Value::Bool(true),
+            Derivation {
+                producer: SCORE,
+                fresh_as_of: fork_point,
+                read_set: vec![CellAt::new(prop(acme, "name"), AT_V1)],
+            },
+        )
         .await?;
     derived.commit().await?;
 

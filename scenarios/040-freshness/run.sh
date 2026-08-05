@@ -36,9 +36,19 @@ assert_eq "$(borg get 'Company#1.is_investible' --value)" "true" \
 
 assert_contains "$(borg frontier)" "invest" "the frontier reports how far each producer has caught up"
 
+# The same question as a *query*. `borg derive --quiet` answers "is anything outstanding" by doing
+# the work and reporting how much it did; this one asks the frontier and the log and runs nothing,
+# which is why the value underneath is still stale afterwards.
+assert_contains "$(borg derive --outstanding)" "invest" \
+    "a read-only query reports what a producer has yet to incorporate"
+assert_field "$(borg get 'Company#1.is_investible')" "state" "stale" \
+    "and asking derived nothing — the query does not run producers"
+
 # Pausing stops the automation, not the engine — which is what makes it useful in an emergency.
-assert_eq "$(borg derive --count)" "1" "borg derive still works on a paused branch"
+assert_derives 1 "borg derive still works on a paused branch"
 assert_eq "$(borg get 'Company#1.is_investible' --value)" "false" "and the value follows the input"
+assert_eq "$(borg derive status --outstanding)" "nothing outstanding" \
+    "and once the round has run, the query says so"
 
 # A write the pipeline never read must not make anything stale.
 borg set 'Company#1.employees' 40

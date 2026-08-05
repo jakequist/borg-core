@@ -5,9 +5,9 @@
 //! the merge-conflict detector.
 
 use borg_core::{
-    BranchId, CellAt, CellRef, ClientVersion, DefEvent, DefVersion, Guard, LayerAuthor, LayerId,
-    MergeMode, Ownership, Pid, PidKind, ProducerId, RepoId, Result, Transaction, Value, ValueType,
-    Writer,
+    BranchId, CellAt, CellRef, ClientVersion, DefEvent, DefVersion, Derivation, Guard, LayerAuthor,
+    LayerId, MergeMode, Ownership, Pid, PidKind, ProducerId, RepoId, Result, Transaction, Value,
+    ValueType, Writer,
 };
 use borg_engine::{
     BranchManager, CellTouchIndex, DefRegistry, InProcessSequencer, LayerManager, WriteSession,
@@ -136,7 +136,21 @@ impl Harness {
             },
         )
         .await?;
-        session.set(cell, value).await?;
+        // With its lineage, as a producer's write always has (§4.3). The guard check below keys on
+        // `origin`, which the session takes from the writer either way — but a derived record with
+        // no read-set is one nothing can invalidate, and a fixture that plants one is an example of
+        // the wrong call sitting in the tree for somebody to copy.
+        session
+            .set_derived(
+                cell,
+                value,
+                Derivation {
+                    producer: SCORE,
+                    fresh_as_of: LayerId(1),
+                    read_set: Vec::new(),
+                },
+            )
+            .await?;
         session.commit().await
     }
 

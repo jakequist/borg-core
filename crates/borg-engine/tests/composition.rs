@@ -1,4 +1,4 @@
-//! Features that have never met. SPEC-DRAFT §9 (S13, S14).
+//! Features that have never met. ROADMAP.md's acceptance scenarios (S13, S14).
 //!
 //! Every major feature in this project works alone. The bugs cluster where two of them meet for the
 //! first time, and this file is the two meetings that need a **mid-round** interleaving:

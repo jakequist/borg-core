@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# **S14 — a def-only merge landing while a round is owed under the older def.** SPEC-DRAFT §9,
-# SPEC.md §5.3, §13, §16.5.
+# **S14 — a def-only merge landing while a round is owed under the older def.**
+# `ROADMAP.md`, *Acceptance scenarios*; SPEC.md §5.3, §13, §16.5.
 #
 # Two features that had never met. A **def-only merge** carries a schema change from a fork into a
 # trunk without any of the fork's data (§13). A **round** forks the trunk at the top of the range it
@@ -104,7 +104,7 @@ if printf '%s\n' "$layers" | grep -E 'derived by .*reflects' | grep -qv 'reflect
 fi
 pass "and nothing derived claims a def layer as its watermark"
 
-assert_eq "$(borg derive --count)" "0" "the trunk settles rather than chasing itself"
+assert_derives 0 "the trunk settles rather than chasing itself"
 
 # --- a second schema move, onto records that are already at the version it supersedes ----------------
 
@@ -139,7 +139,7 @@ assert_field "$out" "value" "1990s" \
 assert_field "$out" "state" "current" "and says current, because nothing is behind it"
 assert_eq "$(borg get 'Company#3.founded' --value --client-version "$v3")" "1970s" \
     "including for the value written while the second change was still on the fork"
-assert_eq "$(borg derive --count)" "0" "the trunk settles rather than chasing itself"
+assert_derives 0 "the trunk settles rather than chasing itself"
 
 # Not wedged, and the rebuild agrees with the catch-up rather than correcting it — which is the
 # statement worth keeping now that both routes reach the same place. §6.3 licenses the comparison:
@@ -149,4 +149,4 @@ assert_eq "$(borg get 'Company#1.founded' --value)" "1990s" \
     "a rebuild reaches the same value the catch-up did"
 assert_eq "$(borg get 'Company#1.decade' --value)" "1990s" \
     "and the pipeline that reads the oldest version of the field is unaffected by any of it"
-assert_eq "$(borg derive --count)" "0" "with the branch settled afterwards"
+assert_derives 0 "with the branch settled afterwards"

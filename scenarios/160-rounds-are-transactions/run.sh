@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # **S7, and what a round looks like from outside.** SPEC.md §16.5.
 #
-# A round is now a transaction: it forks the branch at the source layer it settles, runs every
+# A round is now a transaction: it forks the branch at the top of the range it settles, runs every
 # producer on the fork, and merges what settled. Three of that change's consequences are visible to
 # a client, and this is where they are asserted end to end through the real binary.
 #
@@ -76,5 +76,5 @@ assert_eq "$(borg get 'Company#1.is_investible' --value)" "false" \
 assert_eq "$(borg get 'Company#1.tier' --value)" "watch" \
     "and the chain follows it down"
 
-assert_eq "$(borg derive --count)" "0" \
+assert_derives 0 \
     "nothing is outstanding afterwards: a settled round leaves no work behind"

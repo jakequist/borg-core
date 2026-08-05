@@ -1,4 +1,4 @@
-//! Derivation as a transaction. SPEC.md §16.5, SPEC-DRAFT §3, §4, §9 (S7–S10).
+//! Derivation as a transaction. SPEC.md §16.5, ROADMAP.md's acceptance scenarios (S7–S10) (S7–S10).
 //!
 //! A round forks the branch at the top of the range it settles, runs producers on the fork, and
 //! merges when it settles. Four claims come out of that, and none of them is checked anywhere else:

@@ -71,7 +71,7 @@ use borg_core::{
     BorgError, BranchId, CellAt, CellRef, ClientVersion, DefVersion, Derivation, LayerAuthor,
     LayerId, Pid, ProducerDef, ProducerId, ReadPath, Result, Value, ValueInput, Writer,
 };
-use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef};
+use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef, ValueCodec};
 use borg_storage::StorageProvider;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -189,6 +189,19 @@ impl RecordingCtx<'_> {
     }
 }
 
+/// The unrecorded half: text ↔ value, shared with every other surface that speaks value text — see
+/// `crate::values` for why they are one implementation and not two.
+#[async_trait]
+impl ValueCodec for RecordingCtx<'_> {
+    async fn intern(&mut self, input: ValueInput) -> Result<Value> {
+        self.values.intern(input).await
+    }
+
+    async fn render(&mut self, value: &Value) -> Result<String> {
+        self.values.render(value).await
+    }
+}
+
 #[async_trait]
 impl ProducerCtx for RecordingCtx<'_> {
     async fn get(&mut self, cell: &CellRef) -> Result<Option<Value>> {
@@ -242,14 +255,6 @@ impl ProducerCtx for RecordingCtx<'_> {
             .await?;
         self.wrote(cell);
         Ok(())
-    }
-
-    async fn intern(&mut self, input: ValueInput) -> Result<Value> {
-        self.values.intern(input).await
-    }
-
-    async fn render(&mut self, value: &Value) -> Result<String> {
-        self.values.render(value).await
     }
 }
 
@@ -441,12 +446,22 @@ impl DerivationEngine {
     ///
     /// Note there is no queue anywhere — pending work is *implied* by this gap plus the dependency
     /// index, so it is recomputed rather than remembered.
+    ///
+    /// `None` where there is nothing outstanding. That is a narrower claim than *nothing above the
+    /// watermark*, and the distinction is the same one [`span`](Self::span) makes: a settled
+    /// branch's head is a derived layer its own last round merged, and it stands above every
+    /// watermark by construction — so comparing against the raw head reports a settled branch as
+    /// permanently behind, for ever. A watermark points into the **source** stream (§6.3), so the
+    /// bound it is compared with has to be a source position too.
+    ///
+    /// `span` remains the authority on what a round will actually do; this answers the cheaper
+    /// question a status query asks, and answers it without forking anything.
     pub fn pending(&self, branch: BranchId, producer: ProducerId) -> Option<WorkGap> {
         let head = self.layers.head(branch)?;
         let gap = WorkGap {
             producer,
             from: self.frontier.watermark(branch, producer),
-            to: head,
+            to: self.position(head),
         };
         (!gap.is_empty()).then_some(gap)
     }

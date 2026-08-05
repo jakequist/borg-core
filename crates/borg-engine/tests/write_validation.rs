@@ -92,6 +92,12 @@ impl Harness {
         })
     }
 
+    /// A session for a writer chosen at run time — which is what this whole file is about, and the
+    /// reason `WriteSession` is not split by writer at the type level (see `write.rs`).
+    ///
+    /// The layer is authored `Source` and the writes carry no derivation, deliberately: what is
+    /// under test is *permission* (§8), and a `Derivation` invented here would say nothing and would
+    /// have to be invented at every call.
     async fn session(&self, writer: Writer) -> Result<WriteSession> {
         self.session_at(V1, writer).await
     }
