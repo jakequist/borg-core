@@ -36,6 +36,15 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
+/// The **client** wire contract — `borg serve` and the SDKs — over this same framing.
+///
+/// A separate module rather than more variants here, because the two protocols answer to different
+/// people: this one is `ProducerCtx` over a pipe and is spoken by code the engine invoked, that one
+/// is the transaction surface over a socket and is spoken by code that invoked the engine. What they
+/// share is the framing, the codecs and the single-key rule, and sharing those is the whole point of
+/// them living in one crate.
+pub mod client;
+
 pub const VERSION: u32 = 1;
 
 /// How messages are encoded on the wire.

@@ -38,9 +38,10 @@ crates/borg-storage-sqlite  SQLite backend
 crates/borg-exec            ExecutionProvider + ProducerCtx traits
 crates/borg-exec-native     in-process Rust producers
 crates/borg-exec-process    subprocess producers over stdio
-crates/borg-protocol        the worker wire contract
+crates/borg-protocol        the worker wire contract; `client.rs` is the client one (§17.5)
 crates/borg-engine          log, branches, defs, derivation, resolver, registry
-crates/borg-cli             the `borg` binary
+crates/borg-cli             the `borg` binary — `ops.rs` is what the commands do, `main.rs` is
+                            argv and printing, `serve.rs` is the same ops over a socket
 scenarios/                  end-to-end scenarios driving the real binary
 ```
 
@@ -135,10 +136,11 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   (`ROADMAP.md`, *Concerns carried over from the transactional-model draft*) and should not be made
   by a janitor as a side effect. Note this is now **two** branches per `borg set`: the transaction's,
   and the round's.
-- **The reap sweep lives in the CLI, not in `Registry::open`.** §12.3 says "when a process opens the
-  store", and for this client that is `run()`. The transaction table is a filesystem sidecar like the
-  pause flags and the producer table; `Registry::open` sits below the provider line, where a
-  filesystem sidecar has no business. A server moves the sweep to wherever it opens the store.
+- **The reap sweep lives above the store, not in `Registry::open`.** §12.3 says "when a process opens
+  the store", and for the CLI that is `run()`; for `borg serve` it is every request, because that is
+  when serve opens the store. The transaction table is a filesystem sidecar like the pause flags and
+  the producer table; `Registry::open` sits below the provider line, where a filesystem sidecar has no
+  business.
 - **How many intermediate derived snapshots a backlog leaves is schedule-dependent.** A round settles
   the whole range `[watermark+1 … head]` (§6.3, §16.5), so one that settles `L10`, `L11` and `L12`
   together leaves one generation of derived layers where three rounds would leave three. Settled
@@ -158,6 +160,19 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.
+- **`borg serve` opens the store per request and serves one request at a time.** A real server holds
+  the store open, and the reason this one cannot is not the socket: `ops::tx_commit` drops its
+  registry so that `auto_derive` can open another with an executor, because two live `Registry`
+  instances over one store break the single-process assumption. Making the server hold one is a change
+  to derivation's lifecycle — the same change that turns the post-write `catch_up` call into a signal
+  (§9.6) — and should be made there rather than worked around here.
+- **A served store locks every other `borg` invocation out** rather than letting the CLI speak to the
+  socket (SPEC.md §17.5). The lock is honest about the assumption that was always there; the CLI
+  connecting instead of being refused is the remote-connection feature that supersedes `borg serve`
+  altogether (SDK-DRAFT.md §2.6), and is deliberately not a v1 of itself. The consequence to know
+  about: **pushing a schema to a served store means stopping the server**, because `def push` and
+  `repo push` read from a filesystem and are not on the socket — see SDK-DRAFT.md §4.3 for why
+  putting them there would be the wrong shape rather than merely missing work.
 - `Set`, `Map`, aggregation pipelines, mid-list insertion, container isolation and generated SDKs
   are all deferred (§18).
 

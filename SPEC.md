@@ -2272,6 +2272,45 @@ field naming it as `up` or `down` — one source of truth, so the two cannot dis
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting
 async through the derivation engine afterwards is a far larger change than paying for it now.
 
+### 17.5 The client protocol
+
+§17.4 is the engine talking to code it invoked. This is the reverse: **a client's transaction surface
+over a socket instead of over argv**, which is what an SDK speaks and what `borg serve` answers.
+
+It reuses §17.4's framing whole — same codecs, same per-codec framing, same **single-key object**
+rule — because the two protocols differ in who is asking and not in how a message is carried. The
+operations are the ones the CLI already has: `tx_begin`, `tx_get`, `tx_set`, `tx_commit`, `tx_abort`,
+`get`, `explain`, `branch_list`, `branch_head`, `def_show`. That is a constraint rather than a
+coincidence: the CLI is the testbed for what a client is like to use, so a protocol needing an
+operation the CLI lacks would be evidence about the CLI.
+
+**Everything travels as canonical text**, layer ids included — `"L120"`, the form §10.4's envelope is
+printed in. A `by` is a `ProducerId`, which is a hash spanning the whole `u64` range, and JSON has no
+integers; the same rounding that corrupts a producer id in a sidecar file would corrupt it here.
+
+**A read answers with the §10.4 envelope, never a bare value.** A transaction is named by its id on
+every message, and by nothing else: transaction state lives beside the store (§12.2), so a handle
+outlives the connection that opened it. A client that disconnects mid-transaction has abandoned it,
+not destroyed it — it may reconnect and carry on, and if it does not, §12.3's idle reaper collects it
+like any other silence. This is what makes a browser tab closing an ordinary event.
+
+**A commit answers with a conflict or a landing, and a conflict names the cell.** "Your commit was
+rejected" is not something a client can act on; "the cell you read moved, and here it is" is the
+input to deciding whether to retry (§13).
+
+The handshake carries the client's **ClientVersion** — the def-layer its generated code was built
+from (§5.4) — so that old generated clients keep reading through `down` migrations, and so the engine
+can eventually name which live clients a def push would break (§5.5). Absent means the branch's
+current def-version, which is what an un-generated client honestly is.
+
+**One process serves a store.** The transaction table, the producer table and the pause flags are
+files beside the store, and the sequencer is in-process; none of that is multi-process safe, and it
+was not before a server existed either. `borg serve` therefore takes an advisory lock and every other
+invocation against that store is refused and told the socket to speak to. The lock's liveness test is
+the socket itself — a record whose socket does not answer is stale and is cleared — because a lock
+that can outlive its holder is worse than no lock. This is v1 honesty and not the destination: the
+destination is the CLI connecting to the socket rather than being turned away by it.
+
 ---
 
 ## 18. v1 Scope
