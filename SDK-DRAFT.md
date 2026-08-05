@@ -227,6 +227,37 @@ await tx.commit();                              // merge; throws ConflictError o
    envelope, describe/def push), unix-socket server, per-connection transaction binding.
    **Scenario 250**: two concurrent SDK clients, S2's conflict through the socket; a client killed
    mid-transaction reaped by the idle timeout.
+
+   **Server half built.** `borg_protocol::client`, `borg serve --socket`, and `scenarios/250-serve`
+   (two clients driving the protocol directly, no SDK). Three corrections to the sketch above, all
+   recorded in `SPEC.md` §17.5 and `crates/borg-cli/src/serve.rs`:
+
+   - *Not* per-connection transaction binding — **per-store**. The transaction table is already a
+     sidecar (§12.2), so a handle outlives its socket for free, and that is the stronger property:
+     binding to the connection would make a dropped socket destroy work rather than abandon it,
+     which is the opposite of what §2.5's browser story needs.
+   - The serve loop being thin required extracting the CLI's command layer (`borg-cli/src/ops.rs`)
+     out of `main.rs`, so that `main.rs` is argv-and-printing and `serve.rs` is protocol-and-message
+     over the same functions. Two things did not lift and are findings about the CLI, not about
+     serve: the `--tx` / `$BORG_TX` / only-one-open defaults are shell affordances a socket client
+     cannot use, and `borg set` is an implicit one-shot transaction with no place in a protocol
+     whose clients hold transactions explicitly.
+   - Not one `Registry` across connections. The store is opened per request and requests are
+     serialised, because the ops layer opens and drops registries around derivation; holding one
+     open is a change to derivation's lifecycle and is the next real server's first job.
+
+   The TS client SDK and the WebSocket listener are **not** built. The transport trait
+   (`serve::Transport` / `serve::Peer`) is the seam the latter slots into, per §5.
+
+   **`def push` and `repo push` are not on the socket, and that leaves a gap worth naming.** Both
+   read from a *filesystem* — a JSON file, a directory of pipeline scripts — and `repo push` writes
+   the resolution table saying where that code lives (§9.2). A client naming paths on the server's
+   disk is not a client operation, it is a deployment one. But the advisory lock means the CLI
+   cannot do it either while the store is served, so today **pushing a schema to a served store
+   means stopping the server**. That is acceptable for a local dev server and is not acceptable for
+   anything else; the answer is a deploy path that ships code rather than names it, which is the
+   same question as `ExecutionProvider`'s container future (§17.3) and should not be pre-empted by
+   adding a `def_push` message that only works when the client and the server share a disk.
 4. **Codegen** — `borg generate --lang ts -o ...` emitting typed structs + `createBorgContext` with
    the ClientVersion stamp; `--watch`. **Scenario 260**: generate, compile a client against it,
    def-push a migration, regenerate, old-versioned client still reads through `down` (the SDK twin

@@ -20,7 +20,9 @@ borg-storage-sqlite.workspace = true
 borg-exec-native.workspace = true
 borg-exec-process.workspace = true
 borg-protocol.workspace = true
-# `time` is what bounds `borg frontier reaches`: a wait with no deadline is a hang.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# `time` is what bounds `borg frontier reaches`: a wait with no deadline is a hang. `signal` is what
+# lets `borg serve` release its advisory lock when it is stopped, rather than leaving one behind on
+# every ordinary shutdown and relying on the next process to notice it is stale.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
 serde.workspace = true
 serde_json.workspace = true
