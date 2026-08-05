@@ -5,3 +5,4 @@ dist/
 # Agent worktrees, not project state.
 .claude/worktrees/
 __pycache__/
+.idea/
