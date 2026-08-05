@@ -2220,6 +2220,13 @@ Two shapes were forced by targeting a shell worker first, and both are better th
 - **Every message is a single-key object**, including the payload-free ones. A worker dispatches on
   one key without special cases.
 
+**An `Invoke` names its producer as a string.** A `ProducerId` is a hash of the producer's name
+(§9.2), so it uses the whole `u64` range, and JSON has no integers — read as a number it rounds to 53
+bits and names a producer that does not exist. This is the same reasoning that makes the producer
+table write ids as strings, applied to the one message that carries one. It cost nothing while every
+worker implemented exactly one producer and ignored the field; a worker serving a whole repo has to
+dispatch on it.
+
 **Strings on the wire are strings.** A `Get` of a string cell is answered `{"value":"acme.ai"}`, not
 with the `@s-…` that is physically stored, and a `Set` carrying `"acme.ai"` is complete — the engine
 interns it before the write lands. A worker therefore never makes a second round trip to resolve or
@@ -2251,6 +2258,13 @@ The payload is shaped so a shell script can produce it with one `jq -n`:
   "migrations": [ { "name": "founded_up" }, { "name": "founded_down" } ] }
 ```
 
+Two optional keys sit beside those three. `"transport"` declares how the executable wants to be
+spoken to once it is a worker — see *Two transports* above — and defaults to `"stdio"`. `"repo"`
+states the repo id the executable believes it belongs to; the authoritative id is the one in
+`borg.toml`, because a repo is a directory and one directory has one id however many executables it
+holds, so this is a cross-check. An SDK that makes an author write the id in code as well should have
+that copy verified rather than quietly ignored, and a repo that says nothing skips the check.
+
 `derived_by`, `up` and `down` name producers **by name**, not by id: a repo knows what it calls its
 own code and should not have to compute the hash the engine turns that into. A name the repo does not
 implement is a push-time error — a field nothing can ever write, or a migration nothing can ever run
@@ -2271,6 +2285,39 @@ field naming it as `up` or `down` — one source of truth, so the two cannot dis
 **`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting
 async through the derivation engine afterwards is a far larger change than paying for it now.
+
+#### Two transports, one protocol
+
+A worker may be spoken to over **its own stdio** or over a **unix socket** the engine creates, one
+per worker process, whose path arrives in `BORG_WORKER_SOCKET`. Same handshake, same messages, same
+per-codec framing; only the descriptors differ.
+
+Stdio is what a shell worker wants — `read` and `echo` and nothing else — and its cost is that the
+worker's stdout carries the protocol, so anything printed for a human corrupts it. A shell author can
+be told that once. It is not survivable in a real client library, where a stray `console.log` in a
+pipeline, a dependency, or a runtime warning desynchronises the stream and surfaces far from its
+cause. On the socket, the protocol has a descriptor of its own and **stdout is entirely the
+author's**.
+
+**The transport is declared, not detected.** It rides on `describe`, which is the one thing the
+engine asks an executable before it must decide how to spawn it — and the decision has to be made
+before the spawn, because by then stdout has been claimed. Detection was the obvious alternative and
+it cannot work: the engine would have to tell "has not connected yet" from "printed to stdout first",
+which is exactly the case the socket exists to make harmless. The detector would be broken by the
+thing it was detecting. An absent declaration means stdio, so a worker written before transports
+existed is untouched and no socket is created for it.
+
+**A socket worker's stdout is pointed at the engine's stderr**, by duplicating the descriptor at
+spawn time. Not inherited: the engine's own stdout is a contract too — `borg get --value` is parsed
+by scripts — and handing a subprocess a pipe into it moves the corruption up one level rather than
+removing it. Not discarded either, because a `console.log` nobody ever sees is its own kind of bug.
+This is where the provider already sends a worker's stderr, and it costs one `dup` and no reader
+thread.
+
+`describe` itself stays a plain `argv[1] == "describe"` invocation printing JSON to stdout on both
+transports. That call is one short-lived process whose entire output *is* the payload: there is no
+stream to desynchronise, a corrupted one fails the push immediately with the offending text, and
+leaving it alone is what keeps a repo of shell pipelines a single `jq -n`.
 
 ---
 

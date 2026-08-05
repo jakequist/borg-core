@@ -105,11 +105,27 @@ await tx.commit();                              // merge; throws ConflictError o
 
 ## 4. Build order and acceptance scenarios (numbering continues from 220)
 
-1. **TS pipeline SDK + worker socket transport** — `packages/borg-sdk` (minimal tooling; nx when a
-   second TS package exists), socket-per-env-var transport in `borg-exec-process` so `console.log`
-   cannot corrupt the stream. **Scenario 230**: the investing pipeline authored in TS, pushed via
-   `borg repo push`, derived, field-granular invalidation asserted — the TS twin of scenario 030,
-   plus a pipeline that deliberately `console.log`s mid-invocation and does no harm.
+1. **TS pipeline SDK + worker socket transport** — **Built.** `packages/borg-sdk` (pnpm, tsc,
+   vitest; no nx until a second TS package), socket-per-env-var transport in `borg-exec-process`,
+   **scenario 230**. What the build settled, beyond what was written above:
+
+   - **The transport is declared in `describe`, not detected at runtime.** Detection would have to
+     tell "has not connected yet" from "printed to stdout first", which is the case the socket exists
+     to make harmless — the detector is broken by the thing it detects. Absent means stdio, so every
+     shell worker is untouched and no socket is created for it. SPEC §17.4 carries the reasoning.
+   - **A socket worker's stdout is duplicated onto the engine's stderr.** Inheriting it would put a
+     subprocess into `borg get --value`'s output; discarding it would hide a `console.log` from the
+     person who wrote it.
+   - **`Invoke` names its producer as a string.** A `ProducerId` is a hash past 2⁵³ and JSON has no
+     integers, so a JS worker dispatching on a number resolves a producer that does not exist. Free
+     until now only because every worker implemented exactly one producer and ignored the field.
+   - **`describe` may also state the repo id**, cross-checked against `borg.toml` rather than
+     ignored, because the DSL makes an author write it a second time.
+   - **Field names are used verbatim**, `isInvestible` in the DSL and `Company#1.isInvestible` at the
+     CLI. A silent case conversion is a mapping somebody has to reverse-engineer from an error.
+   - **`null` is absence in both directions**, collapsing "never written" and "tombstoned"; the store
+     keeps the distinction and a pipeline has nothing different to do with it.
+   - **`int()` refuses values past 2⁵³** rather than rounding them, and names `bigint()`.
 2. **Python pipeline SDK** — the neutrality gate. **Scenario 240**: the same pipeline in Python
    against the same store; a mixed repo (one TS pipeline, one Python) in one push.
 3. **`borg serve` + TS client SDK** — client protocol module in `borg-protocol` (tx ops, resolve
@@ -129,4 +145,12 @@ await tx.commit();                              // merge; throws ConflictError o
   transport trait supports it from day one; the actual HTTP listener lands with the browser work.)
 - Codegen for list/ref fields: how a `Ref` renders in a typed client (a typed handle, presumably —
   `c.get("employees")` yielding refs the client can `tx.object(...)` through).
-- Whether `world` (pipeline random access) takes generated types or stays stringly in v1.
+- Whether `world` (pipeline random access) takes generated types or stays stringly in v1. **Partly
+  answered by the build**: it is stringly, with an optional second argument taking the same
+  `FieldType` the DSL already produces (`world.get(cell, borg.int())`). That is where a generated
+  type slots in, so only the source of the type changes later, not the shape.
+- **`describe` mode is still stdout-sensitive.** A top-level `console.log` in a repo module corrupts
+  the describe payload, because that process's whole stdout *is* the payload. It fails immediately
+  and loudly (`describe emitted unusable JSON`, quoting the text), which is a far better failure than
+  a desynchronised worker — but it is the one place where the socket does not help, and an author who
+  hits it is the same author the socket was built for.

@@ -10,11 +10,18 @@ describes, **update the spec in the same change**. A spec that lags the code is 
 ## Commands
 
 ```
-./check.sh                  # fmt, clippy -D warnings, all Rust tests, all scenarios
+./check.sh                  # fmt, clippy -D warnings, all Rust tests, the TS SDK, all scenarios
 cargo test --workspace      # Rust tests only
 bash scenarios/run-all.sh   # end-to-end CLI scenarios only (needs `cargo build -p borg-cli` first)
 cargo fmt
 ```
+
+```
+cd packages/borg-sdk && pnpm install && pnpm run check   # typecheck, vitest, build
+```
+
+The TypeScript steps need node and pnpm. `check.sh` skips them loudly where those are missing, and
+so does scenario 230 — everything else works everywhere.
 
 ```
 cargo test --release -p borg-engine --test scale -- --ignored --nocapture
@@ -37,10 +44,11 @@ crates/borg-storage         StorageProvider trait + MemoryStorage
 crates/borg-storage-sqlite  SQLite backend
 crates/borg-exec            ExecutionProvider + ProducerCtx traits
 crates/borg-exec-native     in-process Rust producers
-crates/borg-exec-process    subprocess producers over stdio
+crates/borg-exec-process    subprocess producers, over stdio or a unix socket
 crates/borg-protocol        the worker wire contract
 crates/borg-engine          log, branches, defs, derivation, resolver, registry
 crates/borg-cli             the `borg` binary
+packages/borg-sdk           the TypeScript SDK: the author-side DSL and the worker protocol
 scenarios/                  end-to-end scenarios driving the real binary
 ```
 

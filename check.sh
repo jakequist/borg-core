@@ -17,6 +17,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "tests"
 cargo test --workspace
 
+step "typescript"
+# The TypeScript SDK's own tests. Not everywhere has a JavaScript runtime, and this script has to
+# work everywhere, so a missing toolchain is a loud skip rather than a failure — the engine's half of
+# the socket transport is covered by `borg-exec-process`'s tests, which need only cargo.
+if command -v node >/dev/null 2>&1 && command -v pnpm >/dev/null 2>&1; then
+    (cd packages/borg-sdk && pnpm install --silent && pnpm run --silent check)
+else
+    printf '  \033[33m⚠ skipped: node and pnpm are not both installed\033[0m\n'
+fi
+
 step "scenarios"
 cargo build -p borg-cli
 bash scenarios/run-all.sh

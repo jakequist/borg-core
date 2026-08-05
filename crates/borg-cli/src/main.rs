@@ -1157,7 +1157,16 @@ const fn ownership(producer: Option<ProducerId>) -> Ownership {
     }
 }
 
+/// The inverse of `ValueType`'s `Display`, which is what makes a declared type round-trip through a
+/// `describe` payload: `Employee[]` in, `Employee[]` back out of `borg def show`.
 fn value_type(name: &str) -> ValueType {
+    // Checked before the table so that `Any[]` is a list of `Any` rather than the untyped array —
+    // the untyped kinds have no declarable spelling, they are what an *absent* declaration means.
+    if let Some(element) = name.strip_suffix("[]")
+        && !element.is_empty()
+    {
+        return ValueType::List(Box::new(value_type(element)));
+    }
     match name {
         "Int" => ValueType::Int,
         "Bool" => ValueType::Bool,
@@ -1398,6 +1407,13 @@ struct Implementation {
     name: String,
     source: String,
     command: PathBuf,
+    /// How to speak to this producer's worker (§17.4). It comes from the same `describe` that
+    /// declared the producer, so it lives beside the command rather than in the log: like the
+    /// command, it is a fact about *this machine's* copy of the code and not about what is true.
+    ///
+    /// A table written before transports existed has no such field, and defaults to stdio.
+    #[serde(default)]
+    transport: borg_protocol::Transport,
 }
 
 fn load_impls(args: &Args) -> Implementations {
@@ -1440,7 +1456,22 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
     for command in scripts {
         // The script is the source of truth for what it implements, so a producer definition cannot
         // exist without the code that satisfies it.
-        described.push((command.clone(), borg_exec_process::describe(&command)?));
+        let description = borg_exec_process::describe(&command)?;
+        // An SDK whose author writes the repo id in code as well as in `borg.toml` has two copies
+        // of one fact. `borg.toml` is the authoritative one — a repo is a directory, and one
+        // directory has one id however many executables it holds — so the other is checked rather
+        // than ignored. A repo that says nothing (every shell worker) skips this.
+        if let Some(claimed) = description.repo
+            && claimed != repo.0
+        {
+            return Err(BorgError::Storage(format!(
+                "{} describes itself as repo {claimed}, but {}/borg.toml says {}",
+                command.display(),
+                dir.display(),
+                repo.0
+            )));
+        }
+        described.push((command.clone(), description));
     }
 
     let mut impls = load_impls(args);
@@ -1457,7 +1488,14 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                 version: LayerId(0),
                 declaring_repo: repo,
             }));
-            remember(&mut impls, id, &spec.name, &spec.source, command);
+            remember(
+                &mut impls,
+                id,
+                &spec.name,
+                &spec.source,
+                command,
+                description.transport,
+            );
             report.push(format!("{} -> {id}", spec.name));
         }
     }
@@ -1510,12 +1548,12 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                             version: LayerId(0),
                             declaring_repo: repo,
                         }));
-                        let command = described
+                        let (command, transport) = described
                             .iter()
                             .find(|(_, d)| d.migrations.iter().any(|m| m.name == *name))
-                            .map(|(command, _)| command.clone())
+                            .map(|(command, d)| (command.clone(), d.transport))
                             .expect("resolve() accepted the name, so some script described it");
-                        remember(&mut impls, id, name, &spec.name, &command);
+                        remember(&mut impls, id, name, &spec.name, &command, transport);
                         Ok(Some(id))
                     };
                 let up = migration(&field.up, borg_core::MigrationDirection::Up)?;
@@ -1607,11 +1645,19 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
 
 /// Record where a producer's code lives. Producer ids are stable across pushes, so this replaces
 /// rather than accumulates.
-fn remember(impls: &mut Implementations, id: ProducerId, name: &str, source: &str, command: &Path) {
+fn remember(
+    impls: &mut Implementations,
+    id: ProducerId,
+    name: &str,
+    source: &str,
+    command: &Path,
+    transport: borg_protocol::Transport,
+) {
     impls.producers.retain(|p| p.id != id.0);
     impls.producers.push(Implementation {
         id: id.0,
         name: name.to_string(),
+        transport,
         // The struct a worker is invoked over. A migration maps over one of its *fields* (§9.3), but
         // what it is handed is still the entity — `Company:o-1234abcd`, to which it appends the
         // field name — so the struct is what this needs to render.
@@ -1681,7 +1727,12 @@ async fn open_deriving(args: &Args) -> Result<(Registry, Arc<borg_exec_process::
         impls
             .producers
             .iter()
-            .map(|p| (p.id, p.command.clone(), p.source.clone())),
+            .map(|p| borg_exec_process::Registration {
+                producer: p.id,
+                command: p.command.clone(),
+                source: p.source.clone(),
+                transport: p.transport,
+            }),
     )
     // The pool matches the scheduler, because a pool smaller than the degree of parallelism would
     // put the queue back that the pool exists to remove.
