@@ -9,12 +9,38 @@
 //!
 //! ## A round is a transaction
 //!
-//! Settling a source layer forks the branch **at that layer**, runs every producer on the fork, and
-//! merges when it settles (§16.5). A producer's read path is therefore `[(round branch, its head),
-//! (trunk, the source layer)]`: it sees its siblings' output because that output is on the round's
-//! own branch, and a client merge landing on the trunk mid-round is above the fork point and simply
-//! is not in the path. There is no high-water mark to maintain, and `reflects` is the fork point by
-//! construction rather than by bookkeeping.
+//! Settling forks the branch **at the top of the range it is settling**, runs every producer on the
+//! fork, and merges when it settles (§16.5). A producer's read path is therefore
+//! `[(round branch, its head), (trunk, the top of the range)]`: it sees its siblings' output because
+//! that output is on the round's own branch, and a client merge landing on the trunk mid-round is
+//! above the fork point and simply is not in the path. There is no high-water mark to maintain, and
+//! `reflects` is the fork point by construction rather than by bookkeeping.
+//!
+//! ## A round settles a range, not a layer
+//!
+//! One round covers `[watermark+1 … head]` (§6.3, §16.5). The alternative — a round per source layer
+//! — makes a backlog a treadmill: with `L10`, `L11`, `L12` all committed before anything settles, the
+//! `L10` round computes from the world at `L10` and is rejected at merge by its own guard, because
+//! `L11` moved its input while it ran. The guards were right; the *schedule* had guaranteed the work
+//! was stale before it ran.
+//!
+//! Two things follow from the range and both are load-bearing:
+//!
+//! * **The invalidation walk covers every layer in the range, derived layers included.** A cell
+//!   written by a previous round's merged output counts as a trigger for the producers that read it,
+//!   which is the only way a chained migration or a pipeline pushed over already-derived data is ever
+//!   discovered — a derived layer opens no round of its own. A layer is skipped for a producer that
+//!   has already incorporated it, and *"already incorporated"* is the layer's position in the source
+//!   stream ([`DerivationEngine::position`]) against that producer's watermark. Without that test a
+//!   settled branch would re-derive itself for ever: the round's own merged output is in the next
+//!   round's range.
+//! * **The fork is at the top layer, which may be a derived one, while `reflects` is the top
+//!   *source* layer.** A watermark points into the source stream (§6.3), so what the output claims
+//!   has to be a source position; but the world at that position *includes* the consequences of the
+//!   layers below it, and those sit above it in the log. Forking at the top source layer would hide
+//!   exactly the derived output an earlier round merged above it — §16.5's backlog residue. Forking
+//!   at the top layer keeps `reflects` true by construction all the same, because every derived layer
+//!   in between reflects a source layer at or below it.
 //!
 //! ## A round runs in waves
 //!
@@ -69,6 +95,23 @@ const CYCLE_RERUN_LIMIT: u32 = 8;
 /// `borg-exec-process`), not the scheduler's.
 fn default_parallelism() -> usize {
     std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+}
+
+/// The stretch of log one round settles: everything between a watermark and head. SPEC.md §16.5.
+///
+/// Two layer ids, and keeping them apart is the whole of what makes a range honest. `fork_at` is
+/// where the round can see from and is the top of the range whatever authored it; `reflects` is what
+/// its output claims and must be a *source* position, because that is what a watermark points into
+/// (§6.3).
+struct Span {
+    /// Where the round forks — the top of the range, source layer or derived.
+    fork_at: LayerId,
+    /// The highest source layer in the range. What every cell this round writes claims, and where
+    /// every producer's watermark lands when it settles.
+    reflects: LayerId,
+    /// Every committed layer in the range, oldest first. Derived layers are in here on purpose: a
+    /// previous round's merged output is a trigger like any other write.
+    layers: Vec<LayerId>,
 }
 
 /// Where one producer run writes, and what its output claims.
@@ -432,11 +475,16 @@ impl DerivationEngine {
     /// anywhere.
     pub async fn recompute(self: &Arc<Self>, branch: BranchId) -> Result<usize> {
         let path = self.branches.read_path(branch, None)?;
-        // A round settles one *source* layer and labels its output `reflects: that layer` (§6.3), so
-        // it is opened at the highest source layer under the branch's ceiling rather than at the
-        // ceiling itself — the same world, named in the stream watermarks actually point into. The
-        // two differ whenever the last thing to commit was derived, which on a settled branch is
-        // almost always.
+        // **Deliberately not a range**, where [`catch_up`](Self::catch_up) is. A range forks at the
+        // top layer so that a round can see what earlier rounds derived; a rebuild is the one
+        // operation that must *not* see it, or a producer re-running would read its own previous
+        // output as an input and the replay would confirm itself. Forking at the highest source
+        // layer leaves the derived output for that layer above the fork point and out of the world —
+        // which is what `scenarios/100-watermark-truth` depends on, and why it forks and rebuilds
+        // rather than forking and reading.
+        //
+        // It is also the only fork point available: a fresh fork has no head of its own, so the top
+        // of a range is a question about the ancestor's log rather than about this branch.
         let Some(at) = self.layers.highest_source_layer(&path) else {
             return Ok(0);
         };
@@ -451,14 +499,14 @@ impl DerivationEngine {
         Ok(self.settle(branch, at).await?.executed)
     }
 
-    /// Run every producer forward to head. Returns the number of invocations executed.
+    /// Run every producer forward to head, in **one** round. Returns the number of invocations
+    /// executed.
     ///
     /// Work is discovered, never queued: the layers between a producer's watermark and head are the
-    /// complete statement of what remains to do (SPEC.md §16.4).
+    /// complete statement of what remains to do (SPEC.md §16.4). All of them, as one range — see the
+    /// module header for why a round per source layer made a backlog run work it had already
+    /// guaranteed would be rejected.
     pub async fn catch_up(self: &Arc<Self>, branch: BranchId) -> Result<usize> {
-        let Some(head) = self.layers.head(branch) else {
-            return Ok(0);
-        };
         // **Before the gap is measured, not after.** A producer whose code has been pushed again is
         // no longer the producer that failed (SPEC.md §14), and reviving it rewinds its watermark —
         // which is the work this call is about to go and find.
@@ -469,70 +517,165 @@ impl DerivationEngine {
             .map(|p| self.frontier.watermark(branch, p))
             .min()
             .unwrap_or(LayerId(0));
+        let Some(span) = self.span(branch, from)? else {
+            return Ok(0);
+        };
+        Ok(self.settle_span(branch, span).await?.executed)
+    }
 
-        let mut executed = 0;
+    /// The range a round would settle: everything on this branch above `from`, up to head.
+    ///
+    /// `None` where there is nothing to do, and *nothing to do* is a narrower claim than *nothing in
+    /// the range*. A settled branch's head is a derived layer this branch's own last round merged,
+    /// and it is above every watermark by construction — so "the range is non-empty" would be true
+    /// for ever and a catch-up would chase its own output round again on every call. What makes it
+    /// work is a layer's **position** in the source stream: the range holds work only if something in
+    /// it stands above `from`.
+    fn span(&self, branch: BranchId, from: LayerId) -> Result<Option<Span>> {
+        let Some(head) = self.layers.head(branch) else {
+            return Ok(None);
+        };
+        let mut layers = Vec::new();
+        let mut fork_at = None;
+        let mut top_source = None;
+        let mut has_work = false;
+
         for raw in (from.0 + 1)..=head.0 {
-            let source_layer = LayerId(raw);
-            let Some(layer) = self.layers.layer(source_layer) else {
+            let id = LayerId(raw);
+            let Some(layer) = self.layers.layer(id) else {
                 continue;
             };
             if layer.branch != branch {
                 continue;
             }
-            // Only *source* layers open a round. Derived layers are consequences, and are picked up
-            // inside the closure below rather than driving one of their own.
-            if !matches!(layer.author, LayerAuthor::Source) {
-                continue;
+            match layer.author {
+                LayerAuthor::Source => {
+                    // **Stop at a source layer that is still open, rather than settling it or
+                    // stepping over it.** A layer becomes the changeset at commit (§6.2, §9.6) and
+                    // means nothing before then; settling it would derive from writes that may yet
+                    // be abandoned, and skipping it would advance every watermark past a layer
+                    // nothing had incorporated. Neither is available once a client can be writing
+                    // while derivation runs, which is the whole point of this being concurrent. An
+                    // *aborted* layer is different — it will never commit, so there is nothing to
+                    // wait for.
+                    //
+                    // Stopping matters more than it did, because the range's top is now the fork
+                    // point: a layer that committed after the round forked *below* that fork point
+                    // would appear in the round's read path halfway through. Breaking here is what
+                    // keeps the fork point a snapshot.
+                    match layer.state {
+                        borg_core::LayerState::Committed => {}
+                        borg_core::LayerState::Aborted => continue,
+                        borg_core::LayerState::Open | borg_core::LayerState::Sealed => break,
+                    }
+                    layers.push(id);
+                    fork_at = Some(id);
+                    top_source = Some(id);
+                    has_work = true;
+                }
+                LayerAuthor::Derived { reflects, .. } => {
+                    // A derived layer is skipped above whatever state it is in, so an abandoned one
+                    // — a round whose task was cancelled by a panicking peer — costs a layer id and
+                    // nothing else. Waiting on those would let one panic stall every future round.
+                    if layer.state != borg_core::LayerState::Committed {
+                        continue;
+                    }
+                    layers.push(id);
+                    fork_at = Some(id);
+                    // It is in the fork's world either way; it is *work* only if some producer here
+                    // has yet to incorporate the source layer it speaks for.
+                    has_work |= reflects.0 > from.0;
+                }
             }
-            // **Stop at a source layer that is still open, rather than settling it or stepping over
-            // it.** A layer becomes the changeset at commit (§6.2, §9.6) and means nothing before
-            // then; settling it would derive from writes that may yet be abandoned, and skipping it
-            // would advance every watermark past a layer nothing had incorporated. Neither is
-            // available once a client can be writing while derivation runs, which is the whole point
-            // of this being concurrent. An *aborted* layer is different — it will never commit, so
-            // there is nothing to wait for.
-            //
-            // The wait is scoped to source layers deliberately. A derived layer is skipped above
-            // whatever state it is in, so an abandoned one — a round whose task was cancelled by a
-            // panicking peer — costs a layer id and nothing else. Waiting on those would let one
-            // panic stall every future round in the process.
-            match layer.state {
-                borg_core::LayerState::Committed => {}
-                borg_core::LayerState::Aborted => continue,
-                borg_core::LayerState::Open | borg_core::LayerState::Sealed => break,
-            }
-            executed += self.settle(branch, source_layer).await?.executed;
         }
-        Ok(executed)
+
+        let Some(fork_at) = fork_at.filter(|_| has_work) else {
+            return Ok(None);
+        };
+        let reflects = match top_source {
+            Some(id) => id,
+            // Every layer in the range is derived — a fork that has settled what it inherited and
+            // written no source layer of its own. The source position it stands at belongs to an
+            // ancestor, and the read path is what knows where.
+            None => {
+                let path = self.branches.read_path(branch, Some(fork_at))?;
+                match self.layers.highest_source_layer(&path) {
+                    Some(id) => id,
+                    // No source layer anywhere below: nothing to derive from, and nothing a
+                    // watermark could honestly name.
+                    None => return Ok(None),
+                }
+            }
+        };
+        Ok(Some(Span {
+            fork_at,
+            reflects,
+            layers,
+        }))
+    }
+
+    /// Where a layer stands in the **source** stream: its own id if it is one, and the source layer
+    /// it is a consequence of if it is derived (SPEC.md §6.3).
+    ///
+    /// This is the comparison a watermark is for. A producer standing at `W` has incorporated every
+    /// layer whose position is at or below `W` — including derived layers with ids far above `W`,
+    /// because a derived layer reflecting `W` *is* part of the world at `W`.
+    fn position(&self, layer: LayerId) -> LayerId {
+        match self.layers.author_of(layer) {
+            Some(LayerAuthor::Derived { reflects, .. }) => reflects,
+            _ => layer,
+        }
     }
 
     /// Run one source layer's consequences to a fixpoint, as a transaction. SPEC.md §16.5.
     ///
-    /// Fork at the layer, run every producer on the fork, merge what settled. A committed layer
-    /// triggers producers; their output commits further layers, which trigger more. All of it
-    /// carries the same `reflects`, because it is all the consequence of one source layer, and the
-    /// fork point is what makes that claim true rather than merely asserted. The watermark advances
-    /// only once this settles — which is precisely what makes the watermark mean *"replay the world
-    /// at this layer and you get exactly this."*
-    ///
-    /// **Public because a round is a verb** (§16.2), and because the interleavings worth testing —
-    /// two rounds settling different source layers, a client landing mid-round — are statements
-    /// about *which* layer a round settles, which `catch_up` chooses for itself.
-    ///
-    /// Alternating *schedule the whole wave, then run the whole wave* is what makes this safe to
-    /// parallelise; see the module header. It also removes an order-dependence the sequential
-    /// version had and nobody had noticed: work used to be discovered one producer at a time, in
-    /// `HashMap` iteration order, so which producer got to run first was already unspecified.
+    /// The degenerate range: a round whose fork point and `reflects` are both this one layer, and
+    /// whose opening wave is this one layer. **Public because a round is a verb** (§16.2), and
+    /// because the interleavings worth testing — two rounds settling different source layers, a
+    /// client landing mid-round — are statements about *which* layer a round settles, which
+    /// `catch_up` chooses for itself. A test asking for a deliberately stale round needs to name the
+    /// layer it is stale about, and a range would helpfully take the staleness away.
     pub async fn settle(
         self: &Arc<Self>,
         branch: BranchId,
         source_layer: LayerId,
     ) -> Result<RoundOutcome> {
-        // **The fork is the whole of what replaced the ceiling.** Taken at the source layer being
-        // settled, so the round's reads resolve through `[(round, head), (trunk, source layer)]`:
-        // siblings' output is visible because it is on this branch, and anything a client lands on
-        // the trunk meanwhile is above the bound and is not in the path at all. `reflects` cannot
-        // drift from what the round saw, because the fork point *is* what the round can see.
+        self.settle_span(
+            branch,
+            Span {
+                fork_at: source_layer,
+                reflects: source_layer,
+                layers: vec![source_layer],
+            },
+        )
+        .await
+    }
+
+    /// Run a range's consequences to a fixpoint, as a transaction. SPEC.md §16.5.
+    ///
+    /// Fork at the top of the range, run every producer on the fork, merge what settled. The layers
+    /// in the range trigger producers; their output commits further layers, which trigger more. All
+    /// of it carries the same `reflects` — the top *source* layer of the range — and the fork point
+    /// is what makes that claim true rather than merely asserted. The watermark advances only once
+    /// this settles, which is precisely what makes the watermark mean *"replay the world at this
+    /// layer and you get exactly this."*
+    ///
+    /// Alternating *schedule the whole wave, then run the whole wave* is what makes this safe to
+    /// parallelise; see the module header. It also removes an order-dependence the sequential
+    /// version had and nobody had noticed: work used to be discovered one producer at a time, in
+    /// `HashMap` iteration order, so which producer got to run first was already unspecified.
+    async fn settle_span(
+        self: &Arc<Self>,
+        branch: BranchId,
+        mut span: Span,
+    ) -> Result<RoundOutcome> {
+        // **The fork is the whole of what replaced the ceiling.** Taken at the top of the range, so
+        // the round's reads resolve through `[(round, head), (trunk, top of range)]`: siblings'
+        // output is visible because it is on this branch, and anything a client lands on the trunk
+        // meanwhile is above the bound and is not in the path at all. `reflects` cannot drift from
+        // what the round saw, because the fork point *is* what the round can see — and everything
+        // between `reflects` and the fork point is derived output reflecting `reflects` or lower,
+        // which is part of the world `reflects` names rather than something above it.
         //
         // Forked from whichever branch owns the layer rather than from `branch`, because the two
         // differ in the ordinary case of a fork that has written nothing of its own: the highest
@@ -540,14 +683,14 @@ impl DerivationEngine {
         // being settled. That is the same split a client transaction carries (§12.2).
         let owner = self
             .layers
-            .layer(source_layer)
-            .ok_or_else(|| BorgError::Storage(format!("unknown layer {source_layer}")))?
+            .layer(span.fork_at)
+            .ok_or_else(|| BorgError::Storage(format!("unknown layer {}", span.fork_at)))?
             .branch;
-        let round_branch = self.branches.fork(owner, source_layer, None).await?;
+        let round_branch = self.branches.fork(owner, span.fork_at, None).await?;
         let round = Arc::new(Mutex::new(borg_core::Round::new(
             round_branch,
             branch,
-            source_layer,
+            span.fork_at,
         )));
 
         // Folded once per round, from the **trunk** and not from the round's fork point. A round
@@ -564,7 +707,8 @@ impl DerivationEngine {
         let permits = Arc::new(Semaphore::new(self.parallelism()));
 
         let mut executed = 0;
-        let mut wave = vec![source_layer];
+        // Taken rather than cloned: a long backlog's range is as long as the backlog.
+        let mut wave = std::mem::take(&mut span.layers);
         // Scoped to this round: a cycle is an invocation that keeps re-running while the branch head
         // is otherwise fixed (SPEC.md §16.5).
         let mut reruns: HashMap<Invocation, u32> = HashMap::new();
@@ -577,7 +721,7 @@ impl DerivationEngine {
                     branch,
                     round_branch,
                     &wave,
-                    source_layer,
+                    span.reflects,
                     &defs,
                     &mut reruns,
                     &mut seeded,
@@ -599,8 +743,8 @@ impl DerivationEngine {
                     let at = RunAt {
                         on: round_branch,
                         home: branch,
-                        fresh_as_of: source_layer,
-                        reflects: source_layer,
+                        fresh_as_of: span.reflects,
+                        reflects: span.reflects,
                     };
                     let outcome = engine.run(&def, &defs, invocation.input, at).await;
                     // The round takes the accesses by value: they are already the two vectors the
@@ -629,7 +773,7 @@ impl DerivationEngine {
                         executed += 1;
                         wave.push(derived);
                     }
-                    Err(err) => self.record_poisoning(branch, producer, source_layer, &err)?,
+                    Err(err) => self.record_poisoning(branch, producer, span.reflects, &err)?,
                 }
             }
         }
@@ -639,7 +783,7 @@ impl DerivationEngine {
         // production when a later refactor keeps a clone alive.
         let round = std::mem::replace(
             &mut *round.lock().unwrap(),
-            borg_core::Round::new(round_branch, branch, source_layer),
+            borg_core::Round::new(round_branch, branch, span.fork_at),
         );
         let mut outcome = self.branches.merge_round(&round).await?;
         outcome.executed = executed;
@@ -658,7 +802,7 @@ impl DerivationEngine {
         // Holding the watermark back instead would stall every *other* producer on one contended
         // cell, which is the failure partial application exists to avoid.
         for producer in self.producer_ids() {
-            self.frontier.advance(branch, producer, source_layer);
+            self.frontier.advance(branch, producer, span.reflects);
         }
         Ok(outcome)
     }
@@ -674,7 +818,7 @@ impl DerivationEngine {
         branch: BranchId,
         round_branch: BranchId,
         wave: &[LayerId],
-        source_layer: LayerId,
+        reflects: LayerId,
         defs: &DefView,
         reruns: &mut HashMap<Invocation, u32>,
         seeded: &mut HashSet<ProducerId>,
@@ -687,6 +831,10 @@ impl DerivationEngine {
         let mut scheduled: HashSet<Invocation> = HashSet::new();
 
         for layer in wave {
+            // Where this layer stands in the source stream, which is what a watermark is comparable
+            // with. For a layer the round produced itself this is the round's own `reflects`, so an
+            // intra-round wave behaves exactly as it always did.
+            let position = self.position(*layer);
             let cells = self.cells_of(*layer).await?;
 
             for def in self.producer_defs() {
@@ -696,10 +844,16 @@ impl DerivationEngine {
                 if self.is_broken(branch, def.id)?.is_some() {
                     continue;
                 }
-                // A producer already caught up past this layer has no business in this round —
-                // otherwise a newly-registered producer replaying history would drag every
-                // up-to-date producer back through it.
-                if self.frontier.watermark(branch, def.id).0 >= source_layer.0 {
+                // A producer that has already incorporated this layer has no business being
+                // dirtied by it — otherwise a newly-registered producer replaying history would drag
+                // every up-to-date producer back through it, and a settled branch would re-derive
+                // itself off its own merged output for ever.
+                //
+                // Asked **per layer** rather than once per round, because a range holds layers
+                // standing at different source positions: a derived layer a previous round merged
+                // and a source layer that arrived afterwards are both in front of a new producer,
+                // and only the second of them is in front of a producer that was already caught up.
+                if self.frontier.watermark(branch, def.id).0 >= position.0 {
                     continue;
                 }
                 // A migration whose step this branch does not record has nothing to bridge here —
@@ -716,10 +870,17 @@ impl DerivationEngine {
                 }
                 let mut candidates = self.invalidated_by(branch, &cells, &def, defs)?;
                 if seeded.insert(def.id) {
-                    for invocation in self.backfill(branch, round_branch, &def, defs).await? {
-                        if !candidates.contains(&invocation) {
-                            candidates.push(invocation);
-                        }
+                    let seeds = self.backfill(branch, round_branch, &def, defs).await?;
+                    if !seeds.is_empty() {
+                        // **Merged through a set, never by `Vec::contains`** (invariant 5). Both
+                        // sides can be the producer's whole buffer at once, and they now routinely
+                        // are: the seeding round used to fork below the data and find nothing, so
+                        // this loop was only ever exercised at one or two candidates. Settling a
+                        // range puts the fork where the buffer is full, and a linear membership test
+                        // turned a 128k backfill into 88 seconds against 2.6.
+                        let mut merged: HashSet<Invocation> = candidates.into_iter().collect();
+                        merged.extend(seeds);
+                        candidates = merged.into_iter().collect();
                     }
                 }
                 for invocation in candidates {
@@ -732,7 +893,7 @@ impl DerivationEngine {
                         self.record_poisoning(
                             branch,
                             def.id,
-                            source_layer,
+                            reflects,
                             &BorgError::ProducerCycle {
                                 producer: def.id,
                                 runs: *runs,
@@ -807,12 +968,12 @@ impl DerivationEngine {
         let role = defs.migration_role(def);
         let path = self.branches.read_path(round_branch, None)?;
         let mut stream = self.storage.scan_buffer(&path, &def.source).await?;
-        let mut candidates = Vec::new();
+        // A set, not a `Vec` with a membership scan: a buffer holds one row per entity and there may
+        // be millions of them (invariant 5, §16.3). This is a hot enough path to have been measured
+        // — see the merge in `schedule`.
+        let mut candidates: HashSet<CellRef> = HashSet::new();
         while let Some(row) = stream.next().await {
-            let cell = row?.cell;
-            if !candidates.contains(&cell) {
-                candidates.push(cell);
-            }
+            candidates.insert(row?.cell);
         }
 
         let mut found = Vec::new();

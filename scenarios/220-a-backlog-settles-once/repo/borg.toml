@@ -1,0 +1,12 @@
+# A two-hop chain. The backlog scenario wants a chain rather than a single producer so that "one
+# round" is a claim about the whole closure — `tier` reads what `invest` writes, and both settle
+# inside the one round the range opens.
+[repo]
+id = 1
+name = "investing"
+
+[[pipelines]]
+command = "pipelines/invest.sh"
+
+[[pipelines]]
+command = "pipelines/tier.sh"

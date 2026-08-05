@@ -3,10 +3,12 @@
 # SPEC.md §5.3, §13, §16.5.
 #
 # Two features that had never met. A **def-only merge** carries a schema change from a fork into a
-# trunk without any of the fork's data (§13). A **round** forks the trunk at the source layer it
-# settles and labels everything it produces with that layer. Put them together and the trunk is
+# trunk without any of the fork's data (§13). A **round** forks the trunk at the top of the range it
+# settles and labels everything it produces with the top source layer of it. Put them together and
+# the trunk is
 # holding unsettled source data at the moment its schema moves underneath it — so the round that
-# eventually runs computes under a def-view that arrived after the data it is settling was written.
+# eventually runs computes under a def-view that arrived after the data it is settling was written,
+# and the def layer the merge landed is itself the top of the range.
 #
 # What must not happen, and is what this is written to catch:
 #
@@ -61,6 +63,9 @@ assert_eq "$(borg get 'Company#2.decade' --value)" "" \
 
 borg branch merge next --defs-only >/dev/null
 v2="$(borg def version)"
+# The top of the range the owed round will settle: everything from the watermark to head, which is
+# now this def layer (§16.5). Captured before the round runs, because that is what its output claims.
+top="$(borg layer head)"
 assert_contains "$(borg def show Company)" "Int" "the schema change crosses, def-only"
 if [ "$v2" = "$v1" ]; then
     fail "a def-only merge must move the trunk's def-version"
@@ -86,11 +91,13 @@ assert_eq "$(borg get 'Company#2.founded' --value)" "1985" \
 assert_eq "$(borg get 'Company#2.founded' --value --client-version "$v1")" "1985-04-04" \
     "while the value its author wrote is untouched"
 
-# Every derived layer on the trunk states a **source** layer, never the def layer the merge landed.
-# A watermark is a position in the source stream (§10.1), and a def layer is not in it.
+# Every derived layer on the trunk states a layer in the **source** stream, and states the same one:
+# a round settles a range and emits one derived layer per producer reflecting the top of it (§6.3,
+# §16.5). The owed write is inside that range, so what the round names is the range's top rather than
+# the layer that dirtied it — which is why `$owed` is not what is looked for here.
 layers="$(borg layer list)"
-assert_contains "$layers" "reflects ${owed}" \
-    "the round that settled the owed write says so, naming the source layer and not the merge"
+assert_contains "$layers" "reflects ${top}" \
+    "the round that settled the owed write names the top of the range it settled"
 if printf '%s\n' "$layers" | grep -E 'derived by .*reflects' | grep -qv 'reflects L[0-9]*$'; then
     fail "a derived layer reflects something that is not a layer id
       $layers"
@@ -120,23 +127,26 @@ assert_eq "$(borg get 'Company#1.founded' --value --client-version "$v2")" "1999
 assert_eq "$(borg get 'Company#1.founded' --value --client-version "$v1")" "1999-06-01" \
     "and so is the source value underneath it"
 
-# What the *new* version says is the honest half. Nothing has walked the second step of the chain, so
-# the read is absent and labelled behind — never a value invented at a version nothing computed.
+# **The second step of the chain is reached by a plain catch-up.** `founded@v3`'s input is
+# `founded@v2`, which nothing but a *derived* layer has ever written — and a derived layer opens no
+# round of its own. While a round settled one source layer at a time, nothing triggered the second
+# migration and `borg derive --rebuild` was the only way to it. A round settles the range
+# `[watermark+1 … head]` (§16.5), so the derived layer the previous round merged is in its opening
+# wave and triggers whoever reads what it wrote.
 out="$(borg get 'Company#1.founded')"
-assert_field "$out" "value" "<absent>" "the version the merge introduced holds nothing yet"
-assert_field "$out" "state" "stale" "and says so, rather than serving something plausible"
-
-# Not wedged. **A chained migration is not discovered by a catch-up** — a producer's work is the
-# source layers between its watermark and head (§16.4), and the second step's input is written only
-# by a *derived* layer, which opens no round. `--rebuild` is the escape hatch and is one command: it
-# rewinds every watermark and settles the whole chain in one round, where each hop sees the previous
-# one's output on the round's own branch. Recorded in `ROADMAP.md` and pinned by
-# `crates/borg-engine/tests/composition.rs`.
-borg derive --rebuild >/dev/null
-assert_eq "$(borg get 'Company#1.founded' --value)" "1990s" \
-    "a rebuild walks both steps of the chain: 1999-06-01 → 1999 → 1990s"
+assert_field "$out" "value" "1990s" \
+    "a catch-up walks both steps of the chain: 1999-06-01 → 1999 → 1990s"
+assert_field "$out" "state" "current" "and says current, because nothing is behind it"
 assert_eq "$(borg get 'Company#3.founded' --value --client-version "$v3")" "1970s" \
     "including for the value written while the second change was still on the fork"
+assert_eq "$(borg derive --count)" "0" "the trunk settles rather than chasing itself"
+
+# Not wedged, and the rebuild agrees with the catch-up rather than correcting it — which is the
+# statement worth keeping now that both routes reach the same place. §6.3 licenses the comparison:
+# derived layers are a cache, and recompute is always their fallback.
+borg derive --rebuild >/dev/null
+assert_eq "$(borg get 'Company#1.founded' --value)" "1990s" \
+    "a rebuild reaches the same value the catch-up did"
 assert_eq "$(borg get 'Company#1.decade' --value)" "1990s" \
     "and the pipeline that reads the oldest version of the field is unaffected by any of it"
 assert_eq "$(borg derive --count)" "0" "with the branch settled afterwards"

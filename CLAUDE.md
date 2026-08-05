@@ -102,11 +102,6 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - Auto-derivation happens in the process that commits a layer, not in a scheduler of its own. A
   write therefore pays for the derivation it causes; §9.6 says that is a latency property, not a
   semantic one, and a server moves the same call behind a signal.
-- Rounds settle one source layer each, so a **backlog** — several source layers committed before any
-  is settled — leaves the round settling the earlier one merging above the later one's id, where the
-  round settling the later one cannot see it. Costs re-runs rather than correctness in the shapes v1
-  produces; settling a *range* is the fix and it changes what a watermark counts (§16.5,
-  `ROADMAP.md`).
 - `scan_buffer` and `read_layer` materialise results before streaming them.
 - SQLite `Registry::open` rebuilds indexes by replaying the log — `O(log)` per CLI invocation.
 - Writes to list and untyped-container cells are **not** validated: there is no `ListDef` event to
@@ -132,16 +127,17 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   store", and for this client that is `run()`. The transaction table is a filesystem sidecar like the
   pause flags and the producer table; `Registry::open` sits below the provider line, where a
   filesystem sidecar has no business. A server moves the sweep to wherever it opens the store.
+- **How many intermediate derived snapshots a backlog leaves is schedule-dependent.** A round settles
+  the whole range `[watermark+1 … head]` (§6.3, §16.5), so one that settles `L10`, `L11` and `L12`
+  together leaves one generation of derived layers where three rounds would leave three. Settled
+  values and every label on them are unaffected and are what `scenarios/200-determinism` sweeps;
+  nothing can ask the other question, because derived data is addressed by `reflects` and never by
+  derived LayerId. This is deliberate — see `ROADMAP.md`, *Settling a range is a schedule change*.
 - **Every `borg set` now costs four layers** — one on its transaction branch, one on the parent
   naming it, and then a round which is one derived layer per producer on its own branch plus one per
   producer on the parent. Forks are `O(1)` and layers are cheap, but `Registry::open` replays the log
   on every CLI invocation, so the `O(log)` open grows with it. SPEC-DRAFT §7.4 flagged this; the
   fan-out benchmark cannot see it, because it drives the engine rather than the CLI.
-- **A chained migration is not discovered by a catch-up.** A producer whose input version is written
-  only by a *derived* layer is never triggered — derived layers open no rounds — and §9.6's seeding,
-  its other route, is spent by the round `catch_up` opens at the bottom of the log, where the buffer
-  is still empty. `borg derive --rebuild` runs it. This catches a pipeline pushed over already-derived
-  data too. Same fix as the backlog entry above: settle a range (`ROADMAP.md`).
 - **A producer that has never succeeded has no cell to call `broken`.** §14's state is a label on a
   stored record (§10.4), and a pipeline that threw on its first run wrote none, so its output reads
   as simply absent. Enumerating the cells a producer *might* have written is not a set anything can

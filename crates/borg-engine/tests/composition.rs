@@ -552,6 +552,17 @@ async fn a_def_only_merge_landing_mid_round_does_not_mislabel_the_rounds_output(
         0,
         "the branch settles rather than chasing itself"
     );
+    if outcome.applied > 0 {
+        // The second step of the chain, reached by a plain catch-up: `up2`'s input exists only in the
+        // derived layer the first round merged, and a round settles the whole range it is behind on
+        // (§16.5), so that layer is in its opening wave. This used to need `--rebuild`.
+        assert_eq!(
+            h.stored_at(&prop(acme, "website"), DefVersion(v3.0)).await,
+            Some(Value::Int(180)),
+            "the migration the merge brought with it ran over the round's output, at the version it \
+             was filed at: 9 → 90 → 180"
+        );
+    }
 
     // — and the trunk still works as a trunk: a client writing the old shape still reaches the view
     // the round was producing, which is the thing a def merge landing mid-round could plausibly have
@@ -566,10 +577,10 @@ async fn a_def_only_merge_landing_mid_round_does_not_mislabel_the_rounds_output(
         "a write after the merge still migrates through the step the round was mid-way through"
     );
 
-    // The version the merge introduced is reached by rebuilding, and *what it computes from* is the
-    // proof that the round's label was right: 180 is 90 doubled, so the second step consumed exactly
-    // the record the first round filed at `v2`. Why a rebuild is needed rather than a catch-up is a
-    // limitation of its own, pinned by the test below.
+    // The same conclusion by the route that owes nothing to whether the round above landed: a
+    // rebuild rewinds every watermark and runs the chain from source. *What it computes from* is the
+    // proof that the round's label was right — 180 is 90 doubled, so the second step consumed
+    // exactly the record the first round filed at `v2`.
     h.engine.recompute(BRANCH).await?;
     let arrived = h.read(&prop(acme, "website"), v3).await?;
     assert_eq!(
@@ -583,24 +594,23 @@ async fn a_def_only_merge_landing_mid_round_does_not_mislabel_the_rounds_output(
     Ok(())
 }
 
-/// **A migration chained onto a migration does not materialise on a catch-up**, and needs
-/// `borg derive --rebuild`. Sequential, no concurrency: this is here because S14 tripped over it and
-/// the honest thing is to pin it rather than to let a composition test quietly depend on it.
+/// **A migration chained onto a migration materialises on a plain catch-up.** Sequential, no
+/// concurrency: this is here because S14 tripped over it, and it used to pin the *gap* rather than
+/// the fix.
 ///
-/// It is the `ROADMAP.md` entry *A backlog of source layers still costs re-runs*, in the shape where
-/// it costs more than re-runs. A producer's work is the source layers between its watermark and head
-/// (§16.4), and a producer that has never run takes its whole source buffer instead (§9.6) — but
-/// that seeding fires only while its watermark is still zero, and `catch_up` starts from the
-/// *minimum* watermark across all producers, which a brand-new producer drags to the bottom of the
-/// log. So the seeding round forks at the very first layer, where the buffer it wants is empty, and
-/// the watermark advances past it. Afterwards `up2`'s input version is only ever written by a
-/// *derived* layer, which opens no round of its own, so nothing rediscovers it.
+/// `up2`'s input version is written only by a **derived** layer — the one the round settling `up1`
+/// merged — and while a round settled one source layer at a time there were two reasons nothing
+/// found it. Derived layers opened no rounds, so the layer that wrote the input never triggered
+/// anything; and §9.6's seeding, the other route, was spent by a round forked at the bottom of the
+/// log, because `catch_up` starts from the *minimum* watermark across producers and a brand-new
+/// producer drags that to zero — where the buffer it wanted was still empty.
 ///
-/// `recompute` rewinds every watermark and settles the highest source layer, so the whole chain runs
-/// in one round and each hop sees the previous one's output on the round's own branch. That is the
-/// escape hatch, it is one command, and it is `O(everything derivable)`.
+/// Settling a **range** closes both. One round covers `[watermark+1 … head]`, so the derived layer
+/// carrying `website@v2` is in the round's opening wave and triggers `up2` through it; and the round
+/// forks at the *top* of the range, so the seeding scan sees the world as it now stands rather than
+/// as it stood before any of this existed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_migration_chained_onto_a_migration_needs_a_rebuild() -> Result<()> {
+async fn a_migration_chained_onto_a_migration_materialises_on_a_catch_up() -> Result<()> {
     let h = Harness::new();
     let v1 = ClientVersion(h.defs.push(BRANCH, vec![declare_website()]).await?);
     let v2 = ClientVersion(h.defs.push(BRANCH, vec![mutate_website(UP)]).await?);
@@ -618,26 +628,19 @@ async fn a_migration_chained_onto_a_migration_needs_a_rebuild() -> Result<()> {
 
     let v3 = ClientVersion(h.defs.push(BRANCH, vec![mutate_website(UP2)]).await?);
     h.install_up(UP2, website_up(2, None));
-    assert_eq!(
-        h.engine.catch_up(BRANCH).await?,
-        0,
-        "the second step is not discovered by a catch-up: its input is written only by a derived \
-         layer, and derived layers open no rounds"
-    );
-    assert_eq!(
-        h.stored_at(&prop(acme, "website"), DefVersion(v3.0)).await,
-        None,
-    );
-    // Honest about it, at least: absent and labelled behind, never a value that isn't there.
-    let behind = h.read(&prop(acme, "website"), v3).await?;
-    assert_eq!(behind.value, None);
-    assert_eq!(behind.state, Freshness::Stale);
-
-    h.engine.recompute(BRANCH).await?;
+    h.engine.catch_up(BRANCH).await?;
     assert_eq!(
         h.stored_at(&prop(acme, "website"), DefVersion(v3.0)).await,
         Some(Value::Int(180)),
-        "a rebuild runs the whole chain in one round, where each hop sees the last on its own branch"
+        "and so does the second, over the first one's output: 9 → 90 → 180"
+    );
+    let arrived = h.read(&prop(acme, "website"), v3).await?;
+    assert_eq!(arrived.value, Some(Value::Int(180)));
+    assert_eq!(arrived.state, Freshness::Current);
+    assert_eq!(
+        h.engine.catch_up(BRANCH).await?,
+        0,
+        "and the branch settles rather than chasing its own derived layers round again"
     );
     Ok(())
 }

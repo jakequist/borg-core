@@ -60,6 +60,13 @@ the scheduler orders it. That class found a lost update — a migration deleted 
 the guard subtraction was keyed on the cell rather than on the record — and it is the only producer
 in the system that could have.
 
+**And derivation settles a range rather than a layer.** A round covers everything between the
+watermark and head, so a backlog no longer runs work its own guards are guaranteed to reject, and a
+producer whose input exists only in derived data — a chained migration, a pipeline pushed over
+something already derived — is discovered by an ordinary `borg derive` instead of needing a full
+rebuild. What it gives up is written down in §6.3: how many intermediate derived snapshots a backlog
+leaves is now a property of the schedule, and nothing can ask.
+
 Act 1 is the modern ORM.
 
 ---
@@ -266,6 +273,42 @@ against 1.66s. At eight, 1.93s against 1.93s and 1.58s against 1.52s. That is no
 directions, and it is what the change predicts: a round with no concurrent writer does not build its
 guard set at all (`touched_since` answers the whole of it in two map lookups), and where one is built
 the difference is a `BTreeSet` of `&CellAt` where there was one of `&CellRef`.
+
+### I — a round settles a range
+
+A round covered one source layer. It now covers `[watermark+1 … head]`, and the two limitations this
+file has carried since G — *a backlog of source layers still costs re-runs* and *a chained migration
+is not discovered by a catch-up* — are the same change and are both closed.
+
+Neither was a cost entry. A round per source layer **manufactures** the staleness its own guards then
+reject: settling `L10` while `L11` is already on the trunk runs work that was guaranteed to lose. And
+a producer whose input exists only in a *derived* layer had nothing to trigger it, because derived
+layers open no rounds, so a chained migration or a pipeline pushed over already-derived data needed
+`borg derive --rebuild` and an operator who knew to run it.
+
+Three things moved together: the opening wave is every layer in the range, derived layers included;
+the fork is at the top *layer* while `reflects` stays the top *source* layer; and the buffer scan runs
+at the top, where the world is complete. §6.3, §9.6, §16.4 and §16.5 are updated — §6.3's
+no-coalescing rule is retired, and what it costs is written down. `scenarios/220-a-backlog-settles-once`
+is the new scenario; `rounds.rs` gains the backlog, the pipeline-over-derived-data case and a backlog
+under a concurrent writer; `composition.rs`'s chained-migration test flipped from pinning the gap to
+proving the fix; `scenarios/180` reaches the second hop of its chain with a plain `borg derive` and
+names the top of the range rather than the layer that dirtied it. One decision came out of it, below.
+
+**The fan-out benchmark found a quadratic, and it was a real one.** Settling a range puts the seeding
+scan (§9.6) where the buffer is *full* — which it never was before, because `catch_up` spent it on a
+round forked at the bottom of the log. Two `Vec::contains` dedupes that had only ever seen one or two
+candidates suddenly saw 128k, and 128k entities took **88 seconds to derive against 2.6**. Both are
+now sets. This is exactly `CLAUDE.md` invariant 5 and exactly the class the benchmark exists for: no
+correctness test could see it, the change that exposed it touched neither dedupe, and the curve said
+so immediately.
+
+After the fix, 128k entities on this machine: derive 2.66s at one core against 2.62s before, 2.06s at
+eight against 2.02s; re-derive after flipping the one shared cell 2.46s against 2.38s at one core and
+1.59s against 1.52s at eight. Two to nine percent, consistently in one direction, and it is work the
+old schedule was not doing — the seeding scan now runs over a populated buffer on the first derive.
+The push-then-derive pattern the benchmark uses has no backlog in it, so the improvement the change is
+*for* does not show here; `220` is where it is visible.
 
 ### Deferred, still
 
@@ -968,10 +1011,11 @@ observed a change to its own input as its own output. The types were right every
 was thinking about; the loss happened in a `filter`, where projecting a version away reads as a
 simplification.
 
-### A chained migration is not discovered by a catch-up
+### A chained migration is not discovered by a catch-up — **fixed in I**
 
-Turned up by S14 and *not* fixed, because it is the deferred entry below in a shape where it costs
-more than re-runs. Sequential, no concurrency needed:
+Turned up by S14 and left as a limitation for two milestones, because it is the entry below in a
+shape where it costs more than re-runs. Both are closed by *settle a range*; what follows is the
+diagnosis as it stood. Sequential, no concurrency needed:
 
 ```
 declare Company.website;  mutate → up1;  write a value;  derive   # website@v2 materializes
@@ -990,24 +1034,35 @@ chance is spent on the wrong fork point.
 The same shape catches a **pipeline pushed over data whose inputs are already derived**, which is the
 more likely way to meet it.
 
-`borg derive --rebuild` is the escape hatch, is one command, and works: it rewinds every watermark
-and settles the highest source layer, so the whole chain runs inside one round where each hop sees
-the previous one on the round's own branch. `crates/borg-engine/tests/composition.rs` pins both the
-limitation and the escape, and `scenarios/180` shows it end to end. Settling a *range* rather than a
-single layer is the fix, and it is the same fix the entry below wants.
+`borg derive --rebuild` was the escape hatch, and it worked: it rewinds every watermark and settles
+the highest source layer, so the whole chain runs inside one round where each hop sees the previous
+one on the round's own branch. It is `O(everything derivable)` and it needs an operator to know to
+run it, which is the objection.
 
-### A backlog of source layers still costs re-runs
+**Fixed by settling a range.** The derived layer carrying `up1`'s output is now in the opening wave
+of the round that follows it, so the trigger exists; and the round forks at the *top* of the range,
+so §9.6's seeding scans a world that contains what it is looking for. Both halves were needed —
+either alone leaves the case unreachable. `crates/borg-engine/tests/composition.rs` flipped from
+pinning the gap to proving the fix, `crates/borg-engine/tests/rounds.rs` has the pipeline shape
+without a migration in it, and `scenarios/180` now reaches the second hop with a plain `borg derive`.
 
-Rounds settle one source layer each, so when several are committed before any is settled, the round
-settling the earlier layer merges *above* the later layer's id — and the round settling the later one,
-forked at it, cannot see that output. This predates the change (a ceiling stalled at `L'` had the same
-blind spot in its first wave, and only saw past it by way of the prefix hole) and is unchanged by it.
+### A backlog of source layers still costs re-runs — **fixed in I**
 
-It costs re-runs rather than correctness in the shapes v1 produces, because each round recomputes what
-its own source layer dirtied, chains included. The exposure is an invocation dirtied by `L'` that
-depends on a derived cell only an earlier round produced. Settling a *range* rather than a single
-layer is the shape that closes it, and it changes what a watermark counts — its own change, with its
-own scenario.
+Rounds settled one source layer each, so when several were committed before any was settled, the
+round settling the earlier layer merged *above* the later layer's id — and the round settling the
+later one, forked at it, could not see that output. It predated the round-as-transaction change (a
+ceiling stalled at `L'` had the same blind spot in its first wave, and only saw past it by way of the
+prefix hole) and was unchanged by it.
+
+It cost re-runs rather than correctness in the shapes v1 produces, because each round recomputes what
+its own source layer dirtied, chains included. The exposure was an invocation dirtied by `L'` that
+depends on a derived cell only an earlier round produced.
+
+**Fixed by settling a range**, and the re-run half turned out to be the more interesting of the two.
+A round per source layer does not merely *risk* staleness under backlog — it manufactures it: the
+round settling `L10` is rejected by its own guard on an input `L11` has already moved, and the guard
+is right. The schedule had guaranteed the work was stale before it ran. See *Settling a range is a
+schedule change, and it retires §6.3's no-coalescing rule* below.
 
 ### The determinism sweep is a scenario with a knob, and its writes go through transactions
 
@@ -1092,6 +1147,75 @@ Not covered: a producer that has never succeeded writes no cells, so there is no
 label. `broken` is a label on a stored record (§10.4), and enumerating the cells a producer *might*
 have written is not a set anything can produce.
 
+### Settling a range is a schedule change, and it retires §6.3's no-coalescing rule
+
+`catch_up` used to open one round per source layer. It now opens **one round for
+`[watermark+1 … head]`**. The two entries above are both this change, and neither of them is a
+performance entry — which is why it is a decision and not a tuning note.
+
+**The backlog case is a schedule manufacturing staleness.** With `L10`, `L11` and `L12` committed
+before anything settles, the `L10` round reads the world at `L10`, and by the time it merges its
+guard on an input `L11` moved has failed. The guard is correct. The *schedule* chose to run work it
+had already guaranteed would be rejected, and under sustained backlog most derivation work goes that
+way. A range has nothing to be stale about: the fork point is the top of it.
+
+**Three things had to move together**, and any one alone leaves a hole:
+
+1. **The invalidation walk covers derived layers.** This is the semantic change, not the
+   optimisation. A cell written by a previous round's merged output now counts as a trigger for
+   producers that read it — which is the only route to a chained migration or a pipeline pushed over
+   already-derived data, because derived layers open no rounds. It needs its own guard against
+   runaway: a layer's **position** in the source stream (its id if source, its `reflects` if derived)
+   is compared with each producer's watermark, per layer rather than once per round. Without that a
+   settled branch re-derives itself for ever off the layers its own last round merged, and every
+   *"the branch settles rather than chasing itself"* assertion in the suite would go red.
+2. **The fork is at the top *layer*; `reflects` is the top *source* layer.** These came apart and had
+   to. A watermark points into the source stream (§6.3) so what the output claims must be a source
+   position; but the world at that position includes the derived consequences of the layers below it,
+   and those sit *above* it in the log. Forking at the top source layer would hide exactly them —
+   which is the residue §16.5 recorded. `reflects` is still true by construction, because everything
+   between it and the fork point reflects it or lower and is therefore part of the world it names.
+3. **The buffer scan runs at the top of the range.** It follows from (2) — `backfill` reads through
+   the round branch's ancestry — and it is the half that fixes the *seeding* route rather than the
+   trigger route.
+
+**What is given up is derived-history granularity, and §6.3 said so in advance.** v1's rule was one
+derived layer per `(producer, source layer)`, with the reasoning recorded: *"coalescing across source
+layers is the natural v2 optimisation and is a scheduler policy, not a redesign."* That is exactly
+what this is, except that it is not an optimisation. The new rule is **one derived layer per producer
+per round**, `reflects` = the top of the range. Two instances replaying the same source log still
+agree on every settled value and on every label; they no longer agree on how many intermediate
+snapshots exist. Nothing can ask: derived data is addressed by `reflects` and never by derived
+LayerId, so a time-travel read at `L11` takes the greatest `reflects ≤ L11` and gets the world at
+`L11` in both. `200-determinism`'s digest already strips layer ids, which was designed for this.
+
+**What is unchanged is the guard model.** A genuinely concurrent writer still trips a round's guards,
+partial application still drops the invocations that lost, and the cascade still takes what consumed
+their output. The treadmill went away because the schedule stopped manufacturing staleness, not
+because anything got weaker — `rounds.rs` asserts the backlog-plus-concurrent-writer case for exactly
+that reason.
+
+**Two things it costs that are worth saying plainly.**
+
+`scenarios/180` changed its claims rather than its numbers. It asserted that a derived layer names
+the source layer that dirtied it; a range names the *top* of the range, which in that scenario is the
+def layer the merge landed. Both are positions in the source stream — a def layer is authored by a
+client and is a source layer — and the newer label is the tighter of the two, because the round did
+compute under that def-view. The scenario also stopped needing `--rebuild` for the second hop of its
+chain, which is the fix arriving where it was documented as missing.
+
+And **a producer that is exactly caught up to the top of a range does not participate in it.** If
+`P1` stands at `reflects` and a brand-new `P2` runs in the same round and writes something `P1`
+reads, `P1` is not re-run. It is the pre-existing per-round gate asked per layer, and in practice a
+new producer arrives with a def push, which is itself a source layer above `P1`'s watermark and puts
+`P1` back in the round. Worth knowing rather than worth a mechanism.
+
+`recompute` was deliberately **not** converted to a range. A rebuild is the one operation that must
+not see what earlier rounds derived — §10.1's check is *fork at W, recompute, compare*, and a fork
+point above the derived output would let a producer read its own previous answer and confirm itself.
+It also has no head of its own to take a range from, since `100-watermark-truth` rebuilds a fresh
+fork. It keeps forking at the highest source layer, which is a one-layer range by another name.
+
 ---
 
 ## Tests we owe
@@ -1142,7 +1266,12 @@ in both merge orders — which is S8 with the one producer S8's fixture structur
 and is where the guard bug was; a client write to another entity landing mid-migration, checked by
 replaying at the stated watermark; a def-only merge landing mid-round, both that it does not mislabel
 the round's output and that it does not reject a round it could not have disturbed; and a chained
-migration pinned as the limitation it is rather than left to be rediscovered.
+migration pinned as the limitation it then was rather than left to be rediscovered.
+
+Paid off again in I: that last test flipped from pinning the gap to proving the fix, and
+`rounds.rs` gained the three cases a range is judged on — a backlog settling as one round, a pipeline
+pushed over already-derived data being discovered at all, and a backlog round still losing its guard
+to a genuinely concurrent writer.
 
 Through the binary: a migration's round rejected by its guard, asserted on **layers** rather than on
 values, because the value alone cannot distinguish "the stale round was rejected" from "the stale

@@ -1,7 +1,7 @@
 //! Derivation as a transaction. SPEC.md §16.5, SPEC-DRAFT §3, §4, §9 (S7–S10).
 //!
-//! A round forks the branch at the source layer it settles, runs producers on the fork, and merges
-//! when it settles. Four claims come out of that, and none of them is checked anywhere else:
+//! A round forks the branch at the top of the range it settles, runs producers on the fork, and
+//! merges when it settles. Four claims come out of that, and none of them is checked anywhere else:
 //!
 //! * **S7** — a chained producer does not trip its own round's guard. *Failing means any round
 //!   containing a producer chain never commits.*
@@ -12,6 +12,11 @@
 //! * **S10** — a client write landing mid-round produces a **true** watermark. This is the bug the
 //!   whole redesign is for, and it is now expected to be structurally impossible: the client's layer
 //!   is above the round's fork point and is not in the round's read path at all.
+//!
+//! The last section is about the *range* rather than about the fork: a round settles
+//! `[watermark+1 … head]` (§6.3, §16.5), so a backlog is one round, a producer whose input exists
+//! only in a derived layer is discovered at all, and a genuinely concurrent writer still trips the
+//! guards of a round that happens to be settling three layers at once.
 //!
 //! ## Why these are here and not in `scenarios/`
 //!
@@ -59,6 +64,17 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Result<Self> {
+        Self::declaring(vec![
+            declare("headcount", ValueType::Int, Ownership::Source),
+            declare("is_investible", ValueType::Int, Ownership::Derived(INVEST)),
+            declare("tier", ValueType::Int, Ownership::Derived(TIER)),
+        ])
+        .await
+    }
+
+    /// A harness whose branch declares exactly these fields, so a test can push the rest later — the
+    /// only honest way to construct *a producer that arrives after the data it consumes*.
+    async fn declaring(fields: Vec<DefEvent>) -> Result<Self> {
         let storage = Arc::new(MemoryStorage::new());
         let layers = Arc::new(LayerManager::new(
             storage.clone(),
@@ -79,15 +95,7 @@ impl Harness {
             branches.clone(),
         ));
         let branch = branches.create_root(Some("main".into())).await?;
-        defs.push(
-            branch,
-            vec![
-                declare("headcount", ValueType::Int, Ownership::Source),
-                declare("is_investible", ValueType::Int, Ownership::Derived(INVEST)),
-                declare("tier", ValueType::Int, Ownership::Derived(TIER)),
-            ],
-        )
-        .await?;
+        defs.push(branch, fields).await?;
 
         let resolver = Resolver::new(
             storage.clone(),
@@ -110,19 +118,29 @@ impl Harness {
 
     /// The chain, with the head of it optionally held open by a gate.
     fn install_chain(&self, gate: Option<Arc<Gate>>) {
-        self.native
-            .register(INVEST, hop("headcount", "is_investible", 2, gate));
-        self.native
-            .register(TIER, hop("is_investible", "tier", 3, None));
-        for id in [INVEST, TIER] {
-            self.engine.register(ProducerDef {
-                id,
-                kind: ProducerKind::Pipeline,
-                source: BufferId::Object("Company".into()),
-                version: LayerId(1),
-                declaring_repo: RepoId(1),
-            });
-        }
+        self.install(INVEST, "headcount", "is_investible", 2, LayerId(1), gate);
+        self.install(TIER, "is_investible", "tier", 3, LayerId(1), None);
+    }
+
+    /// One hop of the chain, at the def-version its output field was declared at — which is the
+    /// producer's ClientVersion (§5.4), and is only `1` when it was declared with everything else.
+    fn install(
+        &self,
+        id: ProducerId,
+        from: &'static str,
+        to: &'static str,
+        times: i64,
+        version: LayerId,
+        gate: Option<Arc<Gate>>,
+    ) {
+        self.native.register(id, hop(from, to, times, gate));
+        self.engine.register(ProducerDef {
+            id,
+            kind: ProducerKind::Pipeline,
+            source: BufferId::Object("Company".into()),
+            version,
+            declaring_repo: RepoId(1),
+        });
     }
 
     async fn push(&self, writes: Vec<(CellRef, Value)>) -> Result<LayerId> {
@@ -578,5 +596,208 @@ async fn a_client_write_landing_mid_round_produces_a_true_watermark() -> Result<
         )
         .await?;
     assert_eq!(stated.state, Freshness::Current);
+    Ok(())
+}
+
+// --- Settling a range ---------------------------------------------------------------------------
+
+/// **A backlog settles in one round, not one round per layer.**
+///
+/// Three writes to one field commit before anything settles. A round per source layer made this a
+/// treadmill: the round settling the first computed from a world the second had already moved, and
+/// was rejected at merge by its own guard — correctly, because the schedule had guaranteed the work
+/// was stale before it ran. Under sustained backlog most derivation work was run and then thrown
+/// away.
+///
+/// One round over `[watermark+1 … head]` has nothing to be stale about. What is asserted is the
+/// settled value and the **number of round branches**, because a round forks exactly one (§16.5) and
+/// that is the one observable that says "one round" without pinning how many invocations ran inside
+/// it — which is precisely what §9.6 leaves to the scheduler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backlog_settles_as_one_round() -> Result<()> {
+    let h = Harness::new().await?;
+    h.install_chain(None);
+
+    h.company(1, 10).await?;
+    h.push(vec![(prop(company(1), "headcount"), Value::Int(20))])
+        .await?;
+    let top = h
+        .push(vec![(prop(company(1), "headcount"), Value::Int(30))])
+        .await?;
+
+    let branches_before = h.branches.all().len();
+    h.engine.catch_up(h.branch).await?;
+
+    assert_eq!(
+        h.branches.all().len() - branches_before,
+        1,
+        "three source layers, one fork: the whole backlog settled as a single round"
+    );
+    assert_eq!(
+        h.read(&prop(company(1), "is_investible")).await,
+        Some(Value::Int(60)),
+        "computed from the newest write, not from the oldest"
+    );
+    assert_eq!(
+        h.read(&prop(company(1), "tier")).await,
+        Some(Value::Int(180)),
+        "and the chain behind it settled in the same round"
+    );
+
+    // What the output claims, and it is the top of the range rather than the layer that happened to
+    // dirty the invocation first.
+    assert_eq!(
+        h.claimed_by(&prop(company(1), "is_investible")).await,
+        Some(top),
+        "one derived layer per producer per round, reflecting the top of the range"
+    );
+    let derived: Vec<_> = h
+        .layers
+        .layers_of(h.branch)
+        .into_iter()
+        .filter_map(|layer| match layer.author {
+            LayerAuthor::Derived { producer, reflects } => Some((producer, reflects)),
+            LayerAuthor::Source => None,
+        })
+        .collect();
+    assert_eq!(
+        derived.len(),
+        2,
+        "two producers, two derived layers on the trunk: {derived:?}"
+    );
+    assert!(
+        derived.iter().all(|(_, reflects)| *reflects == top),
+        "both reflecting the top of the range: {derived:?}"
+    );
+
+    assert_eq!(
+        h.engine.catch_up(h.branch).await?,
+        0,
+        "and nothing is left outstanding — a round does not chase its own merged output"
+    );
+    Ok(())
+}
+
+/// **A pipeline pushed over data that is already derived is discovered by a plain catch-up.**
+///
+/// The chained-migration bug without a migration in it, and the more likely way to meet it: `tier`
+/// is declared and registered *after* `invest` has already produced `is_investible`. Its input was
+/// written by a derived layer, and a derived layer opens no round of its own — so while a round
+/// settled one source layer at a time, nothing triggered it and §9.6's seeding had nothing to find
+/// at the fork point either.
+///
+/// The range is what finds it: the derived layer `invest`'s round merged is inside
+/// `[watermark+1 … head]`, so it is in the opening wave and dirties whoever reads what it wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pipeline_pushed_over_derived_data_is_discovered() -> Result<()> {
+    let h = Harness::declaring(vec![
+        declare("headcount", ValueType::Int, Ownership::Source),
+        declare("is_investible", ValueType::Int, Ownership::Derived(INVEST)),
+    ])
+    .await?;
+    h.install(INVEST, "headcount", "is_investible", 2, LayerId(1), None);
+
+    h.company(1, 10).await?;
+    h.engine.catch_up(h.branch).await?;
+    assert_eq!(
+        h.read(&prop(company(1), "is_investible")).await,
+        Some(Value::Int(20)),
+        "the first pipeline settled, and its output is in a derived layer"
+    );
+
+    // The second pipeline arrives now — declared by a def push, which is how a repo introduces one,
+    // and registered against the def-version that declared its output field.
+    let declared = h
+        .defs
+        .push(
+            h.branch,
+            vec![declare("tier", ValueType::Int, Ownership::Derived(TIER))],
+        )
+        .await?;
+    h.install(TIER, "is_investible", "tier", 3, declared, None);
+
+    h.engine.catch_up(h.branch).await?;
+    // Read at the def-version `tier` was declared at: a value is stored at the def-version of its
+    // own field, and this field's is the push that introduced it rather than the one everything
+    // else here sits at (§5.3).
+    let path = h.branches.read_path(h.branch, None)?;
+    let tier = h
+        .storage
+        .get_cell(&path, &prop(company(1), "tier"), DefVersion(declared))
+        .await?
+        .map(|found| found.event.value);
+    assert_eq!(
+        tier,
+        Some(Value::Int(60)),
+        "and it consumes an input that only a derived layer has ever written"
+    );
+    assert_eq!(
+        h.engine.catch_up(h.branch).await?,
+        0,
+        "settling rather than chasing itself"
+    );
+    Ok(())
+}
+
+/// A backlog round is a round: a client write landing above its fork point still trips its guard,
+/// and the cascade still applies.
+///
+/// The point of the range is that the *schedule* stops manufacturing staleness, not that guards got
+/// weaker. A genuinely concurrent writer is still a genuinely concurrent writer, and the invocation
+/// that read what it moved is still dropped — with everything in the same round that consumed that
+/// invocation's output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_write_above_a_backlog_rounds_fork_still_trips_its_guard() -> Result<()> {
+    let h = Harness::new().await?;
+    let gate = Arc::new(Gate::default());
+    h.install_chain(Some(Arc::clone(&gate)));
+
+    // The backlog: two entities, then a second layer moving one of them, neither settled.
+    h.company(1, 10).await?;
+    h.company(2, 10).await?;
+    h.push(vec![(prop(company(1), "headcount"), Value::Int(50))])
+        .await?;
+
+    let engine = Arc::clone(&h.engine);
+    let branch = h.branch;
+    let settling = tokio::spawn(async move { engine.catch_up(branch).await });
+    gate.reached().await;
+    // Above the fork point, because the fork point is the top of the range and this layer is above
+    // it. Nothing serialises this: locks are per layer, never per branch (§16.3.4).
+    let contended = h
+        .push(vec![(prop(company(1), "headcount"), Value::Int(70))])
+        .await?;
+    gate.release();
+    settling.await.expect("the round did not panic")?;
+
+    assert_eq!(
+        h.read(&prop(company(1), "is_investible")).await,
+        None,
+        "the invocation whose input moved underneath it was dropped rather than published"
+    );
+    assert_eq!(
+        h.read(&prop(company(1), "tier")).await,
+        None,
+        "and the hop that consumed its output cascaded with it"
+    );
+    assert_eq!(
+        h.read(&prop(company(2), "is_investible")).await,
+        Some(Value::Int(20)),
+        "while the entity nobody contended for landed, backlog and all"
+    );
+
+    // The dropped work is still outstanding, and the layer that trod on it is a source layer like
+    // any other — so the next range picks it up.
+    h.settle(contended).await?;
+    assert_eq!(
+        h.read(&prop(company(1), "is_investible")).await,
+        Some(Value::Int(140)),
+        "the next round recomputes what this one dropped, from the value that displaced it"
+    );
+    assert_eq!(
+        h.read(&prop(company(1), "tier")).await,
+        Some(Value::Int(420)),
+        "chain and all"
+    );
     Ok(())
 }

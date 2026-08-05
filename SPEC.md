@@ -582,23 +582,45 @@ watermarks so every producer owes its whole source buffer again, and the layers 
 ones it had. On a fork that is a replay of the world at the fork point, which is how §10.1's claim is
 checked rather than trusted.
 
-**Derived history is deterministic.** One producer run produces exactly one layer, and v1 performs
-**no coalescing**: a producer emits one derived layer per `(producer, source layer)` even when
-several source layers landed while it was busy. Two Borg instances replaying the same source log
-therefore emit identical derived content at every `reflects` point.
+**Derived layers coalesce across a range.** A round settles everything between a producer's
+watermark and head (§16.5), so a producer emits **one derived layer per round**, labelled with the
+top *source* layer of the range it settled. Several source layers landing while a producer is busy
+therefore cost one layer between them, not one each.
+
+v1's rule was the opposite — one derived layer per `(producer, source layer)`, **no coalescing** —
+and it was retired for a correctness-shaped reason rather than an economy one. A round per source
+layer computes each layer from a world the next one has already moved, and the automatic guards that
+catch that (§16.5) then reject work the *schedule* had guaranteed would be stale: under sustained
+backlog most derivation work was run and thrown away. The rule also left a producer whose input is
+written only by a derived layer with nothing to trigger it, because derived layers open no rounds —
+so a chained migration, or a pipeline pushed over data that is already derived, was never discovered
+at all.
+
+**What is lost is derived-history granularity, and it is now schedule-dependent.** Two Borg instances
+replaying the same source log agree on every *settled* value and on every label those values carry.
+They do not agree on how many intermediate snapshots exist: an instance that settled `L10`, `L11` and
+`L12` one at a time holds three generations of derived layers, and one that settled them as a range
+holds one. Nothing can ask which. History is addressed by **source** layer and derived data resolved
+by `reflects`, never by derived LayerId — a time-travel read at `L11` takes the derived layer with
+the greatest `reflects ≤ L11`, which is `L11`'s own output in the first instance and the range's in
+the second, and both are what §10.1 promises for the world they name.
+
+**What still holds is every label.** `reflects` is true by construction rather than by bookkeeping: a
+round cannot label its output with a layer it did not fork at, and it forks at the top of its range
+(§16.5). And settled values stay deterministic, which is the property `scenarios/200-determinism`
+sweeps — its digest strips layer ids, because those were always a property of the schedule.
 
 Ordering is enforced where it is meaningful — a producer reading another's output cannot start until
-that producer's layer commits — and the only residual variation is which LayerId was assigned to
-which of two *concurrent independent* producers. That is unobservable, because history is always
-addressed by **source** layer and derived data resolved by `reflects`, never by derived LayerId.
+that producer's layer commits — and the residual variation is which LayerId was assigned to which of
+two *concurrent independent* producers, and how many rounds a given backlog took. Neither is
+observable, for the reason above.
 
-*(Coalescing across source layers is the natural v2 optimization and is a scheduler policy, not a
-redesign. It trades reproducible history granularity for less recomputation.)*
-
-**The cost of no-coalescing is one layer per invocation.** A source write that invalidates 100k
-entities produces 100k derived layers in a single round, each holding that invocation's output. This
-is inherent to "one run, one layer" and is what buys reproducible derived history. It is also the
-single largest constant in the fan-out path, and the first thing a coalescing policy would reclaim.
+**One layer per invocation, on the round's own branch.** A source write that invalidates 100k
+entities produces 100k layers *inside* the round: a guard is a fact about one invocation, and partial
+application decides per invocation (§16.5). They are regrouped by producer on the way across the
+merge, so the trunk gains one layer per producer rather than 100k — which is what keeps fork-and-merge
+from doubling the log, and is the other half of what "one derived layer per producer per round"
+means.
 
 ---
 
@@ -999,6 +1021,18 @@ machinery at all. One pass over a committing layer's contents answers both trigg
 | cell writes | existing invocations that depend on those cells go dirty |
 | object creations | new invocations for producers subscribed to that buffer |
 
+**The walk covers every layer a round is settling, derived layers included.** A round settles a
+*range* (§16.5), and a cell written by a previous round's merged output is a trigger like any other
+write: it is the only thing that can ever start a producer whose input exists only in derived data —
+a chained migration, or a pipeline pushed over data something else already derived. Skipping derived
+layers is what left those undiscovered until an operator ran a full rebuild.
+
+A layer is skipped for a producer that has already incorporated it, and *already incorporated* is a
+question about the source stream: a layer's **position** is its own id if it is a source layer and
+its `reflects` if it is derived, and a producer standing at watermark `W` has incorporated everything
+positioned at or below `W`. Without that test a settled branch would re-derive itself for ever, since
+a round's own merged output is inside the next round's range.
+
 Keeping this above the provider line matters: were tracking to live inside the buffers, every
 `StorageProvider` would have to reimplement it. The storage interface stays small — get cell, put
 cell, stream a layer, scan a buffer — which is what keeps both a plain KV store and Postgres viable
@@ -1012,6 +1046,10 @@ changeset cannot supply: the entities it owes were written before it existed, or
 forked from, and no layer belonging to its own branch names them. A producer that has never run on a
 branch therefore takes its whole source buffer, read through that branch's ancestry, and streams
 normally thereafter.
+
+It is scanned **at the top of the range**, which is where the round forks and therefore where the
+world is complete. Scanning at the bottom is what spent the one chance a brand-new producer gets on a
+fork point where the data it wanted did not exist yet.
 
 A commit on branch B triggers producers on branch B only, since a layer belongs to exactly one
 branch.
@@ -1603,7 +1641,7 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 | `DefRegistry` | defs, def-versions, ClientVersion resolution, live-version set |
 | `Invalidator` | walks a committing layer, converts it into dirty invocations |
 | `DependencyIndex` | bidirectional cell ↔ invocation graph; in-memory-primary |
-| `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, settles each source layer as a transaction (§16.5) |
+| `Scheduler` | **stateless** (§16.4); derives pending work from watermark gaps, settles the whole gap as one transaction (§16.5) |
 | `ProducerRuntime` | executes user code; owns the read proxy that records and verifies read/write sets |
 | `Resolver` | read path: locate cell, migrate for version skew, validate, build envelope |
 | `FrontierTracker` | per-producer watermarks, settled frontier, `frontier.reaches()` |
@@ -1650,9 +1688,11 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 and the branch head, plus the dependency index. The scheduler *derives* what to run by streaming the
 layers in that gap, rather than materializing a list of invocations.
 
-This is not merely an optimization. Without it, naive-eager with no coalescing is exactly the
-configuration that explodes: one write to a widely-depended-on cell enqueues 100k invocations, and a
-def-mutation on a large type enqueues millions. Three properties fall out of having no queue:
+This is not merely an optimization. Without it, naive-eager is exactly the configuration that
+explodes: one write to a widely-depended-on cell enqueues 100k invocations, and a def-mutation on a
+large type enqueues millions. Coalescing across a *range* (§6.3) does not help here and was never
+meant to — it reduces how many derived layers a backlog leaves, not how many invocations one layer
+dirties. Three properties fall out of having no queue:
 
 - **Bounded memory** — work is streamed, never accumulated.
 - **Free crash recovery** — restart and recompute the gap; there is no queue to lose or replay.
@@ -1672,13 +1712,22 @@ in flight, not a queue of what is outstanding: nothing is remembered between wav
 killed mid-wave leaves the same gap it started from. Setting it to `1` is the sequential scheduler,
 and §9.6 requires the two to settle on the same result.
 
-Discovery stops at the first layer on the branch that has not committed. A layer *is* the changeset
-(§9.6) and means nothing before commit, so settling one would derive from writes that may yet be
-abandoned, and stepping over one would advance every watermark past a layer nothing had incorporated.
-Waiting is the only honest option, and it is available precisely because there is no queue to stall.
-An **aborted** layer is not waited for — it will never commit — and a layer found uncommitted when a
-store is reopened is aborted, because an open layer is exclusive to a process that no longer exists
-(§6.2).
+**The gap is closed in one round, not one round per layer** (§16.5). The gap is the statement of
+what is pending; how it is divided is scheduling policy, and dividing it per source layer is the
+policy that made a backlog run work its own guards were guaranteed to reject. Nothing about
+statelessness changes: the range is recomputed from watermarks and head on every call, and a worker
+killed mid-range leaves exactly the gap it started from.
+
+Discovery stops at the first *source* layer on the branch that has not committed. A layer *is* the
+changeset (§9.6) and means nothing before commit, so settling one would derive from writes that may
+yet be abandoned, and stepping over one would advance every watermark past a layer nothing had
+incorporated. Waiting is the only honest option, and it is available precisely because there is no
+queue to stall. It also bounds the range, which is what keeps the round's fork point a snapshot: a
+layer that committed below the fork point after the round forked would appear in its read path
+halfway through. An **aborted** layer is not waited for — it will never commit — and a layer found
+uncommitted when a store is reopened is aborted, because an open layer is exclusive to a process that
+no longer exists (§6.2). A derived layer is skipped in whatever state it is in, so a round abandoned
+by a panicking peer costs a layer id and nothing else.
 
 **A round forking a branch of its own does not qualify it either** (§16.5). The fork is where a
 round's output goes, not a record of what a round has left to do: nothing about pending work is
@@ -1687,24 +1736,62 @@ can see, plus the same watermark gap it started from. The next round rediscovers
 work and forks again. This is the same statelessness the pause switch and the parallelism bound leave
 intact, applied to isolation instead of to scheduling.
 
-### 16.5 A source layer settles as a transaction
+### 16.5 A range settles as a transaction
 
 A committed layer triggers producers; their output commits further layers, which trigger more.
-**All of it carries the same `reflects`**, because it is all the consequence of one source layer. A
+**All of it carries the same `reflects`**, because it is all the consequence of one settling. A
 producer's watermark advances to `L` only once that whole closure has settled — which is precisely
 what makes the watermark's claim true: *replay the world at `L` and you get exactly this.*
 
-**A round is a transaction like any other write** (§12). It forks the branch at the source layer it
-is settling, runs every producer on the fork, and merges when it settles:
+**A round is a transaction like any other write** (§12). It forks the branch at the top of the range
+it is settling, runs every producer on the fork, and merges when it settles:
 
 ```
-fork at L → run producers → merge, guarded by what they read
+fork at the top of [watermark+1 … head] → run producers → merge, guarded by what they read
 ```
 
-Only **source** layers open a round. Derived layers are consequences, picked up inside the closure
-rather than driving rounds of their own. Skipping derived layers entirely is tempting and wrong: it
-silently breaks every chained producer, since a producer consuming another's output can only ever be
-triggered by that producer's derived layer.
+#### The unit is a range, not a layer
+
+A round settles **everything between the watermark and head**, not one source layer. The alternative
+was tried and is the shape of two failures, neither of which is a cost question:
+
+* **A backlog becomes a treadmill.** With `L10`, `L11` and `L12` committed before anything settles, a
+  round per layer computes `L10` from the world at `L10` and is rejected at merge by its own guard,
+  because `L11` moved its input while it ran; the `L11` round likewise; only `L12` lands. The guards
+  are behaving correctly. The *schedule* guaranteed the work was stale before it ran, and under
+  sustained backlog most derivation work is run and then rejected.
+* **A producer whose input is only ever derived is never discovered.** `up2` reads what `up1` writes,
+  and `up1` writes only into derived layers, which open no rounds. Its other route — §9.6's seeding
+  for a producer that has never run — fires at the fork point of the *earliest* unsettled layer,
+  because a brand-new producer drags the minimum watermark to the bottom of the log, and the world it
+  wanted does not exist there. The same shape catches a pipeline pushed over data that is already
+  derived.
+
+Both close for the same reason: the opening wave is every layer in the range, derived layers
+included, and the fork is at the top of the range, where the world is complete. A layer is skipped
+for a producer that has already incorporated it — see §9.6 on a layer's *position* in the source
+stream — which is what keeps a settled branch from re-deriving itself off its own merged output.
+
+#### The fork is at the top layer; `reflects` is the top source layer
+
+These are two different quantities and collapsing them is a bug in either direction.
+
+`reflects` must be a **source** position, because that is what a watermark points into (§6.3) and
+what every freshness comparison is against (§10.2). So it is the highest source layer in the range.
+
+The **fork point** is the top of the range whatever authored it, which on a settled branch is a
+derived layer that an earlier round merged. Forking at the top *source* layer instead would hide
+exactly that output — a derived layer sits above the source layer it reflects, by construction — and
+that is the residue a round per layer had: an invocation dirtied by `L'` that depends on a derived
+cell only an earlier round produced would read it absent.
+
+`reflects` stays true by construction all the same. Everything between it and the fork point is
+derived output reflecting `reflects` or lower, which is part of the world `reflects` names rather
+than something above it — so *replay the world at `reflects` and you get exactly this* is still what
+the fork point can see, and nothing else is.
+
+Only **source** layers bound a range, and only they are waited for (§16.4). Derived layers are
+consequences: they are swept into the wave and they never stop or extend it.
 
 #### The fork point is the filter
 
@@ -1712,13 +1799,13 @@ triggered by that producer's derived layer.
 expresses the difference. A producer's read path is:
 
 ```
-[(round branch, its own head), (trunk, L)]
+[(round branch, its own head), (trunk, the top of the range)]
 ```
 
 - It sees its siblings' output, because that output is on the round's own branch bounded at that
   branch's head. There is no high-water mark to maintain: *"the head of my branch"* already means
-  *"my source layer plus everything this round has committed"*, which is exactly the world a
-  downstream producer must see to consume its upstream's output.
+  *"my range plus everything this round has committed"*, which is exactly the world a downstream
+  producer must see to consume its upstream's output.
 - It cannot see anything a client lands on the trunk meanwhile, because the trunk segment is bounded
   at the fork point and a layer committed afterwards is above that bound.
 
@@ -1850,13 +1937,11 @@ output computed from `L` — which is correct, because at `L` the round had not 
 surprising. Derived data is addressed by `reflects` rather than by derived LayerId (§16.3), so this
 affects where in the log a value is found and never which value it is.
 
-A second residue is a **backlog**: when several source layers are committed before any of them is
-settled, the round settling the earlier one merges above the later one's id, so the round settling the
-later one — forked at that later layer — cannot see it. Each round recomputes what its own source
-layer dirtied, chains included, so this costs re-runs rather than correctness in the shapes v1
-produces; but an invocation dirtied by `L'` that depends on a derived cell only some earlier round
-produced would read it absent. Settling a *range* rather than a single layer is the shape that closes
-it, and it changes what a watermark counts, so it is its own change.
+The **backlog** that used to be the second residue here is not one any more: a round settles the
+whole range, so there is no earlier round merging above a later round's fork point to be blind to.
+What remains of it is a smaller thing, and it is stated in §6.3 rather than here — how many
+intermediate derived snapshots a backlog leaves behind is now a property of the schedule, and nothing
+can ask.
 
 ### 16.6 Cycle detection
 
@@ -1865,8 +1950,8 @@ statically, and under a stateless scheduler it does not surface as re-entry — 
 producer runs, advances its watermark, dirties its own input, and is rediscovered forever.
 
 **v1 detection is a per-invocation re-run counter scoped to one round (§16.5).** If an invocation
-runs more than `K` times while settling a single source layer, it is cycling; the producer is marked
-broken (§14) and its output cells report `state: 'broken'`.
+runs more than `K` times while one round settles, it is cycling; the producer is marked broken (§14)
+and its output cells report `state: 'broken'`.
 
 An inline computation (§10.5) has no round to scope a counter to, and does not livelock either: it
 walks *recorded* read-sets rather than being rediscovered by a scheduler, so a cycle appears as
