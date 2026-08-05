@@ -1,0 +1,27 @@
+{
+  // What a user's project looks like. Nothing here is borrowed from the SDK's own tsconfig: the
+  // point of the compile step is that `borg generate`'s output is ordinary TypeScript that an
+  // ordinary project compiles, so the settings are the strict ones a project would pick, and the
+  // module resolution is Node's — the generated module imports `borg-sdk/client` and finds it in
+  // `node_modules` like anything else.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    // Node runs these files by erasing types rather than compiling them, so nothing that needs an
+    // emit may appear — and the imports name `.ts` because that is the file that exists on disk.
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["gen", "client.ts"]
+}

@@ -1155,12 +1155,15 @@ have content in it, because a digest that is empty every run is byte-identical e
 
 ## Tests we owe
 
-- **A pool test failed once in 37 runs, under full-suite load only.** `borg-exec-process`'s pool
-  suite: one of its three tests failed during a `check.sh` run and passed 36 consecutive runs since
-  (6 full-suite, 30 targeted). This is the 1-in-N profile this project has twice learned not to call
-  a flake — the pool tests coordinate real subprocesses, so a timing assumption under CPU contention
-  is the likely shape. Owed: capture which assertion fails (run with `--nocapture` in a loop under
-  load) and either fix the race or make the assertion load-independent.
+- ~~**A pool test failed once in 37 runs, under full-suite load only.**~~ **Paid off in Act 2.** It
+  was not a timing assumption. Adding the socket-transport tests raised the rate to about 1 in 15 —
+  more concurrent spawning — and the captured failure was `the_pool_never_exceeds_its_size` with
+  `ETXTBSY`, *"Text file busy"*, on the worker script it had just written. `exec` refuses a file some
+  process holds open for writing, and spawning is fork-then-exec: a fork duplicates every open
+  descriptor, so one thread writing a script leaves it briefly unrunnable for any *other* thread's
+  fork. The window is one fork. Fixed in the provider rather than the harness, because the condition
+  is real — editing a pipeline while `borg derive` runs is the same race — with a bounded retry on
+  `ETXTBSY` in `Worker::spawn`. 60 consecutive suite runs clean since.
 
 - **Unit coverage generally.** Tests are almost entirely integration-level. `borg-storage`,
   `borg-engine`'s internals and the CLI have essentially none of their own. Landing alongside each

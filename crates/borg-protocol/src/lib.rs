@@ -36,6 +36,15 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
+/// The **client** wire contract — `borg serve` and the SDKs — over this same framing.
+///
+/// A separate module rather than more variants here, because the two protocols answer to different
+/// people: this one is `ProducerCtx` over a pipe and is spoken by code the engine invoked, that one
+/// is the transaction surface over a socket and is spoken by code that invoked the engine. What they
+/// share is the framing, the codecs and the single-key rule, and sharing those is the whole point of
+/// them living in one crate.
+pub mod client;
+
 pub const VERSION: u32 = 1;
 
 /// How messages are encoded on the wire.
@@ -69,6 +78,35 @@ impl Codec {
     }
 }
 
+/// Where a worker expects to find the message stream. SPEC.md §17.4.
+///
+/// **Declared, never sniffed.** The engine learns a worker's transport from its `describe` output,
+/// before it spawns anything, rather than by watching to see which channel answers first. Sniffing
+/// looks cheaper and is the trap: the failure it would have to distinguish — a worker that prints to
+/// stdout before it has connected — is exactly the failure a socket exists to make harmless, so the
+/// detector would be broken by the thing it was detecting. A declaration cannot race.
+///
+/// Absent means [`Transport::Stdio`], so a worker written before this existed keeps working with no
+/// change and pays nothing: no socket is created for it at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    /// The worker's own stdin and stdout carry messages. Simple, and what a shell worker wants —
+    /// at the cost that anything the worker prints for a human corrupts the stream.
+    #[default]
+    Stdio,
+    /// The engine listens on a unix socket and passes its path in `BORG_WORKER_SOCKET`; the worker
+    /// connects and speaks the identical protocol there. Its stdout is then its own, which is the
+    /// only arrangement in which a `console.log` in a real client library is survivable.
+    Socket,
+}
+
+/// The environment variable carrying the socket path, for [`Transport::Socket`] workers.
+///
+/// Named here rather than in the provider because it is contract: every SDK reads it, and a provider
+/// is free to be replaced.
+pub const SOCKET_ENV: &str = "BORG_WORKER_SOCKET";
+
 /// The engine's opening message. Always JSON, whatever is negotiated for the body — a handshake
 /// cannot be encoded in a codec that has not been agreed yet.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,7 +137,19 @@ fn default_codec() -> String {
 #[serde(rename_all = "snake_case")]
 pub enum ToWorker {
     /// Run this producer against this entity.
-    Invoke { producer: u64, input: String },
+    Invoke {
+        /// The producer's id, **as a string**, for the reason the producer table writes it as one:
+        /// it is `producer_id(name)`, a hash, so it uses the whole `u64` range, and JSON has no
+        /// integers. A worker that read it as a JSON number would get a value rounded to 53 bits —
+        /// silently naming a producer that does not exist. That corrupts nothing today only because
+        /// every existing worker implements exactly one producer and ignores the field; a worker
+        /// that serves a whole repo has to dispatch on it.
+        ///
+        /// A producer id is one identity and never arithmetic, so a string loses nothing.
+        #[serde(with = "id_as_string")]
+        producer: u64,
+        input: String,
+    },
     /// The answer to a `Get`. `None` means the cell has never been written — distinct from a
     /// tombstone, which arrives as the value `"~"`.
     Value(Option<String>),
@@ -107,6 +157,31 @@ pub enum ToWorker {
     Ok {},
     /// No more work. The worker should exit.
     Shutdown {},
+}
+
+/// A `u64` identity that must survive a JSON round trip through a client that has only doubles.
+/// See [`ToWorker::Invoke::producer`].
+mod id_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(id: &u64, out: S) -> Result<S::Ok, S::Error> {
+        out.serialize_str(&id.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<u64, D::Error> {
+        // MessagePack has integers and writes one, so both forms have to be readable — the wire is
+        // one message type across every codec, and only the JSON view needs the string.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Text(String),
+            Number(u64),
+        }
+        match Written::deserialize(input)? {
+            Written::Text(text) => text.parse().map_err(serde::de::Error::custom),
+            Written::Number(id) => Ok(id),
+        }
+    }
 }
 
 /// Worker → engine.
@@ -166,6 +241,21 @@ pub struct Description {
     pub structs: Vec<StructSpec>,
     #[serde(default)]
     pub producers: Vec<ProducerSpec>,
+    /// How this executable wants to be spoken to once it is running as a worker. See [`Transport`].
+    ///
+    /// It rides on `describe` because that is the one thing the engine asks an executable *before*
+    /// it has to decide how to spawn it — and the decision has to be made before the spawn, or
+    /// stdout has already been claimed.
+    #[serde(default)]
+    pub transport: Transport,
+    /// The repo id this executable believes it belongs to, if it says.
+    ///
+    /// The authoritative id is the one in `borg.toml`, because a repo is a directory and one
+    /// directory has one id however many executables it contains. This is a cross-check: an SDK that
+    /// makes the author write the id in code as well should have that copy verified rather than
+    /// quietly ignored. Absent — every shell worker — skips the check.
+    #[serde(default)]
+    pub repo: Option<u32>,
     /// Migrations this repo implements, named. Which field each bridges and in which direction comes
     /// from the field that names it as `up` or `down` — one source of truth, so the two cannot
     /// disagree, and a migration nothing names is a push-time error rather than dead code.
@@ -420,6 +510,35 @@ mod tests {
         );
     }
 
+    /// The id that started this, in `producers.json` and now here: `producer_id("invest")` is past
+    /// 2⁵³, so a worker dispatching on a JSON *number* would resolve a producer that does not exist.
+    #[test]
+    fn an_invocation_names_its_producer_in_a_form_a_json_client_cannot_round() {
+        let invoke = ToWorker::Invoke {
+            producer: producer_id("invest"),
+            input: "Company:o-04068".into(),
+        };
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, Codec::Json, &invoke).unwrap();
+        let line = String::from_utf8(buffer).unwrap();
+        assert!(
+            line.contains(&format!(r#""producer":"{}""#, producer_id("invest"))),
+            "{line}"
+        );
+
+        // And every codec still carries the same value, whichever form it uses underneath.
+        for codec in [Codec::Json, Codec::Msgpack] {
+            let mut buffer = Vec::new();
+            write_message(&mut buffer, codec, &invoke).unwrap();
+            let mut cursor = std::io::Cursor::new(buffer);
+            let back: ToWorker = read_message(&mut cursor, codec).unwrap();
+            let ToWorker::Invoke { producer, .. } = back else {
+                panic!("{} lost the variant", codec.name())
+            };
+            assert_eq!(producer, producer_id("invest"), "{}", codec.name());
+        }
+    }
+
     /// The invariant a shell worker relies on: one key, always, so `jq 'keys[0]'` always works.
     #[test]
     fn every_message_is_a_single_key_object() {
@@ -436,6 +555,34 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{line}` is not an object — a unit variant leaked"));
             assert_eq!(object.len(), 1, "`{line}` should have exactly one key");
         }
+    }
+
+    /// The compatibility claim the socket transport rests on: a `describe` payload written before
+    /// transports existed — every shell worker in the repo — asks for stdio, and asks for no repo
+    /// cross-check.
+    #[test]
+    fn a_describe_payload_that_says_nothing_asks_for_stdio() {
+        let described: Description = serde_json::from_str(
+            r#"{"structs":[],"producers":[{"name":"invest","source":"Company"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(described.transport, Transport::Stdio);
+        assert_eq!(described.repo, None);
+    }
+
+    /// …and the declaration an SDK writes is one lowercase word, because it is read and written by
+    /// hand as often as by a serializer.
+    #[test]
+    fn a_transport_is_declared_by_name() {
+        let described: Description =
+            serde_json::from_str(r#"{"transport":"socket","repo":2}"#).unwrap();
+        assert_eq!(described.transport, Transport::Socket);
+        assert_eq!(described.repo, Some(2));
+        assert!(
+            serde_json::to_string(&described)
+                .unwrap()
+                .contains(r#""transport":"socket""#)
+        );
     }
 
     #[test]

@@ -1603,22 +1603,33 @@ have written, which is not a set anything can enumerate.
 
 ## 15. Code Generation
 
-**Generated SDKs are deferred out of v1.** A generated client needs a transport to reach the engine,
-and v1 has no network layer — building one competes directly with building the engine.
+Generated SDKs were deferred out of v1 because a generated client needs a transport to reach the
+engine, and building one competed directly with building the engine. **They arrived with §17.5**, as
+that deferral said they would: `borg generate --lang ts -o <dir>` emits one module per branch.
 
-When SDKs arrive they will come with a socket/network layer, and the generation contract is:
+The generation contract, now realised:
 
-- Generated from the registry's defs at a chosen layer; that layer becomes the client's ClientVersion.
-- Derived fields are known statically now that ownership is declared (§8), so a generator can mark
-  them read-only. v1 emits everything as writable and lets the runtime rejection do the work; the
-  static marking is deferred with the SDKs themselves.
-- Reads return the provenance envelope of §10.4.
+- **Generated from the branch's def view at a layer, and that layer becomes the client's
+  ClientVersion.** It is baked into the module and sent in the handshake (§5.4, §17.5), which is what
+  makes an old generated client a first-class actor rather than a stale one: it keeps writing the
+  shape it knows and keeps reading through `down` migrations. Regenerating is how a schema change is
+  adopted; not regenerating is a supported state. Generation reads the def view through the socket
+  when the store is served and opens the store when it is not, because §17.5's advisory lock would
+  otherwise make "stop the server to regenerate" a workflow.
+- **Derived fields are marked read-only.** Ownership is declared (§8), so it is a static fact, and
+  the earlier plan to emit everything as writable and lean on the runtime rejection was explicitly
+  deferred "with the SDKs themselves" — this is them.
+- **Reads return the provenance envelope of §10.4.** A generated handle offers both the value and the
+  envelope; the value-shaped shortcut refuses a `broken` cell rather than answering `null`, because
+  §9.3 forbids substituting "there is nothing here" for "there is no path to a value from your
+  version".
 - TypeScript first, then Python, Rust, Go.
 
-**The v1 constraint that makes this possible later:** every engine operation must have a
-**serializable command/response form** — no callbacks, no borrowed references escaping the API
-surface, no in-process-only affordances. This is nearly free now and expensive to retrofit; it is the
-difference between "add a transport" and "redesign the API."
+**The v1 constraint that made this possible:** every engine operation has a **serializable
+command/response form** — no callbacks, no borrowed references escaping the API surface, no
+in-process-only affordances. It was nearly free at the time and would have been expensive to
+retrofit; it was the difference between "add a transport" and "redesign the API", and §17.5 was
+indeed only a transport.
 
 ---
 
@@ -2220,6 +2231,13 @@ Two shapes were forced by targeting a shell worker first, and both are better th
 - **Every message is a single-key object**, including the payload-free ones. A worker dispatches on
   one key without special cases.
 
+**An `Invoke` names its producer as a string.** A `ProducerId` is a hash of the producer's name
+(§9.2), so it uses the whole `u64` range, and JSON has no integers — read as a number it rounds to 53
+bits and names a producer that does not exist. This is the same reasoning that makes the producer
+table write ids as strings, applied to the one message that carries one. It cost nothing while every
+worker implemented exactly one producer and ignored the field; a worker serving a whole repo has to
+dispatch on it.
+
 **Strings on the wire are strings.** A `Get` of a string cell is answered `{"value":"acme.ai"}`, not
 with the `@s-…` that is physically stored, and a `Set` carrying `"acme.ai"` is complete — the engine
 interns it before the write lands. A worker therefore never makes a second round trip to resolve or
@@ -2251,6 +2269,13 @@ The payload is shaped so a shell script can produce it with one `jq -n`:
   "migrations": [ { "name": "founded_up" }, { "name": "founded_down" } ] }
 ```
 
+Two optional keys sit beside those three. `"transport"` declares how the executable wants to be
+spoken to once it is a worker — see *Two transports* above — and defaults to `"stdio"`. `"repo"`
+states the repo id the executable believes it belongs to; the authoritative id is the one in
+`borg.toml`, because a repo is a directory and one directory has one id however many executables it
+holds, so this is a cross-check. An SDK that makes an author write the id in code as well should have
+that copy verified rather than quietly ignored, and a repo that says nothing skips the check.
+
 `derived_by`, `up` and `down` name producers **by name**, not by id: a repo knows what it calls its
 own code and should not have to compute the hash the engine turns that into. A name the repo does not
 implement is a push-time error — a field nothing can ever write, or a migration nothing can ever run
@@ -2271,6 +2296,86 @@ field naming it as `up` or `down` — one source of truth, so the two cannot dis
 **`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting
 async through the derivation engine afterwards is a far larger change than paying for it now.
+
+#### Two transports, one protocol
+
+A worker may be spoken to over **its own stdio** or over a **unix socket** the engine creates, one
+per worker process, whose path arrives in `BORG_WORKER_SOCKET`. Same handshake, same messages, same
+per-codec framing; only the descriptors differ.
+
+Stdio is what a shell worker wants — `read` and `echo` and nothing else — and its cost is that the
+worker's stdout carries the protocol, so anything printed for a human corrupts it. A shell author can
+be told that once. It is not survivable in a real client library, where a stray `console.log` in a
+pipeline, a dependency, or a runtime warning desynchronises the stream and surfaces far from its
+cause. On the socket, the protocol has a descriptor of its own and **stdout is entirely the
+author's**.
+
+**The transport is declared, not detected.** It rides on `describe`, which is the one thing the
+engine asks an executable before it must decide how to spawn it — and the decision has to be made
+before the spawn, because by then stdout has been claimed. Detection was the obvious alternative and
+it cannot work: the engine would have to tell "has not connected yet" from "printed to stdout first",
+which is exactly the case the socket exists to make harmless. The detector would be broken by the
+thing it was detecting. An absent declaration means stdio, so a worker written before transports
+existed is untouched and no socket is created for it.
+
+**A socket worker's stdout is pointed at the engine's stderr**, by duplicating the descriptor at
+spawn time. Not inherited: the engine's own stdout is a contract too — `borg get --value` is parsed
+by scripts — and handing a subprocess a pipe into it moves the corruption up one level rather than
+removing it. Not discarded either, because a `console.log` nobody ever sees is its own kind of bug.
+This is where the provider already sends a worker's stderr, and it costs one `dup` and no reader
+thread.
+
+`describe` itself stays a plain `argv[1] == "describe"` invocation printing JSON to stdout on both
+transports. That call is one short-lived process whose entire output *is* the payload: there is no
+stream to desynchronise, a corrupted one fails the push immediately with the offending text, and
+leaving it alone is what keeps a repo of shell pipelines a single `jq -n`.
+### 17.5 The client protocol
+
+§17.4 is the engine talking to code it invoked. This is the reverse: **a client's transaction surface
+over a socket instead of over argv**, which is what an SDK speaks and what `borg serve` answers.
+
+It reuses §17.4's framing whole — same codecs, same per-codec framing, same **single-key object**
+rule — because the two protocols differ in who is asking and not in how a message is carried. The
+operations are the ones the CLI already has: `tx_begin`, `tx_get`, `tx_set`, `tx_commit`, `tx_abort`,
+`get`, `explain`, `branch_list`, `branch_head`, `def_show`. That is a constraint rather than a
+coincidence: the CLI is the testbed for what a client is like to use, so a protocol needing an
+operation the CLI lacks would be evidence about the CLI.
+
+One message is not a lifted subcommand, and it is worth saying why. **`def_view` returns a branch's
+whole def view and the def-version it was read at**, which is what codegen reads (§15). Neither half
+could be composed from the rest: `def_show` answers about a struct you can already name, and a
+generator's whole job is to not know the names in advance; and the version a generated module stamps
+itself with is the branch's *def*-version, which is not `branch_head` — head moves on every data
+write and a def-version moves only on a def push (§5.3). They travel together in one message because
+they are one read: taken separately, a generator could be handed a schema and a version from either
+side of a push.
+
+**Everything travels as canonical text**, layer ids included — `"L120"`, the form §10.4's envelope is
+printed in. A `by` is a `ProducerId`, which is a hash spanning the whole `u64` range, and JSON has no
+integers; the same rounding that corrupts a producer id in a sidecar file would corrupt it here.
+
+**A read answers with the §10.4 envelope, never a bare value.** A transaction is named by its id on
+every message, and by nothing else: transaction state lives beside the store (§12.2), so a handle
+outlives the connection that opened it. A client that disconnects mid-transaction has abandoned it,
+not destroyed it — it may reconnect and carry on, and if it does not, §12.3's idle reaper collects it
+like any other silence. This is what makes a browser tab closing an ordinary event.
+
+**A commit answers with a conflict or a landing, and a conflict names the cell.** "Your commit was
+rejected" is not something a client can act on; "the cell you read moved, and here it is" is the
+input to deciding whether to retry (§13).
+
+The handshake carries the client's **ClientVersion** — the def-layer its generated code was built
+from (§5.4) — so that old generated clients keep reading through `down` migrations, and so the engine
+can eventually name which live clients a def push would break (§5.5). Absent means the branch's
+current def-version, which is what an un-generated client honestly is.
+
+**One process serves a store.** The transaction table, the producer table and the pause flags are
+files beside the store, and the sequencer is in-process; none of that is multi-process safe, and it
+was not before a server existed either. `borg serve` therefore takes an advisory lock and every other
+invocation against that store is refused and told the socket to speak to. The lock's liveness test is
+the socket itself — a record whose socket does not answer is stale and is cleared — because a lock
+that can outlive its holder is worse than no lock. This is v1 honesty and not the destination: the
+destination is the CLI connecting to the socket rather than being turned away by it.
 
 ---
 
@@ -2307,8 +2412,11 @@ async through the derivation engine afterwards is a far larger change than payin
 - `Set`, `Map`
 - Aggregation pipelines
 - Mid-list insertion
-- **All generated SDKs** (§15) — they arrive with the network layer
-- Network / server layer — v1 is a library exercised by Rust tests
+- ~~**All generated SDKs** (§15) — they arrive with the network layer~~ — and they did: `borg serve`
+  (§17.5) is that layer, and `borg generate --lang ts` is the generator. TypeScript only; Python,
+  Rust and Go remain out.
+- ~~Network / server layer — v1 is a library exercised by Rust tests~~ — §17.5. A **local** unix
+  socket, with one process serving a store; actual distribution is still out.
 - Actual distribution — only the seams (§17.2)
 - `O(1)` merge — a parent layer referencing a child's event set rather than enumerating it (§13)
 - `down`-migration validation

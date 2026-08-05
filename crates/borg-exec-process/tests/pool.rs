@@ -11,7 +11,7 @@ use borg_core::{
     BranchId, CellRef, ClientVersion, DefVersion, LayerId, Pid, PidKind, ProducerId, Result, Value,
 };
 use borg_exec::{ExecutionProvider, ProducerCtx, ProducerRef, ValueCodec};
-use borg_exec_process::ProcessExecutor;
+use borg_exec_process::{ProcessExecutor, Registration};
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -105,7 +105,13 @@ async fn distinct_workers(pool_size: usize, invocations: u64, at_once: bool) -> 
     let command = worker(&dir, &log);
 
     let mut executor = ProcessExecutor::new(BRANCH).with_pool_size(pool_size);
-    executor.register(PRODUCER.0, command, "Company".into());
+    executor.register(Registration {
+        producer: PRODUCER.0,
+        command,
+        source: "Company".into(),
+        // The pool is transport-agnostic; the transport tests cover the other one.
+        transport: borg_protocol::Transport::Stdio,
+    });
     let executor = Arc::new(executor);
 
     let producer = ProducerRef {

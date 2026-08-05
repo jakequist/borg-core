@@ -10,11 +10,23 @@ describes, **update the spec in the same change**. A spec that lags the code is 
 ## Commands
 
 ```
-./check.sh                  # fmt, clippy -D warnings, all Rust tests, all scenarios
+./check.sh                  # fmt, clippy -D warnings, all Rust tests, both SDKs, all scenarios
 cargo test --workspace      # Rust tests only
 bash scenarios/run-all.sh   # end-to-end CLI scenarios only (needs `cargo build -p borg-cli` first)
 cargo fmt
 ```
+
+```
+cd packages/borg-sdk && pnpm install && pnpm run check          # typecheck, vitest, build
+cd packages/borg-sdk-py && PYTHONPATH=src python3 -m unittest discover -s tests
+```
+
+The TypeScript steps need node and pnpm. `check.sh` skips them loudly where those are missing, and
+so do scenarios 230, 260 and 270 — `scenarios/ts-lib.sh` is the shared skip-and-build harness, and
+the SDK's own client suite skips the same way when `target/debug/borg` has not been built (it drives
+a real `borg serve`, not a stand-in). The Python SDK needs only a Python 3.11+ — its tests are `unittest` cases with
+no dependencies, so `pytest` runs them but nothing needs it — and scenario 240 skips loudly without
+one. Everything else works everywhere.
 
 ```
 cargo test --release -p borg-engine --test scale -- --ignored --nocapture
@@ -37,11 +49,20 @@ crates/borg-storage         StorageProvider trait + MemoryStorage
 crates/borg-storage-sqlite  SQLite backend
 crates/borg-exec            ExecutionProvider + ProducerCtx traits
 crates/borg-exec-native     in-process Rust producers
-crates/borg-exec-process    subprocess producers over stdio
-crates/borg-protocol        the worker wire contract
+crates/borg-exec-process    subprocess producers, over stdio or a unix socket
+crates/borg-protocol        the worker wire contract; `client.rs` is the client one (§17.5)
 crates/borg-engine          log, branches, defs, derivation, resolver, registry
-crates/borg-cli             the `borg` binary
-scenarios/                  end-to-end scenarios driving the real binary
+crates/borg-cli             the `borg` binary — `ops.rs` is what the commands do, `main.rs` is
+                            argv and printing, `serve.rs` is the same ops over a socket, and
+                            `generate.rs` emits the typed client (§15)
+packages/borg-sdk           the TypeScript SDK. Two entry points, deliberately opposite: `borg-sdk`
+                            is the author-side DSL and the worker protocol, `borg-sdk/client` is
+                            the consumer-side client over `borg serve`. `values.ts` is the one
+                            conversion table both use and `lines.ts` the one framing.
+packages/borg-sdk-py        the Python SDK: the pipeline half, and the neutrality gate on the
+                            contract
+scenarios/                  end-to-end scenarios driving the real binary; `ts-lib.sh`
+                            is the skip-if-no-node harness the TypeScript ones share
 ```
 
 Dependency arrows point inward to `borg-core`. Trait crates (`borg-storage`, `borg-exec`) are
@@ -135,10 +156,11 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   (`ROADMAP.md`, *Concerns carried over from the transactional-model draft*) and should not be made
   by a janitor as a side effect. Note this is now **two** branches per `borg set`: the transaction's,
   and the round's.
-- **The reap sweep lives in the CLI, not in `Registry::open`.** §12.3 says "when a process opens the
-  store", and for this client that is `run()`. The transaction table is a filesystem sidecar like the
-  pause flags and the producer table; `Registry::open` sits below the provider line, where a
-  filesystem sidecar has no business. A server moves the sweep to wherever it opens the store.
+- **The reap sweep lives above the store, not in `Registry::open`.** §12.3 says "when a process opens
+  the store", and for the CLI that is `run()`; for `borg serve` it is every request, because that is
+  when serve opens the store. The transaction table is a filesystem sidecar like the pause flags and
+  the producer table; `Registry::open` sits below the provider line, where a filesystem sidecar has no
+  business.
 - **How many intermediate derived snapshots a backlog leaves is schedule-dependent.** A round settles
   the whole range `[watermark+1 … head]` (§6.3, §16.5), so one that settles `L10`, `L11` and `L12`
   together leaves one generation of derived layers where three rounds would leave three. Settled
@@ -158,8 +180,38 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.
-- `Set`, `Map`, aggregation pipelines, mid-list insertion, container isolation and generated SDKs
-  are all deferred (§18).
+- **`borg serve` opens the store per request and serves one request at a time.** A real server holds
+  the store open, and the reason this one cannot is not the socket: `ops::tx_commit` drops its
+  registry so that `auto_derive` can open another with an executor, because two live `Registry`
+  instances over one store break the single-process assumption. Making the server hold one is a change
+  to derivation's lifecycle — the same change that turns the post-write `catch_up` call into a signal
+  (§9.6) — and should be made there rather than worked around here.
+- **A served store locks every other `borg` invocation out** — except `borg generate`, which speaks
+  to the socket instead (SPEC.md §17.5, `crates/borg-cli/src/generate.rs`). The lock is honest about
+  the assumption that was always there; the CLI connecting rather than being refused is the
+  remote-connection feature that supersedes `borg serve` altogether (SDK-DRAFT.md §2.6), and
+  `generate` is the first and so far only command to do it, because it is a pure read and needs none
+  of the answers the write path needs about `--tx` and `$BORG_TX`. Extending it further is an open
+  question in SDK-DRAFT §5, not a pattern to copy. The consequence to know about: **pushing a schema
+  to a served store means stopping the server**, because `def push` and `repo push` read from a
+  filesystem and are not on the socket — see SDK-DRAFT.md §4.3 for why putting them there would be
+  the wrong shape rather than merely missing work.
+- **`borg generate --watch` polls, because §17.5 has no server push.** One request, one response, in
+  order; a subscription would be a change of shape rather than a field, so the loop asks for the def
+  view every 400ms and rewrites the file when it moved. Recorded in SDK-DRAFT §4.4.
+- **A handshake `borg serve` rejects is answered and then hung up on immediately**, so a client that
+  writes its first request before reading may get an EPIPE that discards the answer it was racing.
+  The server also never acknowledges an accepted handshake, so a client cannot tell "accepted" from
+  "not answered yet" without asking something. The fix is a lingering close in `serve::Peer`, not a
+  retry in an SDK.
+- **Reading a cell of a struct nobody declared answers an absent envelope rather than an error**, and
+  its `origin` reads `derived`. `borg get Wombat#1.nose` prints exactly that, and the SDK reproduces
+  it because there is one read path. Pre-dates the SDKs; asserted in `packages/borg-sdk`'s client
+  suite so that nobody "fixes" it in one of the two places.
+- `Set`, `Map`, aggregation pipelines, mid-list insertion and container isolation are deferred (§18).
+  Generated SDKs are no longer: `borg generate --lang ts` is built, and Python, Rust and Go are not.
+  A generated list field yields the handle to the list and not its elements, because element
+  addressing goes with the rest of the list story.
 
 ## Reporting work
 

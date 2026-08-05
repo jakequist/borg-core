@@ -5,23 +5,25 @@
 //!
 //! Each invocation opens the store, does one thing, and exits. Layers and branches are durable; the
 //! indexes are rebuilt from the log on open (see `Registry`).
+//!
+//! **This file is argv and rendering.** What the commands actually *do* lives in [`crate::ops`],
+//! because `borg serve` does the same things over a socket and there must not be two implementations
+//! of a transaction (SDK-DRAFT.md §2.6). A command here reads as: parse the arguments, call one op,
+//! print what it returned.
 
 use borg_core::{
-    BorgError, BranchId, CellAt, CellRef, ClientVersion, DefEvent, Freshness, FreshnessRequirement,
-    LayerAuthor, LayerId, LayerKind, MergeMode, ObjectTypeName, Origin, Ownership, ProducerId,
-    RepoId, Resolved, Result, Transaction, Value, ValueType, Writer, parse,
+    BorgError, BranchId, DefEvent, LayerAuthor, LayerId, LayerKind, MergeMode, ObjectTypeName,
+    Ownership, ProducerId, RepoId, Result, Transaction, ValueType, Writer, parse,
 };
-use borg_engine::{Poisoning, Registry};
-use borg_exec_native::NativeExecutor;
-use borg_storage_sqlite::SqliteStorage;
-use sidecar::Sidecar;
+use borg_engine::Registry;
+use ops::Ops;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod generate;
+mod ops;
+mod serve;
 mod sidecar;
-
-const ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(0);
 
 /// `println!`, for a reader that is allowed to stop listening.
 ///
@@ -45,10 +47,10 @@ macro_rules! outln {
 }
 
 struct Args {
-    store: PathBuf,
-    branch: Option<String>,
-    /// `--client-version`. See [`client_version`].
-    version: Option<LayerId>,
+    /// Everything an operation needs: the store, `--branch`, `--client-version`, `--freshness`,
+    /// `--settled`. Held as one struct because `borg serve` fills the same struct from a message —
+    /// a request naming a branch and a freshness is naming the same two things these flags do.
+    ops: Ops,
     value_only: bool,
     /// `--quiet`. See [`derive`] — it selects an output *format*, and does not make the command a
     /// query.
@@ -59,14 +61,19 @@ struct Args {
     rebuild: bool,
     /// `--retry-broken`. See [`derive`].
     retry_broken: bool,
-    /// `--freshness`. What a read is willing to pay for (SPEC.md §10.5).
-    freshness: FreshnessRequirement,
-    /// `--settled`: read at the settled frontier rather than at the ragged head.
-    settled: bool,
     /// `--timeout`, in whole seconds. How long `borg frontier reaches` will wait.
     timeout: u64,
-    /// `--tx`. Which open transaction a `borg tx …` command speaks to. See [`transaction_of`].
+    /// `--tx`. Which open transaction a `borg tx …` command speaks to. See [`transaction_id`].
     tx: Option<String>,
+    /// `--socket`. Where `borg serve` listens, and where every other command is told to look when
+    /// the store is being served (see [`crate::serve`]). `borg generate` also *speaks* to it.
+    socket: Option<PathBuf>,
+    /// `--lang`. Which SDK `borg generate` emits.
+    lang: String,
+    /// `-o` / `--out`. Where `borg generate` writes its module.
+    out: Option<PathBuf>,
+    /// `--watch`. See [`crate::generate`].
+    watch: bool,
     rest: Vec<String>,
 }
 
@@ -108,6 +115,10 @@ borg — an event-sourced data backend
   borg layer list | borg layer head
   borg frontier                        how far each producer has caught up
   borg frontier reaches <layer>        wait until every producer has incorporated it
+
+  borg serve --socket <path>           serve this store's client protocol on a unix socket
+  borg generate --lang ts -o <dir>     emit a typed client, pinned to this branch's def-version
+  borg generate ... --watch            and rewrite it whenever that def-version moves
 
 Cells are written Struct:pid.field, Struct:pid, Element[]:pid or Element[]:pid[n], where a pid
 looks like o-1234abcd and names the whole identity. Struct#100 is accepted on input as a
@@ -151,6 +162,23 @@ computes the value at the call site instead of taking the lag; `--settled` reads
 the point everything is caught up to, which is a coherent snapshot slightly in the past rather than
 the latest of every field.
 
+`borg serve` puts this same surface on a socket: transactions, reads with their provenance,
+branches and definitions, as newline-delimited JSON one message per line. It is what an SDK speaks,
+and it is deliberately the same operations these subcommands call rather than a second
+implementation. A transaction belongs to the store and not to the connection, so a client that
+disconnects can reconnect and name the same handle, and one that never comes back is reaped like any
+other idle transaction. **One process serves a store**: while a store is served, every other borg
+invocation against it is refused and told the socket to speak to.
+
+`borg generate` writes the other half: a TypeScript module holding an interface and a runtime
+descriptor per struct, and a `createBorgContext` with **this branch's def-version baked in as the
+client's ClientVersion**. That stamp is the point. borg itself has no generated code and so is
+authored anew on every invocation, but a generated client was authored once, and keeping working
+after the schema moves on is what `down` migrations are for (§5.4). Regenerating is how you adopt a
+new schema; not regenerating is supported. Generation reads through the socket when the store is
+being served and opens the store directly when it is not, because a served store would otherwise
+have to be stopped to generate against it.
+
 A paused branch needs no special vocabulary: its frontier stops advancing, and every read of derived
 data already reports how far behind it is. `borg derive` still works while paused — that is what
 makes pausing useful in an emergency.
@@ -175,6 +203,10 @@ Options:
   --settled                 read at the settled frontier, not at the ragged head
   --timeout <seconds>       how long `frontier reaches` waits (default 0)
   --tx <id>                 which open transaction to speak to (or $BORG_TX)
+  --socket <path>           `serve`: the socket to listen on; `generate`: the one to read through
+  --lang <name>             `generate`: which SDK to emit (ts)
+  -o, --out <dir>           `generate`: where to write the module
+  --watch                   `generate`: rewrite it whenever the def-version moves
   --value                   print only the value
   --quiet                   `derive`: print the bare invocation count, without the prose
   --outstanding             `derive`: report pending work as a query, deriving nothing
@@ -186,28 +218,38 @@ Options:
 
 fn parse_args() -> Args {
     let mut args = Args {
-        store: PathBuf::from("borg.db"),
-        branch: None,
-        version: None,
+        ops: Ops {
+            store: PathBuf::from("borg.db"),
+            branch: None,
+            version: None,
+            freshness: borg_core::FreshnessRequirement::Validated,
+            settled: false,
+        },
         value_only: false,
         quiet: false,
         outstanding: false,
         rebuild: false,
         retry_broken: false,
-        freshness: FreshnessRequirement::Validated,
-        settled: false,
         timeout: 0,
         tx: None,
+        socket: None,
+        lang: "ts".to_string(),
+        out: None,
+        watch: false,
         rest: Vec::new(),
     };
     let mut raw = std::env::args().skip(1);
     while let Some(arg) = raw.next() {
         match arg.as_str() {
-            "--store" => args.store = raw.next().unwrap_or_else(|| usage()).into(),
-            "--branch" => args.branch = raw.next(),
-            "--client-version" => args.version = raw.next().as_deref().map(layer_id),
-            "--freshness" => args.freshness = freshness(raw.next().as_deref()),
-            "--settled" => args.settled = true,
+            "--store" => args.ops.store = raw.next().unwrap_or_else(|| usage()).into(),
+            "--branch" => args.ops.branch = raw.next(),
+            "--client-version" => args.ops.version = raw.next().as_deref().map(layer_id),
+            "--freshness" => args.ops.freshness = freshness(raw.next().as_deref()),
+            "--settled" => args.ops.settled = true,
+            "--socket" => args.socket = raw.next().map(PathBuf::from),
+            "--lang" => args.lang = raw.next().unwrap_or_else(|| usage()),
+            "-o" | "--out" => args.out = raw.next().map(PathBuf::from),
+            "--watch" => args.watch = true,
             "--timeout" => {
                 args.timeout = raw
                     .next()
@@ -236,44 +278,10 @@ async fn main() {
     }
 }
 
-async fn open(args: &Args) -> Result<Registry> {
-    let storage = Arc::new(SqliteStorage::open(&args.store)?);
-    // The poison table comes from beside the store even on the read path, and especially there:
-    // the reader is the one §14 owes an explanation to, and it is never the process that discovered
-    // the failure (SPEC.md §14).
-    Registry::open_with_poison(
-        storage,
-        Arc::new(NativeExecutor::new()),
-        Arc::new(FilePoison::new(args)),
-    )
-    .await
-}
-
-/// The branch the `Struct#100` shorthand names ids on.
-///
-/// A PID's branch component records where an object was *allocated*, not where it lives — the whole
-/// point of `(branch, allocator, counter)` is that ids never collide, so a fork can inherit an
-/// object without renaming it. The shorthand therefore always resolves against the root, or
-/// `Company#1` would mean a different object on every branch and a fork could never read what its
-/// parent wrote. A canonical address needs none of this: it carries its own branch.
-fn allocation_branch(registry: &Registry) -> Result<BranchId> {
-    registry
-        .default_branch()
-        .ok_or_else(|| BorgError::Storage("store has no branches — run `borg init`".into()))
-}
-
-/// What a read is willing to pay for. SPEC.md §10.5.
-///
-/// `validated` is the default because it is the one that is always honest and never expensive: it
-/// walks the read-set and runs no user code. `any` is cheaper and says less; `current` computes and
-/// blocks.
-fn freshness(mode: Option<&str>) -> FreshnessRequirement {
-    match mode {
-        Some("any") => FreshnessRequirement::Any,
-        Some("validated") => FreshnessRequirement::Validated,
-        Some("current") => FreshnessRequirement::Current,
-        _ => usage(),
-    }
+/// `--freshness`, refused by `usage()` rather than by an error, because a mode nobody has is a typo
+/// in the command line and not a fact about the store. SPEC.md §10.5.
+fn freshness(mode: Option<&str>) -> borg_core::FreshnessRequirement {
+    mode.and_then(ops::freshness).unwrap_or_else(|| usage())
 }
 
 /// A layer id as written by `borg layer head` — `L7` — or bare.
@@ -285,58 +293,34 @@ fn layer_id(text: &str) -> LayerId {
     )
 }
 
-/// The ClientVersion this invocation acts at. SPEC.md §5.4.
-///
-/// **The branch's current def-version, unless pinned.** Every actor that executes code carries the
-/// def-layer its code was authored against; the CLI has no generated code, so each invocation is
-/// authored *now*, against the schema as it stands — a client that regenerates itself every time it
-/// runs. Nothing is recorded beside the store, because there would be nothing true to record: a
-/// remembered version would go stale the moment someone else pushed a def, and one recorded per
-/// branch would still be wrong for a branch it was never synced on.
-///
-/// `--client-version` is how an *older* client is spelled, and it has to exist: §5.4's whole claim
-/// is that a v1 client keeps reading and writing after the schema moves to v5, and until generated
-/// SDKs arrive (§18) there is otherwise no way to have a v1 client at all.
-async fn client_version(
-    registry: &Registry,
-    args: &Args,
-    branch: BranchId,
-) -> Result<ClientVersion> {
-    if let Some(pinned) = args.version {
-        return Ok(ClientVersion(pinned));
-    }
-    let path = registry.branches.read_path(branch, None)?;
-    Ok(ClientVersion(registry.defs.head(&path)))
-}
-
-/// Resolve `--branch`, falling back to the root. This selects the *timeline*, which is a separate
-/// question from which object a shorthand names.
-fn branch_of(registry: &Registry, name: Option<&str>) -> Result<BranchId> {
-    match name {
-        Some(name) => registry
-            .branches
-            .all()
-            .into_iter()
-            .find(|b| b.name.as_deref() == Some(name))
-            .map(|b| b.id)
-            .ok_or_else(|| BorgError::Storage(format!("no branch named `{name}`"))),
-        None => registry
-            .default_branch()
-            .ok_or_else(|| BorgError::Storage("store has no branches — run `borg init`".into())),
-    }
-}
-
 async fn run(args: Args) -> Result<()> {
     let verb = args.rest.first().map(String::as_str).unwrap_or("");
     let rest: Vec<&str> = args.rest.iter().skip(1).map(String::as_str).collect();
 
+    // **One process serves a store.** Sidecars and the in-process sequencer are not multi-process
+    // safe, and they were not before `borg serve` either — what serve changes is that the second
+    // process is now likely rather than hypothetical. So a served store refuses everyone else by
+    // name, and says where the socket is (see `crate::serve`).
+    //
+    // `generate` is the one exception, and it is not an exemption: it does not open a served store
+    // either, it *connects to the socket* instead. That is SDK-DRAFT §2.6's remote-connection future
+    // arriving for exactly one read-only command — see `crate::generate` for why it stops there.
+    if verb != "serve" && verb != "generate" {
+        serve::refuse_if_served(&args.ops)?;
+    }
+
     // Reaping sweeps **opportunistically, when a process opens the store** — the same place the
     // indexes are already rebuilt — so there is no daemon, and an idle store sweeps nothing because
-    // nothing is growing (SPEC.md §12).
-    reap_transactions(&args)?;
+    // nothing is growing (SPEC.md §12). Not for `generate`, which may not be touching this store's
+    // files at all: sweeping a served store's transaction table from a second process is exactly the
+    // thing the lock exists to prevent.
+    if verb != "generate" {
+        ops::reap_transactions(&args.ops)?;
+    }
 
     match (verb, rest.as_slice()) {
         ("init", _) => init(&args).await,
+        ("serve", _) => serve::run(&args.ops, args.socket.as_deref()).await,
         ("set", [cell, value]) => set(&args, cell, value).await,
         ("delete", [cell]) => set(&args, cell, "~").await,
         ("get", [cell]) => get(&args, cell).await,
@@ -365,20 +349,36 @@ async fn run(args: Args) -> Result<()> {
         ("derive", _) => derive(&args).await,
         ("frontier", ["reaches", layer]) => frontier_reaches(&args, layer).await,
         ("frontier", _) => frontier(&args).await,
+        ("generate", _) => {
+            let out = args.out.clone().unwrap_or_else(|| usage());
+            generate::run(
+                &args.ops,
+                &generate::Generate {
+                    lang: args.lang.clone(),
+                    out,
+                    watch: args.watch,
+                    socket: args.socket.clone(),
+                },
+            )
+            .await
+        }
         _ => usage(),
     }
 }
 
 async fn init(args: &Args) -> Result<()> {
-    if args.store.exists() {
+    if args.ops.store.exists() {
         return Err(BorgError::Storage(format!(
             "{} already exists",
-            args.store.display()
+            args.ops.store.display()
         )));
     }
-    let registry = open(args).await?;
+    let registry = ops::open(&args.ops).await?;
     let id = registry.branches.create_root(Some("main".into())).await?;
-    outln!("initialised {} (branch main = {id})", args.store.display());
+    outln!(
+        "initialised {} (branch main = {id})",
+        args.ops.store.display()
+    );
     Ok(())
 }
 
@@ -398,11 +398,11 @@ async fn init(args: &Args) -> Result<()> {
 /// text against the field's *declared* type, rejects an undeclared struct or field or a value that
 /// does not fit, and interns content on the way in (§3.4, §5.1, §8).
 async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
+    let registry = ops::open(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
+    let cell = parse::cell_ref(cell, ops::allocation_branch(&registry)?, ops::ALLOCATOR)?;
 
-    let Some(fork_point) = fork_point_of(&registry, branch)? else {
+    let Some(fork_point) = ops::fork_point_of(&registry, branch)? else {
         // Nothing anywhere in this branch's ancestry, so there are no definitions — and §8.0 makes
         // every write contingent on definitions, so this write is going to be rejected whatever
         // path it takes. Going straight to the session gets the caller the rejection they deserve
@@ -415,10 +415,10 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
     // *later* process can name a transaction, and this one dies before there is a later process.
     let scratch = registry
         .branches
-        .fork(owner_of(&registry, fork_point)?, fork_point, None)
+        .fork(ops::owner_of(&registry, fork_point)?, fork_point, None)
         .await?;
 
-    let version = client_version(&registry, args, scratch).await?;
+    let version = ops::client_version(&registry, &args.ops, scratch).await?;
     let mut session = registry
         .begin_write(scratch, version, Writer::Client)
         .await?;
@@ -428,7 +428,7 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
         return Err(rejection);
     }
     let mut transaction = Transaction::new(scratch, branch, fork_point);
-    absorb(&mut transaction, &session);
+    ops::absorb(&mut transaction, &session);
     session.commit().await?;
 
     let replayed = registry
@@ -437,9 +437,9 @@ async fn set(args: &Args, cell: &str, value: &str) -> Result<()> {
         .await?;
     // The layer on the **parent**, not on the scratch branch: this is what a client awaits with
     // `borg frontier reaches`, and the one on the branch nobody else can see is no use for that.
-    outln!("{}", landing(&registry, &transaction, &replayed));
+    outln!("{}", ops::landing(&registry, &transaction, &replayed));
     drop(registry);
-    auto_derive(args, branch).await
+    ops::auto_derive(&args.ops, branch).await
 }
 
 /// The one write path that is not a transaction, and the only branch state it can exist on is none
@@ -448,10 +448,10 @@ async fn write_directly(
     registry: &Registry,
     args: &Args,
     branch: BranchId,
-    cell: &CellRef,
+    cell: &borg_core::CellRef,
     value: &str,
 ) -> Result<()> {
-    let version = client_version(registry, args, branch).await?;
+    let version = ops::client_version(registry, &args.ops, branch).await?;
     let mut session = registry
         .begin_write(branch, version, Writer::Client)
         .await?;
@@ -464,93 +464,39 @@ async fn write_directly(
 }
 
 async fn get(args: &Args, cell: &str) -> Result<()> {
-    // Computing inline needs the same executor `borg derive` needs, and nothing else does. Paying
-    // for it on every read would double the cost of the cheap modes to serve the expensive one.
-    let (registry, workers) = if args.freshness == FreshnessRequirement::Current {
-        let (registry, workers) = open_deriving(args).await?;
-        (registry, Some(workers))
-    } else {
-        (open(args).await?, None)
-    };
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
-
-    // Two honest consistency modes (SPEC.md §10.5). Ragged head is the latest of everything with
-    // per-field freshness; the settled frontier is one layer where nothing is behind anything else.
-    let at = if args.settled {
-        Some(registry.settled(branch).await?)
-    } else {
-        None
-    };
-
-    let resolved = registry
-        .resolver
-        .resolve(
-            branch,
-            &cell,
-            at,
-            client_version(&registry, args, branch).await?,
-            args.freshness,
-        )
-        .await;
-    // Stopped before the read's outcome is raised: a `current` read that could not compute is still
-    // a read that started workers, and leaving them for process exit to clean up is how a longer-
-    // lived host inherits a leak.
-    if let Some(workers) = workers {
-        workers.shutdown().await;
-    }
-    let resolved = resolved?;
-    report(&registry, args, &cell, &resolved).await
+    report(args, &ops::get(&args.ops, cell).await?)
 }
 
 /// The provenance envelope, as `borg get` and `borg tx get` both print it.
 ///
 /// One renderer, because a read through a transaction is a read: if the two drifted, the CLI would
 /// be teaching that a transaction's reads are a different kind of thing from a branch's, which is
-/// exactly the belief §12 exists to remove.
-async fn report(
-    registry: &Registry,
-    args: &Args,
-    cell: &CellRef,
-    resolved: &Resolved<Option<Value>>,
-) -> Result<()> {
+/// exactly the belief §12 exists to remove. `borg serve` renders the same [`ops::Read`] as an
+/// envelope message, and `scenarios/250-serve` asserts the two agree field for field.
+fn report(args: &Args, read: &ops::Read) -> Result<()> {
     // Interned content reads back as content, so a string field prints `acme.ai` rather than the
     // `@s-…` that is physically stored (§3.4). What `borg get --value` prints is what `borg set`
     // accepts, which is the property a shell pipeline actually relies on.
-    let rendered = match &resolved.value {
-        Some(value) => Some(registry.values.render(value).await?),
-        None => None,
-    };
-
     if args.value_only {
-        if let Some(value) = rendered {
+        if let Some(value) = &read.rendered {
             outln!("{value}");
         }
         return Ok(());
     }
 
-    outln!("{cell}");
+    let resolved = &read.resolved;
+    outln!("{}", read.cell);
     outln!(
         "  value:       {}",
-        rendered.as_deref().unwrap_or("<absent>")
+        read.rendered.as_deref().unwrap_or("<absent>")
     );
     // Shown only when there is one: it is the proof that equal content is stored once, registry-wide
     // and branch-independently (§3.1), and there is nothing to show for a primitive.
-    if let Some(pid) = resolved
-        .value
-        .as_ref()
-        .and_then(|v| registry.values.content_pid(v))
-    {
-        outln!("  interned:    @{pid}");
+    if let Some(pid) = &read.interned {
+        outln!("  interned:    {pid}");
     }
-    outln!(
-        "  origin:      {}",
-        match resolved.origin {
-            Origin::Source => "source",
-            Origin::Derived => "derived",
-        }
-    );
-    outln!("  state:       {}", state_name(resolved.state));
+    outln!("  origin:      {}", ops::origin_name(resolved.origin));
+    outln!("  state:       {}", ops::state_name(resolved.state));
     // Two layers, not one. `authored at` is where the value was first committed — on whichever
     // branch wrote it — and `landed at` is where it arrived on the branch being read. They differ
     // exactly when the value came across a merge, and the old single `written at` reported only the
@@ -564,27 +510,9 @@ async fn report(
     Ok(())
 }
 
-const fn state_name(state: Freshness) -> &'static str {
-    match state {
-        Freshness::Current => "current",
-        Freshness::Unvalidated => "unvalidated",
-        Freshness::Stale => "stale",
-        Freshness::Broken => "broken",
-        Freshness::Tombstoned => "tombstoned",
-    }
-}
-
 async fn explain(args: &Args, cell: &str) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
-
-    let version = client_version(&registry, args, branch).await?;
-    let Some(lineage) = registry
-        .resolver
-        .explain(branch, &cell, None, version)
-        .await?
-    else {
+    let (cell, lineage) = ops::explain(&args.ops, cell).await?;
+    let Some(lineage) = lineage else {
         outln!("{cell}: nothing stored");
         return Ok(());
     };
@@ -616,10 +544,8 @@ async fn explain(args: &Args, cell: &str) -> Result<()> {
             outln!(
                 "    {}  {}  @{}",
                 edge.cell.cell,
-                match edge.origin {
-                    Origin::Source => "source ",
-                    Origin::Derived => "derived",
-                },
+                // Padded to the width of `derived`, so the layer column lines up.
+                format!("{:<7}", ops::origin_name(edge.origin)),
                 edge.landed_at
             );
         }
@@ -628,10 +554,7 @@ async fn explain(args: &Args, cell: &str) -> Result<()> {
 }
 
 async fn branch_list(args: &Args) -> Result<()> {
-    let registry = open(args).await?;
-    let mut branches = registry.branches.all();
-    branches.sort_by_key(|b| b.id.0);
-    for branch in branches {
+    for branch in ops::branch_list(&args.ops).await? {
         let name = branch.name.unwrap_or_else(|| "<unnamed>".into());
         match branch.origin {
             Some(origin) => outln!("{:<6} {name:<16} forked at {origin}", branch.id.to_string()),
@@ -642,8 +565,8 @@ async fn branch_list(args: &Args) -> Result<()> {
 }
 
 async fn branch_fork(args: &Args, parent: &str, tail: &[&str]) -> Result<()> {
-    let registry = open(args).await?;
-    let parent_id = branch_of(&registry, Some(parent))?;
+    let registry = ops::open(&args.ops).await?;
+    let parent_id = ops::branch_of(&registry, Some(parent))?;
     let at = flag(tail, "--at")
         .and_then(|v| v.trim_start_matches('L').parse::<u64>().ok())
         .map(LayerId)
@@ -657,8 +580,8 @@ async fn branch_fork(args: &Args, parent: &str, tail: &[&str]) -> Result<()> {
 }
 
 async fn branch_merge(args: &Args, child: &str, tail: &[&str]) -> Result<()> {
-    let registry = open(args).await?;
-    let child_id = branch_of(&registry, Some(child))?;
+    let registry = ops::open(&args.ops).await?;
+    let child_id = ops::branch_of(&registry, Some(child))?;
     let mode = if tail.contains(&"--defs-only") {
         MergeMode::DefOnly
     } else {
@@ -680,169 +603,12 @@ async fn branch_merge(args: &Args, child: &str, tail: &[&str]) -> Result<()> {
         .map(|layer| layer.branch);
     drop(registry);
     match parent {
-        Some(parent) => auto_derive(args, parent).await,
+        Some(parent) => ops::auto_derive(&args.ops, parent).await,
         None => Ok(()),
     }
 }
 
 // --- Transactions. SPEC.md §12, §13. ---------------------------------------------------------------
-
-/// How long a transaction may sit untouched before it is reaped, when nobody has said otherwise.
-///
-/// Generous on purpose: the cost of reaping too eagerly is a client losing work it was in the middle
-/// of, and the cost of reaping too late is a branch row and a read-set sitting in a file. Those are
-/// not the same size of mistake.
-const DEFAULT_TX_IDLE_TIMEOUT: u64 = 24 * 60 * 60;
-
-/// How many ended transactions are remembered, so that touching one can say what became of it rather
-/// than "unknown transaction". Bounded because this is a courtesy, not a log.
-const REMEMBERED_TRANSACTIONS: usize = 64;
-
-/// The open transactions, beside the store.
-///
-/// A transaction spans several CLI processes, so it needs somewhere to keep two things: which branch
-/// it forked, and what it has read so far. That goes here, with the pause flags and the
-/// producer-implementation table (§9.2), for the same reason they do — see `crate::sidecar`.
-///
-/// Every id in this file is a layer or a branch id, which are sequential counters; there is no
-/// producer id in it, and so nothing that needs `sidecar::producer_id`.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-struct Transactions {
-    /// Seconds. Rendered and accepted as a duration by `borg tx timeout`.
-    tx_idle_timeout: u64,
-    /// The next handle to hand out. Monotonic and never reused, so a stale `--tx` names a
-    /// transaction that existed rather than one that is about to.
-    next: u64,
-    open: Vec<Open>,
-    /// What became of the transactions that ended.
-    spent: Vec<Spent>,
-}
-
-impl Default for Transactions {
-    fn default() -> Self {
-        Self {
-            tx_idle_timeout: DEFAULT_TX_IDLE_TIMEOUT,
-            next: 1,
-            open: Vec::new(),
-            spent: Vec::new(),
-        }
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Open {
-    id: String,
-    /// Unix seconds, when this transaction was last used. **Idle, not elapsed**: a legitimate
-    /// transaction may run for hours, and what predicts an abandoned one is silence.
-    touched: u64,
-    state: Transaction,
-}
-
-/// A transaction that ended, and how.
-///
-/// The `fate` is a phrase rather than a code because it is going straight into a sentence, and the
-/// sentence is the point: *"expired after 2 minutes idle"* tells a client what to do next, and
-/// *"unknown transaction"* tells it to go and look for a bug it does not have.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Spent {
-    id: String,
-    fate: String,
-}
-
-impl Sidecar for Transactions {
-    const EXTENSION: &'static str = "transactions.json";
-}
-
-fn load_transactions(args: &Args) -> Transactions {
-    sidecar::load(&args.store)
-}
-
-fn save_transactions(args: &Args, table: &Transactions) -> Result<()> {
-    sidecar::save(&args.store, table)
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
-}
-
-/// `90s`, `10m`, `24h`, `7d`, or a bare count of seconds.
-fn duration(text: &str) -> Option<u64> {
-    let (digits, scale) = match text.as_bytes().last()? {
-        b's' => (&text[..text.len() - 1], 1),
-        b'm' => (&text[..text.len() - 1], 60),
-        b'h' => (&text[..text.len() - 1], 60 * 60),
-        b'd' => (&text[..text.len() - 1], 24 * 60 * 60),
-        _ => (text, 1),
-    };
-    digits.parse::<u64>().ok().map(|n| n * scale)
-}
-
-/// The largest whole unit that describes this exactly, which is how it was almost certainly typed.
-fn render_duration(seconds: u64) -> String {
-    for (scale, suffix) in [(86400, 'd'), (3600, 'h'), (60, 'm')] {
-        if seconds >= scale && seconds.is_multiple_of(scale) {
-            return format!("{}{suffix}", seconds / scale);
-        }
-    }
-    format!("{seconds}s")
-}
-
-/// The same duration spelled for a sentence rather than for a config file.
-fn spell_duration(seconds: u64) -> String {
-    let (count, unit) = [(86400, "day"), (3600, "hour"), (60, "minute")]
-        .into_iter()
-        .find(|(scale, _)| seconds >= *scale && seconds.is_multiple_of(*scale))
-        .map_or((seconds, "second"), |(scale, unit)| (seconds / scale, unit));
-    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
-}
-
-/// Drop transactions that have been idle too long. SPEC.md §12.
-///
-/// **No daemon.** This runs when a process opens the store, which is the same place the indexes are
-/// already rebuilt from the log — so an idle store sweeps nothing, because nothing is growing, and a
-/// busy one sweeps constantly for free.
-///
-/// A reaped transaction's *state* is dropped, which is what makes it unusable: nothing can be
-/// written through it and its layers can never merge. Its branch row is left where it is, because
-/// whether spent branches are reaped or kept as history is a real choice and is deliberately not
-/// being made by a janitor as a side effect (ROADMAP.md, open questions).
-fn reap_transactions(args: &Args) -> Result<()> {
-    let mut table = load_transactions(args);
-    if table.open.is_empty() {
-        return Ok(());
-    }
-    let now = now();
-    let timeout = table.tx_idle_timeout;
-    let mut reaped = Vec::new();
-    table.open.retain(|open| {
-        if now.saturating_sub(open.touched) <= timeout {
-            return true;
-        }
-        reaped.push((open.id.clone(), open.state.branch));
-        false
-    });
-    if reaped.is_empty() {
-        return Ok(());
-    }
-    for (id, branch) in reaped {
-        set_paused(args, branch, false)?;
-        retire(
-            &mut table,
-            id,
-            format!("expired after {} idle", spell_duration(timeout)),
-        );
-    }
-    save_transactions(args, &table)
-}
-
-fn retire(table: &mut Transactions, id: String, fate: String) {
-    table.spent.push(Spent { id, fate });
-    let excess = table.spent.len().saturating_sub(REMEMBERED_TRANSACTIONS);
-    table.spent.drain(..excess);
-}
 
 /// Which open transaction this command speaks to.
 ///
@@ -851,235 +617,84 @@ fn retire(table: &mut Transactions, id: String, fate: String) {
 /// shell that exported it once; the flag is what lets one shell hold two transactions open at the
 /// same time, which is the whole reason the handle is explicit and is an interleaving a
 /// single-process API cannot express.
-fn transaction_of(args: &Args, table: &Transactions) -> Result<usize> {
+///
+/// **This stayed in the CLI when the rest of the transaction moved to `ops`**, and the reason is a
+/// small finding about the surface: every one of these defaults is a way of *not* naming a
+/// transaction, and they all borrow from the shell — a flag, an exported variable, or the fact that
+/// a terminal usually has one thing going on. A socket client has none of that. It holds its handles
+/// in variables and names one on every message, so `ops` takes an explicit id and this is the only
+/// place that guesses.
+fn transaction_id(args: &Args, table: &ops::Transactions) -> Result<String> {
     let named = args
         .tx
         .clone()
         .or_else(|| std::env::var("BORG_TX").ok().filter(|id| !id.is_empty()));
-    let Some(id) = named else {
-        return match table.open.len() {
-            0 => Err(BorgError::Storage(
-                "no transaction is open — start one with `borg tx begin`".into(),
-            )),
-            1 => Ok(0),
-            _ => Err(BorgError::Storage(format!(
-                "several transactions are open ({}) — name one with --tx",
-                table
-                    .open
-                    .iter()
-                    .map(|open| open.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))),
-        };
-    };
-    if let Some(index) = table.open.iter().position(|open| open.id == id) {
-        return Ok(index);
+    if let Some(id) = named {
+        return Ok(id);
     }
-    // **Never "unknown transaction" for one that existed.** The first tells you what happened and
-    // what to do; the second sends you looking for a bug in your own bookkeeping.
-    if let Some(spent) = table.spent.iter().find(|spent| spent.id == id) {
-        return Err(BorgError::Storage(format!(
-            "transaction {id} {}",
-            spent.fate
-        )));
+    match table.open.len() {
+        0 => Err(BorgError::Storage(
+            "no transaction is open — start one with `borg tx begin`".into(),
+        )),
+        1 => Ok(table.open[0].id.clone()),
+        _ => Err(BorgError::Storage(format!(
+            "several transactions are open ({}) — name one with --tx",
+            table
+                .open
+                .iter()
+                .map(|open| open.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
-    Err(BorgError::Storage(format!("unknown transaction {id}")))
 }
 
-/// The highest layer this branch can see — its own head, or the fork point it inherits when it has
-/// written nothing yet. `None` where the whole ancestry is empty.
+/// The handle a `borg tx …` command is speaking to, resolved against the table on disk.
 ///
-/// A transaction forks *here* rather than at `head(branch)`, which is what lets the first write on a
-/// fresh fork be a transaction like every other write. The branch it merges back into is still the
-/// one the client named, which is why a transaction carries its parent rather than inferring it.
-fn fork_point_of(registry: &Registry, branch: BranchId) -> Result<Option<LayerId>> {
-    let ceiling = registry.branches.read_path(branch, None)?.ceiling();
-    Ok((ceiling.0 != 0).then_some(ceiling))
-}
-
-fn owner_of(registry: &Registry, layer: LayerId) -> Result<BranchId> {
-    registry
-        .layers
-        .layer(layer)
-        .map(|layer| layer.branch)
-        .ok_or_else(|| BorgError::Storage(format!("unknown layer {layer}")))
-}
-
-/// Fold a finished write session's reads and writes into the transaction that owns it.
-///
-/// Reads before writes, always: every probe a session makes precedes any write it makes to the same
-/// cell, so draining them in this order is what gets [`Transaction::observe`]'s ordering rule right
-/// — a read that came *before* the transaction's own write is a real dependency on the parent and is
-/// guarded, and a read that came after saw only the transaction itself.
-fn absorb(transaction: &mut Transaction, session: &borg_engine::WriteSession) {
-    for read in session.observed() {
-        transaction.observe(read.clone());
-    }
-    for write in session.authored() {
-        transaction.wrote(write.clone());
-    }
-}
-
-/// The layer a transaction landed in on its parent — what a client awaits with
-/// `borg frontier reaches`. A transaction that wrote nothing landed nowhere, and says head.
-fn landing(registry: &Registry, transaction: &Transaction, replayed: &[LayerId]) -> LayerId {
-    replayed.last().copied().unwrap_or_else(|| {
-        registry
-            .layers
-            .head(transaction.parent)
-            .unwrap_or(LayerId(0))
-    })
+/// The table is loaded here and again inside the operation. That is one extra read of a small file
+/// per command, and it buys the operations an argument list that says what they need — an id — rather
+/// than a table plus an index into it, which is a shape only this caller could ever produce.
+fn tx_target(args: &Args) -> Result<String> {
+    transaction_id(args, &ops::load_transactions(&args.ops))
 }
 
 async fn tx_begin(args: &Args) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    let fork_point = fork_point_of(&registry, branch)?
-        .ok_or_else(|| BorgError::Storage("nothing to fork from — the branch is empty".into()))?;
-
-    let mut table = load_transactions(args);
-    let id = format!("tx-{}", table.next);
-    table.next += 1;
-    let forked = registry
-        .branches
-        .fork(
-            owner_of(&registry, fork_point)?,
-            fork_point,
-            Some(id.clone()),
-        )
-        .await?;
-    // **Created paused.** Deriving on a branch that exists to be merged is waste: merge does not
-    // carry derived layers, and the parent recomputes what it needs (§13).
-    set_paused(args, forked, true)?;
-
-    table.open.push(Open {
-        id: id.clone(),
-        touched: now(),
-        state: Transaction::new(forked, branch, fork_point),
-    });
-    save_transactions(args, &table)?;
-    outln!("{id}");
+    outln!("{}", ops::tx_begin(&args.ops).await?);
     Ok(())
 }
 
-/// Read through a transaction, and **record the read**.
-///
-/// The recording is the whole difference from `borg get`, and it is what makes the guard at commit
-/// automatic. Reads that find nothing are recorded too: absence is a legitimate thing to have acted
-/// on, and a later write to that cell must invalidate the decision (§9.4).
 async fn tx_get(args: &Args, cell: &str) -> Result<()> {
-    let mut table = load_transactions(args);
-    let index = transaction_of(args, &table)?;
-    let registry = open(args).await?;
-    let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
-    let branch = table.open[index].state.branch;
-
-    let version = client_version(&registry, args, branch).await?;
-    // The def-version of *this field*, as this reader's own view names it — the record key, and the
-    // only bridge from a whole-schema ClientVersion to one (§5.3, §5.4). Recording the read at the
-    // reader's ClientVersion instead would file it under a version nothing else uses.
-    let path = registry.branches.read_path(branch, None)?;
-    let at = registry
-        .defs
-        .view_at(&path, version.0)
-        .await?
-        .version_of(&cell);
-
-    let resolved = registry
-        .resolver
-        .resolve(branch, &cell, None, version, args.freshness)
-        .await?;
-
-    let open = &mut table.open[index];
-    open.state.observe(CellAt::new(cell.clone(), at));
-    open.touched = now();
-    save_transactions(args, &table)?;
-
-    report(&registry, args, &cell, &resolved).await
+    let read = ops::tx_get(&args.ops, &tx_target(args)?, cell).await?;
+    report(args, &read)
 }
 
 async fn tx_set(args: &Args, cell: &str, value: &str) -> Result<()> {
-    let mut table = load_transactions(args);
-    let index = transaction_of(args, &table)?;
-    let registry = open(args).await?;
-    let cell = parse::cell_ref(cell, allocation_branch(&registry)?, ALLOCATOR)?;
-    let branch = table.open[index].state.branch;
-
-    let version = client_version(&registry, args, branch).await?;
-    let mut session = registry
-        .begin_write(branch, version, Writer::Client)
-        .await?;
-    if let Err(rejection) = session.set_text(&cell, value).await {
-        session.abort().await?;
-        return Err(rejection);
-    }
-    let open = &mut table.open[index];
-    absorb(&mut open.state, &session);
-    open.touched = now();
-
-    let layer = session.commit().await?;
-    save_transactions(args, &table)?;
-    outln!("{layer}");
+    outln!(
+        "{}",
+        ops::tx_set(&args.ops, &tx_target(args)?, cell, value).await?
+    );
     Ok(())
 }
 
-/// Merge, guarded by everything the transaction read. SPEC.md §12, §13.
 async fn tx_commit(args: &Args) -> Result<()> {
-    let mut table = load_transactions(args);
-    let index = transaction_of(args, &table)?;
-    let registry = open(args).await?;
-    let state = table.open[index].state.clone();
-
-    let replayed = match registry
-        .branches
-        .merge_transaction(&state, MergeMode::DefAndData)
-        .await
-    {
-        Ok(replayed) => replayed,
-        Err(rejection) => {
-            // **The transaction stays open.** Its snapshot is stale and its commit cannot succeed,
-            // but the read-set is what a client needs in order to decide whether to retry or to give
-            // up, and throwing it away here would leave them holding an error and nothing else. The
-            // other half of that is `borg tx abort`, and the timeout is what collects the ones
-            // nobody comes back to.
-            table.open[index].touched = now();
-            save_transactions(args, &table)?;
-            return Err(rejection);
-        }
-    };
-
-    let spent = table.open.remove(index);
-    retire(&mut table, spent.id, "already committed".into());
-    save_transactions(args, &table)?;
-    set_paused(args, state.branch, false)?;
-
-    outln!("{}", landing(&registry, &state, &replayed));
-    drop(registry);
-    auto_derive(args, state.parent).await
+    outln!("{}", ops::tx_commit(&args.ops, &tx_target(args)?).await?);
+    Ok(())
 }
 
-/// Drop a transaction. Nothing it wrote is on the parent, because nothing it wrote ever left its own
-/// branch — which is what makes an abort free.
 async fn tx_abort(args: &Args) -> Result<()> {
-    let mut table = load_transactions(args);
-    let index = transaction_of(args, &table)?;
-    let spent = table.open.remove(index);
-    let id = spent.id.clone();
-    set_paused(args, spent.state.branch, false)?;
-    retire(&mut table, spent.id, "was aborted".into());
-    save_transactions(args, &table)?;
+    let id = tx_target(args)?;
+    ops::tx_abort(&args.ops, &id)?;
     outln!("{id} aborted");
     Ok(())
 }
 
 fn tx_list(args: &Args) -> Result<()> {
-    let table = load_transactions(args);
+    let table = ops::load_transactions(&args.ops);
     if table.open.is_empty() {
         outln!("no open transactions");
         return Ok(());
     }
-    let now = now();
+    let now = ops::now();
     for open in &table.open {
         let (reads, writes) = open.state.size();
         outln!(
@@ -1087,7 +702,7 @@ fn tx_list(args: &Args) -> Result<()> {
             open.id,
             open.state.branch.to_string(),
             open.state.fork_point.to_string(),
-            render_duration(now.saturating_sub(open.touched))
+            ops::render_duration(now.saturating_sub(open.touched))
         );
     }
     Ok(())
@@ -1095,18 +710,18 @@ fn tx_list(args: &Args) -> Result<()> {
 
 /// Read or set the idle timeout. SPEC.md §12.
 fn tx_timeout(args: &Args, spec: Option<&str>) -> Result<()> {
-    let mut table = load_transactions(args);
+    let mut table = ops::load_transactions(&args.ops);
     if let Some(spec) = spec {
-        table.tx_idle_timeout = duration(spec).ok_or_else(|| {
+        table.tx_idle_timeout = ops::duration(spec).ok_or_else(|| {
             BorgError::Storage(format!(
                 "`{spec}` is not a duration — try 90s, 10m, 24h or 7d"
             ))
         })?;
-        save_transactions(args, &table)?;
+        ops::save_transactions(&args.ops, &table)?;
     }
     outln!(
         "tx_idle_timeout = {}",
-        render_duration(table.tx_idle_timeout)
+        ops::render_duration(table.tx_idle_timeout)
     );
     Ok(())
 }
@@ -1171,8 +786,8 @@ fn value_type(name: &str) -> ValueType {
 }
 
 async fn def_push(args: &Args, file: &str) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let registry = ops::open(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
 
     let raw = std::fs::read_to_string(file)
         .map_err(|err| BorgError::Storage(format!("{file}: {err}")))?;
@@ -1224,21 +839,13 @@ async fn def_push(args: &Args, file: &str) -> Result<()> {
     // A def push commits no data, and still creates work: a producer newer than the data it maps
     // over owes its whole source buffer (§9.6), and a `MutateField` appoints migrations that owe
     // every existing value.
-    auto_derive(args, branch).await
+    ops::auto_derive(&args.ops, branch).await
 }
 
 async fn def_show(args: &Args, name: &str) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    let path = registry.branches.read_path(branch, None)?;
-    let view = registry.defs.view(&path).await?;
-
-    let name: ObjectTypeName = name.into();
-    let Some(def) = view.object(&name) else {
-        return Err(BorgError::Storage(format!("no struct named `{name}`")));
-    };
-    outln!("{name}");
-    for (field, def) in &def.fields {
+    let object = ops::def_show(&args.ops, name).await?;
+    outln!("{}", object.name);
+    for (field, def) in &object.fields {
         // Ownership is shown because it is now enforced: this line is the answer to "why was my
         // write rejected" (§8).
         outln!(
@@ -1257,16 +864,13 @@ async fn def_show(args: &Args, name: &str) -> Result<()> {
 /// The def-version in force on this branch — the ClientVersion a client generated right now would
 /// carry (SPEC.md §5.3, §5.4). A def-version *is* a layer id; there is no separate scheme.
 async fn def_version(args: &Args) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    let path = registry.branches.read_path(branch, None)?;
-    outln!("{}", registry.defs.head(&path));
+    outln!("{}", ops::def_version(&args.ops).await?);
     Ok(())
 }
 
 async fn layer_list(args: &Args) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let registry = ops::open(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
     let mut layers = registry.layers.layers_of(branch);
     layers.sort_by_key(|l| l.id.0);
     for layer in layers {
@@ -1289,9 +893,7 @@ async fn layer_list(args: &Args) -> Result<()> {
 }
 
 async fn layer_head(args: &Args) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    outln!("{}", registry.layers.head(branch).unwrap_or(LayerId(0)));
+    outln!("{}", ops::branch_head(&args.ops).await?.1);
     Ok(())
 }
 
@@ -1312,8 +914,8 @@ async fn frontier_reaches(args: &Args, layer: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.timeout);
 
     loop {
-        let registry = open(args).await?;
-        let branch = branch_of(&registry, args.branch.as_deref())?;
+        let registry = ops::open(&args.ops).await?;
+        let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
         let producers = registry.producers_of(branch).await?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         let slice = remaining.min(POLL);
@@ -1337,14 +939,14 @@ async fn frontier_reaches(args: &Args, layer: &str) -> Result<()> {
 }
 
 async fn frontier(args: &Args) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let registry = ops::open(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
     let path = registry.branches.read_path(branch, None)?;
     let view = registry.defs.view(&path).await?;
 
     // The log knows producer ids; only the implementation table knows what a human called them.
     // Joining the two here is the CLI's job precisely because the log must not hold either.
-    let names = load_impls(args);
+    let names = ops::load_impls(&args.ops);
     let head = registry.layers.head(branch).unwrap_or(LayerId(0));
     let mut any = false;
     for producer in view.producers() {
@@ -1372,59 +974,13 @@ fn flag<'a>(tail: &[&'a str], name: &str) -> Option<&'a str> {
         .copied()
 }
 
-// --- Repos, producers and derivation ---
+// --- Repos, producers and derivation. The state these read and write lives in `ops`. ---
 
-/// Where a producer's implementation lives.
-///
-/// Deliberately *not* in the log. §9.2 separates a producer's definition from its implementation:
-/// the log records that producer P exists at some ClientVersion, and the `ExecutionProvider`
-/// resolves that id to code. Writing a local file path into the log would tie the data model to one
-/// machine's filesystem. This sidecar is the CLI's own resolution table, and a container-backed
-/// runtime would keep an image reference in exactly the same place.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct Implementations {
-    producers: Vec<Implementation>,
-}
-
-impl Sidecar for Implementations {
-    const EXTENSION: &'static str = "producers.json";
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Implementation {
-    /// A string, and this is the file that made the case for it — see `sidecar::producer_id`.
-    #[serde(with = "sidecar::producer_id")]
-    id: u64,
-    name: String,
-    source: String,
-    command: PathBuf,
-}
-
-fn load_impls(args: &Args) -> Implementations {
-    sidecar::load(&args.store)
-}
-
-fn save_impls(args: &Args, impls: &Implementations) -> Result<()> {
-    sidecar::save(&args.store, impls)
-}
-
-/// Push a repo: ask each script to describe itself, record its definitions in the log, and remember
-/// where the code lives.
-///
-/// **Definitions and producers land in one def layer.** A producer and the field it writes must
-/// arrive together or not at all: after §8, a producer cannot write anything unless its output field
-/// is declared, and half a push would leave a pipeline that is registered and legally mute.
-///
-/// **Nothing is printed until everything has been accepted.** A push is decided as a whole, and the
-/// checks that can reject it — a `derived_by` naming a producer the repo does not implement, a type
-/// change with no `up`, a migration no field appoints, and the def layer's own validation — are
-/// spread through the walk that also builds the report. Printing as it went meant a rejected push
-/// listed half a schema first, which reads as a partial success and is not one.
 async fn repo_push(args: &Args, dir: &str) -> Result<()> {
     let dir = PathBuf::from(dir);
     let repo = read_repo_id(&dir)?;
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let registry = ops::open(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
 
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(dir.join("pipelines"))
         .map_err(|err| BorgError::Storage(format!("{}/pipelines: {err}", dir.display())))?
@@ -1440,10 +996,25 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
     for command in scripts {
         // The script is the source of truth for what it implements, so a producer definition cannot
         // exist without the code that satisfies it.
-        described.push((command.clone(), borg_exec_process::describe(&command)?));
+        let description = borg_exec_process::describe(&command)?;
+        // An SDK whose author writes the repo id in code as well as in `borg.toml` has two copies
+        // of one fact. `borg.toml` is the authoritative one — a repo is a directory, and one
+        // directory has one id however many executables it holds — so the other is checked rather
+        // than ignored. A repo that says nothing (every shell worker) skips this.
+        if let Some(claimed) = description.repo
+            && claimed != repo.0
+        {
+            return Err(BorgError::Storage(format!(
+                "{} describes itself as repo {claimed}, but {}/borg.toml says {}",
+                command.display(),
+                dir.display(),
+                repo.0
+            )));
+        }
+        described.push((command.clone(), description));
     }
 
-    let mut impls = load_impls(args);
+    let mut impls = ops::load_impls(&args.ops);
     let mut events = Vec::new();
     // Held back until the push is accepted — see the header.
     let mut report: Vec<String> = Vec::new();
@@ -1457,7 +1028,14 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                 version: LayerId(0),
                 declaring_repo: repo,
             }));
-            remember(&mut impls, id, &spec.name, &spec.source, command);
+            ops::remember(
+                &mut impls,
+                id,
+                &spec.name,
+                &spec.source,
+                command,
+                description.transport,
+            );
             report.push(format!("{} -> {id}", spec.name));
         }
     }
@@ -1510,12 +1088,12 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
                             version: LayerId(0),
                             declaring_repo: repo,
                         }));
-                        let command = described
+                        let (command, transport) = described
                             .iter()
                             .find(|(_, d)| d.migrations.iter().any(|m| m.name == *name))
-                            .map(|(command, _)| command.clone())
+                            .map(|(command, d)| (command.clone(), d.transport))
                             .expect("resolve() accepted the name, so some script described it");
-                        remember(&mut impls, id, name, &spec.name, &command);
+                        ops::remember(&mut impls, id, name, &spec.name, &command, transport);
                         Ok(Some(id))
                     };
                 let up = migration(&field.up, borg_core::MigrationDirection::Up)?;
@@ -1597,29 +1175,12 @@ async fn repo_push(args: &Args, dir: &str) -> Result<()> {
         registry.defs.push(branch, events).await?;
     }
     drop(registry);
-    save_impls(args, &impls)?;
+    ops::save_impls(&args.ops, &impls)?;
     // Everything is accepted and committed, so this is a report rather than a running commentary.
     for line in report {
         outln!("{line}");
     }
-    auto_derive(args, branch).await
-}
-
-/// Record where a producer's code lives. Producer ids are stable across pushes, so this replaces
-/// rather than accumulates.
-fn remember(impls: &mut Implementations, id: ProducerId, name: &str, source: &str, command: &Path) {
-    impls.producers.retain(|p| p.id != id.0);
-    impls.producers.push(Implementation {
-        id: id.0,
-        name: name.to_string(),
-        // The struct a worker is invoked over. A migration maps over one of its *fields* (§9.3), but
-        // what it is handed is still the entity — `Company:o-1234abcd`, to which it appends the
-        // field name — so the struct is what this needs to render.
-        source: source.to_string(),
-        command: command
-            .canonicalize()
-            .unwrap_or_else(|_| command.to_path_buf()),
-    });
+    ops::auto_derive(&args.ops, branch).await
 }
 
 /// Read the repo id out of `borg.toml`.
@@ -1642,7 +1203,7 @@ fn read_repo_id(dir: &Path) -> Result<RepoId> {
 }
 
 async fn producer_list(args: &Args) -> Result<()> {
-    for producer in load_impls(args).producers {
+    for producer in ops::load_impls(&args.ops).producers {
         outln!(
             "{:<20} {:<10} maps {:<12} {}",
             producer.name,
@@ -1654,97 +1215,20 @@ async fn producer_list(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Open the store with an executor that can run this store's producers, and make the engine aware
-/// of the ones defined on the branch.
-///
-/// Three paths need exactly this and need it identically: `borg derive`, the auto-derivation that
-/// follows a write, and a `--freshness current` read. Producer *definitions* live in the log and
-/// producer *implementations* in the sidecar beside it (§9.2), so being able to run anything at all
-/// means joining the two — and doing that in three places is how they drift.
-async fn open_deriving(args: &Args) -> Result<(Registry, Arc<borg_exec_process::ProcessExecutor>)> {
-    let storage = Arc::new(SqliteStorage::open(&args.store)?);
-    let impls = load_impls(args);
-
-    // A worker resolves the `Company#1` shorthand against the allocating branch, which is a fact
-    // about the store — so the store has to be open before the executor can be built.
-    let probe = Registry::open(
-        Arc::clone(&storage) as Arc<_>,
-        Arc::new(NativeExecutor::new()),
-    )
-    .await?;
-    let allocation = allocation_branch(&probe)?;
-    drop(probe);
-
-    let parallelism = derive_parallelism();
-    let executor = borg_exec_process::from_registrations(
-        allocation,
-        impls
-            .producers
-            .iter()
-            .map(|p| (p.id, p.command.clone(), p.source.clone())),
-    )
-    // The pool matches the scheduler, because a pool smaller than the degree of parallelism would
-    // put the queue back that the pool exists to remove.
-    .with_pool_size(parallelism);
-    let executor = Arc::new(executor);
-    let registry = Registry::open_with_poison(
-        storage,
-        Arc::clone(&executor) as Arc<_>,
-        Arc::new(FilePoison::new(args)),
-    )
-    .await?;
-    registry.engine.set_parallelism(parallelism);
-
-    registry
-        .register_producers(branch_of(&registry, args.branch.as_deref())?)
-        .await?;
-    Ok((registry, executor))
-}
-
-/// How many invocations a round runs at once, and how many worker processes back them.
-///
-/// An environment variable rather than a flag or a sidecar file. It is neither log data nor a fact
-/// about the store — the same store derived on a laptop and on a build box wants different numbers —
-/// so there is nothing to record, and every command that derives would otherwise need the same flag.
-/// Unset means one per core, which is what the engine picks for itself.
-fn derive_parallelism() -> usize {
-    std::env::var("BORG_DERIVE_PARALLELISM")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
-        })
-}
-
-/// Run every producer forward to head.
-///
-/// **Works on a paused branch.** Pausing means "do not auto-derive", not "refuse to derive" — which
-/// is the whole point of having the switch: freeze the automation, then step it by hand.
-///
-/// `--rebuild` swaps catching up for recomputing: this branch forgets what it has derived and
-/// derives it again from source (§6.3). On a fork that is a replay of the world as of the fork
-/// point, which is the operation a watermark's meaning is defined in terms of (§10.1) and the one
-/// `scenarios/100-watermark-truth` uses to check that meaning holds.
-///
-/// **A broken producer is skipped, and said so.** §14 poisons a producer that threw or cycled, and
-/// running it again on the next command would repeat the failure, burn the work and repeat whatever
-/// partial effects it had. `--retry-broken` is the way to say *I fixed something the log cannot see*;
-/// pushing the producer again is the way §14 means, and needs no flag.
 async fn derive(args: &Args) -> Result<()> {
     // `--outstanding` names a query wherever it appears, and this is the spelling somebody reaches
     // for first. Running a round because the flag was attached to the verb rather than to `status`
     // would be the one outcome a caller asking what is outstanding did not want.
     if args.outstanding {
-        let registry = open(args).await?;
-        let branch = branch_of(&registry, args.branch.as_deref())?;
+        let registry = ops::open(&args.ops).await?;
+        let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
         return outstanding(args, &registry, branch).await;
     }
-    let (registry, workers) = open_deriving(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let (registry, workers) = ops::open_deriving(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
 
     if args.retry_broken {
-        for (name, poisoning) in broken_here(args, &registry, branch)? {
+        for (name, poisoning) in ops::broken_here(&args.ops, &registry, branch)? {
             eprintln!("note: retrying {name}, broken since {}", poisoning.since);
         }
         registry.engine.retry_broken(branch)?;
@@ -1752,7 +1236,7 @@ async fn derive(args: &Args) -> Result<()> {
     // Said *before* the work, because it is the explanation for the count printed after it. A
     // producer poisoned during this run is different news, and is reported below.
     let mut skipped = Vec::new();
-    for (name, poisoning) in broken_here(args, &registry, branch)? {
+    for (name, poisoning) in ops::broken_here(&args.ops, &registry, branch)? {
         eprintln!(
             "note: skipping {name} — broken since {}: {}",
             poisoning.since, poisoning.error
@@ -1772,7 +1256,7 @@ async fn derive(args: &Args) -> Result<()> {
     };
     workers.shutdown().await;
 
-    for (name, poisoning) in broken_here(args, &registry, branch)? {
+    for (name, poisoning) in ops::broken_here(&args.ops, &registry, branch)? {
         if !skipped.contains(&poisoning.producer) {
             eprintln!("warning: {name} is now broken: {}", poisoning.error);
         }
@@ -1789,226 +1273,10 @@ async fn derive(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Catch a branch up after a commit. SPEC.md §9.6.
-///
-/// **This is what "materialization is continuous" means here.** The CLI is process-per-command, so
-/// there is no daemon to run a loop in; the process that commits a layer is the one in a position to
-/// chase it, and it does so before exiting. A worker pool with its own scheduler is a strictly better
-/// shape and needs a server to live in — which is the point at which this call becomes a signal
-/// rather than a call, with nothing above it changing, because §9.6 already says scheduling policy
-/// cannot affect correctness.
-///
-/// The pause check lives *here* and not in `catch_up`. The engine's job is the mechanism, and a
-/// mechanism that consults an operational switch is one `borg derive` would have to reach around —
-/// which is the shape that eventually gets it wrong.
-async fn auto_derive(args: &Args, branch: BranchId) -> Result<()> {
-    if paused_branches(args).contains(&branch.0) {
-        return Ok(());
-    }
-    // No implementations means nothing here can run, and building an executor to discover that would
-    // charge every store without producers for the ones that have them.
-    if load_impls(args).producers.is_empty() {
-        return Ok(());
-    }
-    let (registry, workers) = open_deriving(args).await?;
-    let before: Vec<_> = broken_here(args, &registry, branch)?
-        .into_iter()
-        .map(|(_, poisoning)| poisoning.producer)
-        .collect();
-    let caught_up = registry.engine.catch_up(branch).await;
-    workers.shutdown().await;
-
-    // **A producer that broke while chasing this write is news, and only this process has it.** The
-    // write itself is fine — §14 scopes the failure to the producer — but the derived data that was
-    // about to follow is not coming, and saying nothing here is how somebody finds out from a
-    // `state: broken` an hour later.
-    for (name, poisoning) in broken_here(args, &registry, branch)? {
-        if !before.contains(&poisoning.producer) {
-            eprintln!("warning: {name} is now broken: {}", poisoning.error);
-        }
-    }
-
-    if let Err(err) = caught_up {
-        // Reported, not raised. The write this followed is ground truth whether or not anything has
-        // chased it yet, and §9.6's licence is exactly that scheduling cannot affect correctness — a
-        // write that failed because somebody else's pipeline is unrunnable would be a write failing
-        // for a reason that has nothing to do with it.
-        eprintln!("warning: auto-derivation did not complete: {err}");
-    }
-    Ok(())
-}
-
-/// Derivation's operational state, beside the store.
-///
-/// Beside the store, like the producer-implementation table and the transaction table, and for the
-/// same reason (`crate::sidecar`): neither half of this changes what is true. Pausing changes only
-/// when the system catches up; a poisoning is the engine's judgement about code, discovered at
-/// runtime. In the log both would be forkable, mergeable and time-travellable, and "was derivation
-/// paused at layer 400?" is not a question anybody has.
-///
-/// Branch *ids*, not names: a branch may be renamed or unnamed, and the id is what the log uses.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-struct DerivationConfig {
-    paused: Vec<u64>,
-    /// Producers judged broken. SPEC.md §14, and `borg_engine::poison` for why they belong here
-    /// rather than in the log.
-    broken: Vec<BrokenProducer>,
-}
-
-impl Sidecar for DerivationConfig {
-    const EXTENSION: &'static str = "derivation.json";
-}
-
-/// One poisoning, as this client writes it down.
-///
-/// The wire form lives here and not in the engine because the file is the CLI's, the way
-/// `producers.json` is: a server keeps the same facts somewhere else entirely, and neither of them
-/// is the engine's business.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct BrokenProducer {
-    branch: u64,
-    #[serde(with = "sidecar::producer_id")]
-    producer: u64,
-    /// The ClientVersion it was running at. This is what makes the record self-expiring, and what
-    /// makes §14's recovery — push fixed code — need no other machinery.
-    version: u64,
-    error: String,
-    since: u64,
-}
-
-fn load_derivation(args: &Args) -> DerivationConfig {
-    sidecar::load(&args.store)
-}
-
-fn save_derivation(args: &Args, config: &DerivationConfig) -> Result<()> {
-    sidecar::save(&args.store, config)
-}
-
-fn paused_branches(args: &Args) -> Vec<u64> {
-    load_derivation(args).paused
-}
-
-/// Turn auto-derivation on or off for one branch.
-///
-/// Factored out because transactions use it too: a transaction branch is **created paused** (§12),
-/// and a transaction that ends resumes what it paused rather than leaving a flag behind for a branch
-/// id that will never be written to again.
-fn set_paused(args: &Args, branch: BranchId, pause: bool) -> Result<()> {
-    let mut config = load_derivation(args);
-    config.paused.retain(|id| *id != branch.0);
-    if pause {
-        config.paused.push(branch.0);
-    }
-    save_derivation(args, &config)
-}
-
-/// The poison table, beside the store. SPEC.md §14.
-///
-/// **This is the whole of what makes §14 true for a client that exits after every command.** The
-/// engine's own table is a `HashMap` in the process that discovered the failure; for the CLI that
-/// process is gone by the time anybody reads, so the next `borg get` used to call a broken
-/// producer's output `stale` — a promise of a catch-up that was never coming — and the next
-/// `borg derive` used to run the failing code again from scratch.
-struct FilePoison {
-    /// The store, not the sidecar's own path: the file is named from it, and naming it in one place
-    /// is what keeps this and `load_derivation` reading the same file.
-    store: PathBuf,
-    /// Read once and held for the life of the command. One process does one thing here, so nothing
-    /// can move the file underneath it — and re-reading per lookup would put a syscall inside the
-    /// scheduler's per-producer loop.
-    table: std::sync::Mutex<Vec<BrokenProducer>>,
-}
-
-impl FilePoison {
-    fn new(args: &Args) -> Self {
-        Self {
-            store: args.store.clone(),
-            table: std::sync::Mutex::new(load_derivation(args).broken),
-        }
-    }
-
-    /// Write the table back, preserving the pause flags it shares the file with.
-    ///
-    /// Re-read rather than remembered, for the same reason [`set_paused`] re-reads: the two halves
-    /// are edited by different commands, and holding a whole-file snapshot across a command would
-    /// let one of them silently revert the other.
-    fn flush(&self, table: &[BrokenProducer]) -> Result<()> {
-        let mut config: DerivationConfig = sidecar::load(&self.store);
-        config.broken = table.to_vec();
-        sidecar::save(&self.store, &config)
-    }
-}
-
-impl borg_engine::PoisonProvider for FilePoison {
-    fn poisoned(&self, branch: BranchId) -> Result<Vec<Poisoning>> {
-        Ok(self
-            .table
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|row| row.branch == branch.0)
-            .map(|row| Poisoning {
-                producer: ProducerId(row.producer),
-                version: LayerId(row.version),
-                error: row.error.clone(),
-                since: LayerId(row.since),
-            })
-            .collect())
-    }
-
-    fn poison(&self, branch: BranchId, poisoning: Poisoning) -> Result<()> {
-        let mut table = self.table.lock().unwrap();
-        table.retain(|row| row.branch != branch.0 || row.producer != poisoning.producer.0);
-        table.push(BrokenProducer {
-            branch: branch.0,
-            producer: poisoning.producer.0,
-            version: poisoning.version.0,
-            error: poisoning.error,
-            since: poisoning.since.0,
-        });
-        self.flush(&table)
-    }
-
-    fn clear(&self, branch: BranchId, producer: ProducerId) -> Result<()> {
-        let mut table = self.table.lock().unwrap();
-        table.retain(|row| row.branch != branch.0 || row.producer != producer.0);
-        self.flush(&table)
-    }
-}
-
-/// What a human calls a producer. The log knows ids; only the implementation table knows names.
-fn producer_name(names: &Implementations, producer: ProducerId) -> String {
-    names
-        .producers
-        .iter()
-        .find(|impl_| impl_.id == producer.0)
-        .map_or_else(|| producer.to_string(), |impl_| impl_.name.clone())
-}
-
-/// Which producers are broken on this branch, under the names a human gave them. SPEC.md §14.
-///
-/// Everything that reports a poisoning goes through here, and everything reports it on **stderr**
-/// and never as a failure: a broken producer is not a broken command. `borg derive` still derives
-/// everything else, and a write followed by a poisoned pipeline is still a write that landed.
-fn broken_here(
-    args: &Args,
-    registry: &Registry,
-    branch: BranchId,
-) -> Result<Vec<(String, Poisoning)>> {
-    let names = load_impls(args);
-    Ok(registry
-        .engine
-        .broken(branch)?
-        .into_iter()
-        .map(|poisoning| (producer_name(&names, poisoning.producer), poisoning))
-        .collect())
-}
-
 async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
-    set_paused(args, branch, pause)?;
+    let registry = ops::open(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
+    ops::set_paused(&args.ops, branch, pause)?;
     outln!(
         "auto-derivation {} on {branch}",
         if pause { "paused" } else { "resumed" }
@@ -2029,12 +1297,12 @@ async fn derive_pause(args: &Args, pause: bool) -> Result<()> {
 /// a number is a round that forks a branch and walks the changesets. `borg derive --quiet` is that
 /// round, and its number is what it did rather than what was owed.
 async fn derive_status(args: &Args) -> Result<()> {
-    let registry = open(args).await?;
-    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let registry = ops::open(&args.ops).await?;
+    let branch = ops::branch_of(&registry, args.ops.branch.as_deref())?;
     if args.outstanding {
         return outstanding(args, &registry, branch).await;
     }
-    let paused = paused_branches(args).contains(&branch.0);
+    let paused = ops::paused_branches(&args.ops).contains(&branch.0);
     outln!(
         "auto-derivation {} on {branch}",
         if paused { "paused" } else { "running" }
@@ -2044,7 +1312,7 @@ async fn derive_status(args: &Args) -> Result<()> {
     // a record naming a version that has since been replaced is spent, and printing it would send
     // somebody to fix code that has already been fixed (§14).
     registry.register_producers(branch).await?;
-    for (name, poisoning) in broken_here(args, &registry, branch)? {
+    for (name, poisoning) in ops::broken_here(&args.ops, &registry, branch)? {
         outln!(
             "broken      {name} since {}: {}",
             poisoning.since,
@@ -2064,7 +1332,7 @@ async fn outstanding(args: &Args, registry: &Registry, branch: BranchId) -> Resu
     // Producers are registered so that the engine can be asked about the ones this branch *defines*
     // rather than the ones this process happens to have seen.
     registry.register_producers(branch).await?;
-    let names = load_impls(args);
+    let names = ops::load_impls(&args.ops);
     let mut any = false;
     for producer in registry.producers_of(branch).await? {
         let Some(gap) = registry.engine.pending(branch, producer) else {
@@ -2076,7 +1344,7 @@ async fn outstanding(args: &Args, registry: &Registry, branch: BranchId) -> Resu
         // derived layer the last round merged.
         outln!(
             "outstanding {:<16} incorporated through {}, owes up to {}",
-            producer_name(&names, producer),
+            ops::producer_name(&names, producer),
             gap.from,
             gap.to
         );

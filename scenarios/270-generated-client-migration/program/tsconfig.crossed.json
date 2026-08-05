@@ -1,0 +1,7 @@
+{
+  // `crossed.ts` reads the v1 module expecting the v2 shape, and must not compile. Without this the
+  // scenario would only be asserting that two files compile, which two *identical* generated modules
+  // would also satisfy.
+  "extends": "./tsconfig.json",
+  "include": ["gen", "crossed.ts"]
+}

@@ -72,6 +72,17 @@ impl DefView {
         self.objects.get(name)
     }
 
+    /// Every struct this view declares.
+    ///
+    /// Unordered, like the map behind it. Codegen sorts — see
+    /// [`SchemaDef`](borg_protocol::client::SchemaDef) for why the *emitter* owns that and not this:
+    /// a stable file is a property of the artifact, and a caller that wanted insertion order could
+    /// not get it from here anyway (a struct has no owner and no declaration point, only its fields
+    /// do — SPEC.md §5.2).
+    pub fn objects(&self) -> impl Iterator<Item = &ObjectDef> {
+        self.objects.values()
+    }
+
     pub fn producers(&self) -> impl Iterator<Item = &ProducerDef> {
         self.producers.values()
     }

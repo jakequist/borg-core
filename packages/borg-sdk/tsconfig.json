@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+
+    // `test/generated/borg.generated.ts` is the **golden output of `borg generate`**, checked in
+    // byte for byte (see `crates/borg-cli/src/generate.rs`). It imports `borg-sdk/client` because
+    // that is what it will import in a user's project, and this is what lets that specifier resolve
+    // inside the package that provides it. A golden that had to be edited to compile here would be
+    // testing an edited file rather than the emitted one.
+    "paths": { "borg-sdk/client": ["./src/client.ts"] },
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+
+    // Node runs `.ts` pipelines by erasing types rather than compiling them, so anything that needs
+    // a compiler to *emit* something — enums, parameter properties, namespaces — cannot appear in
+    // code an author might copy. Better to be unable to write it than to write it and find the
+    // pipeline will not start.
+    "erasableSyntaxOnly": true,
+
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "skipLibCheck": true
+  },
+  "include": ["src", "test"]
+}
