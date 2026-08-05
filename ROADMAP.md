@@ -52,6 +52,14 @@ resolve to one increment in either commit order, and two racing to create one ob
 object. Transactions are ephemeral and reaped on an idle timeout; branches are the durable form of
 the same idea, and nothing reaps those.
 
+**And the features have now met each other.** A migration runs while a client writes the field it is
+migrating, in both merge orders; a def-only merge lands on a trunk that owes a round and neither
+mislabels its output nor wedges it; a fork of a fork migrates data inherited through two levels while
+both ancestors stay exactly as they were; and one contended workload settles byte-identically however
+the scheduler orders it. That class found a lost update — a migration deleted its own guard, because
+the guard subtraction was keyed on the cell rather than on the record — and it is the only producer
+in the system that could have.
+
 Act 1 is the modern ORM.
 
 ---
@@ -234,6 +242,30 @@ back would mean a read index keyed cell-first rather than branch-first, which ma
 proportional to the whole store rather than to a branch — a trade worth measuring on its own and not
 worth taking blind. What was cheap was removing a `CellRef` clone from the probe itself, which is
 done: `MemoryStorage`'s read index is nested now for the same reason the touch index is.
+
+### H — features that had never met
+
+Phase 4a: the composition class (`SPEC-DRAFT.md` §9, S13–S15) and the determinism sweep (S16). This
+class has produced the most bugs in the project and had the least coverage — every major feature
+worked alone and several had never been in the same store.
+
+**It found one, and it is the kind this file exists to record.** A migration is the only producer
+whose output shares a `CellRef` with a cell clients write, and a round's guard subtraction was keyed
+on `CellRef` — so a migration deleted its own guard on the record it migrates from, and a stale
+migration round could land over a fresher one with every watermark advanced and nothing outstanding
+to correct it.
+
+`crates/borg-engine/tests/composition.rs` is the mid-round interleavings of S13 and S14; `170`, `180`
+and `190` are S13, S14 and S15 through the real binary; `200-determinism` is S16. Four decisions came
+out of it, below, and one of them is a limitation recorded rather than fixed. §16.5 is updated.
+
+**The fan-out benchmark is unchanged**, measured before and after on the same machine because this
+one moves at a different speed from the box the milestone-G table was taken on. 128k entities at four
+cores: derive 2.02s after against 2.06s before, re-derive after flipping the one shared cell 1.56s
+against 1.66s. At eight, 1.93s against 1.93s and 1.58s against 1.52s. That is noise in both
+directions, and it is what the change predicts: a round with no concurrent writer does not build its
+guard set at all (`touched_since` answers the whole of it in two map lookups), and where one is built
+the difference is a `BTreeSet` of `&CellAt` where there was one of `&CellRef`.
 
 ### Deferred, still
 
@@ -894,6 +926,76 @@ knows what they are doing. `BranchManager` therefore skips an id that already na
 one that already has a branch row — two branches sharing an id breaks the one thing §6.2 says about
 layers and branches, and the cost of being sure is one map lookup.
 
+### A round's guard subtraction was keyed on `CellRef`, and a migration is the one producer that shows it
+
+The composition bug S13 was written to look for, found on the first try, and it is a **lost update**
+rather than a near miss.
+
+A round guards *what it read and the round did not write* (§16.5), and the subtraction was over
+`CellRef`. That is stated in the code as safe because "everything a round writes is derived, and a
+derived cell is never in the cell-touch index" — which is true of every producer **except a
+migration**. A migration reads `C@v1` and writes `C@v9`: same cell, two def-versions, and that is the
+whole of what a migration is (§9.3). Projecting the version away made `up` look like it had produced
+the very record it consumed, so its guard on that record was subtracted and it carried **no guard at
+all** on the source cell a client owns.
+
+What that costs, in the order it was found:
+
+* Merging first, the stale round lands and the next round overwrites it. Only a wasted layer — which
+  is why `scenarios/080-migration` and every existing test pass with the bug in place.
+* Merging last — two rounds in flight, which `settle` being public makes ordinary — the stale round
+  lands **on top of** the fresh one. The trunk then holds a migrated view of a value that is no
+  longer there, `catch_up` reports nothing outstanding because every watermark advanced, and the read
+  says `stale` for ever with no work left that would ever correct it. That is exactly the failure S8
+  exists to prevent, arriving through the one producer S8's fixture could not contain.
+
+The fix is to subtract over `CellAt` and emit `CellRef`: `up` guards `C` because it read `C@v1` and
+produced only `C@v9`, while `tier` still does not guard `is_investible` because it read and the round
+produced the same record. The guard itself stays a question about the cell — the touch index keys on
+`CellRef` and a write at any version is a write.
+
+**`Round::cascade` was deliberately left keyed on `CellRef`.** The two want opposite errors: a guard
+that is too broad rejects work that was fine and costs a re-run, while a cascade that is too narrow
+publishes a value derived from one that never landed — the §10.1 lie. Over-approximating there is
+free and getting it wrong is not.
+
+It is the same *shape* as the four `LayerId` conflations *Deferred, still* records, with a different
+pair of types: two quantities that look interchangeable, are not, and share a Rust type that will not
+say so. `CLAUDE.md`'s invariant 6 already names this one — *`CellRef` is the shard key; `CellAt` is
+the record key* — and warns that keying on `CellRef` "makes a migration observe its own output as a
+change to its own input". This is the mirror of that sentence and cost the same: the migration
+observed a change to its own input as its own output. The types were right everywhere the invariant
+was thinking about; the loss happened in a `filter`, where projecting a version away reads as a
+simplification.
+
+### A chained migration is not discovered by a catch-up
+
+Turned up by S14 and *not* fixed, because it is the deferred entry below in a shape where it costs
+more than re-runs. Sequential, no concurrency needed:
+
+```
+declare Company.website;  mutate → up1;  write a value;  derive   # website@v2 materializes
+mutate → up2;  derive                                            # website@v3 never appears
+derive --rebuild                                                 # website@v3 = up2(up1(value))
+```
+
+Two things have to line up. A producer's work is the source layers between its watermark and head
+(§16.4), and `up2`'s input version is only ever written by a **derived** layer, which opens no round
+— so nothing triggers it. Its other route is §9.6's seeding, where a producer that has never run
+takes its whole source buffer; but `catch_up` starts from the **minimum** watermark across all
+producers, which a brand-new producer drags to the bottom of the log, so the seeding round forks at
+the very first layer, finds the buffer empty there, and advances the watermark past zero. The one
+chance is spent on the wrong fork point.
+
+The same shape catches a **pipeline pushed over data whose inputs are already derived**, which is the
+more likely way to meet it.
+
+`borg derive --rebuild` is the escape hatch, is one command, and works: it rewinds every watermark
+and settles the highest source layer, so the whole chain runs inside one round where each hop sees
+the previous one on the round's own branch. `crates/borg-engine/tests/composition.rs` pins both the
+limitation and the escape, and `scenarios/180` shows it end to end. Settling a *range* rather than a
+single layer is the fix, and it is the same fix the entry below wants.
+
 ### A backlog of source layers still costs re-runs
 
 Rounds settle one source layer each, so when several are committed before any is settled, the round
@@ -906,6 +1008,42 @@ its own source layer dirtied, chains included. The exposure is an invocation dir
 depends on a derived cell only an earlier round produced. Settling a *range* rather than a single
 layer is the shape that closes it, and it changes what a watermark counts — its own change, with its
 own scenario.
+
+### The determinism sweep is a scenario with a knob, and its writes go through transactions
+
+S16 asks for the same workload replayed 50+ times with the settled result byte-identical every run.
+Fifty runs is a couple of minutes, which is not a thing to put in `./check.sh` unattended — so
+`BORG_DETERMINISM_RUNS` defaults to **5** and the number that counts as evidence is passed in. An
+environment variable rather than a flag, for the same reason `BORG_DERIVE_PARALLELISM` is one: it is
+not a fact about the store, and the same store swept on a laptop and on a build box wants different
+numbers.
+
+**The workload writes through transactions rather than through `borg set`, and that is what makes it
+a determinism test at all.** The CLI commits one layer per `set`, so the round settling it discovers
+one invocation and the wave has nothing to schedule — a sweep built on `set` would replay a
+sequential program fifty times and prove nothing. A transaction commits every cell it wrote as **one**
+layer, so a round settling it fans out across every entity, and `borg derive --rebuild` puts the
+chain, the fan-out and both migration directions into a single round's waves. That is the widest
+thing the CLI can be asked for.
+
+What is compared is the settled state with **every layer id removed**. An id is assigned when a layer
+opens (§7.3) and which invocation of a wave opens first is precisely what the scheduler decides, so
+`authored at`, `landed at` and `fresh as of` are properties of the schedule; pinning them would pin
+the thing the sweep exists to let vary. What is kept is what a client is promised: value, interned
+identity, origin, freshness, and which producer said so. The reference run is separately asserted to
+have content in it, because a digest that is empty every run is byte-identical every run.
+
+### A migration cannot be appointed for a derived field
+
+Noticed while designing S14 and left alone. `DefView::check_ownership` matches
+`(Ownership::Derived(owner), Writer::Producer(attempted))` before it reaches the migration exemption,
+so the exemption is reachable only for a `Source` field — a `MutateField` on a derived field would
+name migrations that are then forbidden to write it.
+
+Left as it is because it is not obviously wrong: a derived field's shape is its producer's business,
+and a producer that changes its output type re-derives rather than migrating. But nothing *says* so,
+and the failure would arrive as an ownership violation at run time rather than as a rejection at push
+time. Worth a decision of its own rather than a rider.
 
 ---
 
@@ -950,3 +1088,22 @@ concurrent processes, the pool bounded by its size, and a worker reused when not
 are not a scenario because the CLI writes one layer per `borg set`, so a wave driven through the CLI
 is one invocation wide — the pool only matters where one source layer dirties many, which is a
 fan-out flip, a migration backfill, or a producer pushed over existing data.
+
+Paid off in H (`crates/borg-engine/tests/composition.rs`, `scenarios/170`–`200`): the first tests in
+which a migration and a concurrent writer are in the same store. A stale *migration* round rejected
+in both merge orders — which is S8 with the one producer S8's fixture structurally could not contain,
+and is where the guard bug was; a client write to another entity landing mid-migration, checked by
+replaying at the stated watermark; a def-only merge landing mid-round, both that it does not mislabel
+the round's output and that it does not reject a round it could not have disturbed; and a chained
+migration pinned as the limitation it is rather than left to be rediscovered.
+
+Through the binary: a migration's round rejected by its guard, asserted on **layers** rather than on
+values, because the value alone cannot distinguish "the stale round was rejected" from "the stale
+round landed and was overwritten"; a migration's merge landing under an open transaction and
+correctly *not* conflicting, beside another client's write at a different def-version correctly
+conflicting; a fork-of-a-fork migrating data inherited through two levels with both ancestors
+untouched; and a settled state compared byte-for-byte across runs.
+
+What is still owed here: the **client** half of S13 has no in-process test. `scenarios/170` covers it
+end to end and the rule it exercises (a derived write cannot trip a guard) is unit-tested in
+`transactions.rs` on a pipeline, but nothing asserts it in Rust with a migration in the picture.

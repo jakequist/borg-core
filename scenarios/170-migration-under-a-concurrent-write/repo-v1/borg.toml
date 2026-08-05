@@ -1,0 +1,5 @@
+# `Company.founded` before the schema moves. A repo of pure schema plus the two migration scripts
+# the next version appoints — §17.4 says a repo may contribute definitions, code, or both.
+[repo]
+id = 1
+name = "companies"

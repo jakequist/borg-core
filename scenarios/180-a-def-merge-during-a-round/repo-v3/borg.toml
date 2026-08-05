@@ -1,0 +1,5 @@
+# A third version of `founded`, so that a def merge lands on a trunk whose records are already at the
+# version this one supersedes. Same repo id: a repo may mutate only the fields it declared (§5.2).
+[repo]
+id = 1
+name = "companies"

@@ -1,0 +1,5 @@
+# A pipeline and the source field it reads. The pipeline is what makes the trunk *owe a round* while
+# a def change is landing on it from elsewhere.
+[repo]
+id = 1
+name = "companies"

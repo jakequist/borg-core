@@ -1,0 +1,5 @@
+# The workload: a two-hop chain and a field that is about to be migrated, in one repo, so that one
+# round holds a chain, a fan-out and a migration at once.
+[repo]
+id = 1
+name = "investing"

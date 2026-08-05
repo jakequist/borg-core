@@ -1696,14 +1696,24 @@ merges are attempted in**. The stale round is not sequenced behind the fresher o
 That is stronger than an ordering rule, because it needs no queue and no serialization point: the bad
 interleaving becomes harmless rather than prevented.
 
-**A round guards the cells it read and the round did not write.** The subtraction is round-wide, not
-per-invocation, and that is what lets a chain commit: within one round `invest` writes
+**A round guards the records it read and the round did not write.** The subtraction is round-wide,
+not per-invocation, and that is what lets a chain commit: within one round `invest` writes
 `is_investible` and `tier` reads it, and `tier` must not fail on a cell its own round produced. §12.1
 states the client's version of this rule as an *ordering* — a read before your own write is still
 guarded — because taken as a set difference it deletes read-modify-write. A round has no order to
 appeal to, and does not need one: everything it writes is derived, a derived cell is never in the
 cell-touch index (§12.4), so no guard on one could ever have tripped; and a producer that reads a
 cell it writes is a cycle (§16.6), not a compare-and-swap.
+
+**The subtraction is over `CellAt`, and the guard it produces is over `CellRef`** (§16.3). The two
+differ for exactly one kind of producer, and for that one it is the difference between a guard and no
+guard: a **migration** reads `C@v1` and writes `C@v9`, which is the whole of what a migration is
+(§9.3). Subtract by cell and its guard on the source record it migrated *from* disappears — and that
+record is source data a client owns, so it is in the touch index and the guard was the only thing
+standing between a stale migration round and a lost update. Subtract by record and the migration
+guards `C` because it read `C@v1` and produced only `C@v9`, while `tier` still does not guard
+`is_investible` because it read and the round produced the same record. The guard itself stays a
+question about the cell, because a write at any version is a write.
 
 #### Rounds apply partially
 

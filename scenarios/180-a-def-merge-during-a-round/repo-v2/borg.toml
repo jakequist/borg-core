@@ -1,0 +1,5 @@
+# The same repo with `founded` moved to an Int, and the two scripts that bridge it. Same repo id,
+# because a repo may mutate only the fields it declared (§5.2).
+[repo]
+id = 1
+name = "companies"

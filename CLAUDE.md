@@ -137,6 +137,11 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   producer on the parent. Forks are `O(1)` and layers are cheap, but `Registry::open` replays the log
   on every CLI invocation, so the `O(log)` open grows with it. SPEC-DRAFT §7.4 flagged this; the
   fan-out benchmark cannot see it, because it drives the engine rather than the CLI.
+- **A chained migration is not discovered by a catch-up.** A producer whose input version is written
+  only by a *derived* layer is never triggered — derived layers open no rounds — and §9.6's seeding,
+  its other route, is spent by the round `catch_up` opens at the bottom of the log, where the buffer
+  is still empty. `borg derive --rebuild` runs it. This catches a pipeline pushed over already-derived
+  data too. Same fix as the backlog entry above: settle a range (`ROADMAP.md`).
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.

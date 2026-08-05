@@ -117,8 +117,9 @@ impl Transaction {
 /// [`Transaction`]s. A producer's accesses come out of `ProducerCtx` as vectors the dependency index
 /// already needs (§9.4), so this takes them by value and copies nothing — which matters, because
 /// this is the hot path of a 128k-invocation round and a `Transaction`'s two `BTreeSet`s were 12% of
-/// it, spent computing a guard set that is *provably identical* to the one below. See
-/// [`guards`](Self::guards) for why identical.
+/// it, spent computing a guard set a round cannot use anyway: a `Transaction` records its writes as
+/// cells and drops a read of a cell it has written, which for a migration — one cell, two versions —
+/// drops exactly the guard that matters. See [`guards`](Self::guards).
 ///
 /// Two rules are the round's own, and both exist because a round is `N` independent computations
 /// rather than one intent. They are [`guards`](Self::guards) and [`cascade`](Self::cascade).
@@ -136,9 +137,9 @@ pub struct Round {
 
 /// What one invocation touched: the same two sets the dependency index is fed.
 ///
-/// `CellAt` because that is the record key the engine already has in hand (§16.3), and a guard is a
-/// question about a `CellRef` — so both accessors project the version away, exactly as
-/// [`Transaction::guards`] does.
+/// `CellAt` because that is the record key the engine already has in hand (§16.3), and the
+/// distinction is load-bearing rather than incidental — see [`Round::guards`], where the subtraction
+/// is over records and the guard that comes out of it is over cells.
 #[derive(Clone, Debug, Default)]
 struct Accesses {
     reads: Vec<CellAt>,
@@ -146,12 +147,14 @@ struct Accesses {
 }
 
 impl Accesses {
-    fn observed(&self) -> impl Iterator<Item = &CellRef> {
-        self.reads.iter().map(|at| &at.cell)
+    /// The records this invocation read.
+    fn observed(&self) -> impl Iterator<Item = &CellAt> {
+        self.reads.iter()
     }
 
-    fn written(&self) -> impl Iterator<Item = &CellRef> {
-        self.writes.iter().map(|at| &at.cell)
+    /// The records it wrote.
+    fn written(&self) -> impl Iterator<Item = &CellAt> {
+        self.writes.iter()
     }
 }
 
@@ -179,8 +182,8 @@ impl Round {
         self.invocations.is_empty()
     }
 
-    /// What each of this round's layers is contingent on: the cells it read and **the round** did
-    /// not produce.
+    /// What each of this round's layers is contingent on: the records it read and **the round** did
+    /// not produce, named as the cells a guard is asked about.
     ///
     /// This is [`Transaction::guards`] asked of a round, and it differs in exactly one way: the
     /// subtraction is round-wide. That is the S7 rule — within one round `invest` writes
@@ -199,10 +202,20 @@ impl Round {
     /// * The read-modify-write the ordering rule exists to protect cannot arise. A producer that
     ///   reads a cell it writes is a cycle (§16.6), not a compare-and-swap.
     ///
+    /// **The subtraction is over `CellAt` and the result is over `CellRef`, and mixing the two is a
+    /// lost update.** The second bullet is true of every producer *except a migration*, which reads
+    /// `C@v1` and writes `C@v9` — that is what a migration is (§9.3). Subtract by cell and the
+    /// migration's guard on the record it migrated *from* is deleted; that record is source data a
+    /// client owns, so it is in the touch index, and the deleted guard was the only thing stopping a
+    /// stale migration round from landing over a fresher one. Subtract by record and `up` guards `C`
+    /// (it read `C@v1` and produced only `C@v9`) while `tier` still does not guard `is_investible`
+    /// (read and produced the same record). The guard stays a question about the cell, because a
+    /// write at any version is a write and the touch index keys on `CellRef`.
+    ///
     /// Borrowed rather than cloned, because a round's guard set is the sum of its producers'
     /// read-sets and is unbounded (§7.7).
     pub fn guards(&self) -> Vec<(LayerId, Vec<&CellRef>)> {
-        let produced: BTreeSet<&CellRef> = self
+        let produced: BTreeSet<&CellAt> = self
             .invocations
             .values()
             .flat_map(Accesses::written)
@@ -212,7 +225,8 @@ impl Round {
             .map(|(layer, invocation)| {
                 let guards = invocation
                     .observed()
-                    .filter(|cell| !produced.contains(*cell))
+                    .filter(|at| !produced.contains(at))
+                    .map(|at| &at.cell)
                     .collect();
                 (*layer, guards)
             })
@@ -240,10 +254,16 @@ impl Round {
         }
         // cell -> the layers that read it. Built only when something has already failed, so the
         // common case — a round nothing contended with — pays nothing for it.
+        //
+        // Keyed on the **cell** and not on the record, unlike [`guards`](Self::guards). The two want
+        // opposite errors: a guard that is too broad rejects work that was fine, while a cascade that
+        // is too narrow publishes a value derived from one that never landed (§10.1). So this
+        // over-approximates on purpose — a migration's `C@v9` sweeping up a sibling that read `C@v1`
+        // costs a re-run and cannot cost a lie.
         let mut readers: BTreeMap<&CellRef, Vec<LayerId>> = BTreeMap::new();
         for (layer, invocation) in &self.invocations {
-            for cell in invocation.observed() {
-                readers.entry(cell).or_default().push(*layer);
+            for read in invocation.observed() {
+                readers.entry(&read.cell).or_default().push(*layer);
             }
         }
 
@@ -253,8 +273,8 @@ impl Round {
             let Some(invocation) = self.invocations.get(&layer) else {
                 continue;
             };
-            for cell in invocation.written() {
-                for consumer in readers.get(cell).into_iter().flatten() {
+            for write in invocation.written() {
+                for consumer in readers.get(&write.cell).into_iter().flatten() {
                     if dropped.insert(*consumer) {
                         frontier.push(*consumer);
                     }

@@ -491,16 +491,38 @@ one identity rather than two values. *This is the specific risk the inversion in
 This class has produced the most bugs and has the least coverage.
 
 **S13 — migration under a concurrent client write.** *Migrations and concurrency have never been
-exercised together.*
+exercised together.* — **built**, `crates/borg-engine/tests/composition.rs` and
+`scenarios/170-migration-under-a-concurrent-write`.
 
-**S14 — a def-only merge landing while a round computes under the old def.**
+> **This one found a bug, which is what it was for.** A round guards *what it read minus what the
+> round wrote*, and the subtraction was keyed on `CellRef`. A migration is the only producer that
+> reads and writes one cell at two def-versions, so it subtracted away its own guard on the source
+> record it migrates from — and a stale migration round landed over a fresher one, permanently, with
+> every watermark advanced and nothing outstanding to correct it. The subtraction is over `CellAt`
+> now; SPEC.md §16.5 states the rule and `ROADMAP.md` records why it was not caught before.
 
-**S15 — a second-order fork with a migration**, migrating data inherited through two levels.
+**S14 — a def-only merge landing while a round computes under the old def.** — **built**,
+`crates/borg-engine/tests/composition.rs` and `scenarios/180-a-def-merge-during-a-round`. The answer
+is coherent: a round folds its def-view once, at the trunk, when it opens, so it produces the version
+chain it saw; the output is filed at the version it was computed under and never at the one that
+overtook it; and a def layer carries no value events, so it can trip no guard. What it turned up is a
+*limitation* rather than a bug — a migration chained onto a migration is not discovered by a
+catch-up, and needs `borg derive --rebuild`. See `ROADMAP.md`.
+
+**S15 — a second-order fork with a migration**, migrating data inherited through two levels. —
+**built**, `scenarios/190-a-fork-of-a-fork-migrates`. Nothing was wrong: a migration on a
+fork-of-a-fork carries values it inherited from both ancestors, neither ancestor moves, and merging
+inward moves exactly one branch per step.
 
 ### Determinism
 
 **S16 — identical settled state across many parallel runs**, asserting the settled result and never
-the schedule.
+the schedule. — **built**, `scenarios/200-determinism`.
 
 Frequency matters: milestone C's ordering bug appeared **one run in six**, and an `EPIPE` panic **one
 in forty, under load only**. Both read as flakes and were not. Fewer than ~50 runs is not evidence.
+
+So the run count is `BORG_DETERMINISM_RUNS`, defaulting to 5 so `./check.sh` stays a smoke test, and
+50+ is what is run when the number has to mean something. The workload writes through *transactions*
+rather than through `borg set`, because the CLI commits one layer per `set` and a round settling one
+layer is one invocation wide — a wave with nothing in it to schedule is not a determinism test.
