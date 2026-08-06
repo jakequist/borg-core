@@ -19,13 +19,15 @@
 
 import { afterAll, beforeAll, describe as suite, expect, test } from "vitest";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { connect } from "node:net";
+import { connect, createServer, type Server } from "node:net";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BorgClientError,
+  BorgDisconnectedError,
+  BorgUnreachableError,
   ConflictError,
   createBorgContext,
   defineStruct,
@@ -87,6 +89,7 @@ const Contact: StructDescriptor<Contact, "Contact"> = defineStruct("Contact", {
 });
 
 let dir: string;
+let data: string;
 let socket: string;
 let server: ChildProcess;
 
@@ -114,7 +117,7 @@ beforeAll(async () => {
   socket = join(dir, "borg.sock");
   // One registry under a data directory — what `borg-server` hosts. `main` is the only one, so the
   // handshake below names none and gets it.
-  const data = join(dir, "data");
+  data = join(dir, "data");
   const store = join(data, "main", "borg.db");
   const borg = (...args: string[]): void => {
     execFileSync(BORG, ["--store", store, ...args], { stdio: "pipe" });
@@ -137,19 +140,42 @@ beforeAll(async () => {
   );
   borg("def", "push", schema);
 
-  // `--foreground`, because this test *is* the supervisor: it holds the child and kills it in
-  // `afterAll`, which is exactly what backgrounding would take away from it.
-  server = spawn(
-    BORG_SERVER,
-    ["start", "--foreground", "--data-dir", data, "--socket", socket],
-    { stdio: "pipe" },
-  );
+  server = startServer();
   await untilListening(socket);
 }, 60_000);
 
-afterAll(() => {
-  if (!available) return;
+/**
+ * `--foreground`, because this test *is* the supervisor: it holds the child and kills it in
+ * `afterAll`, which is exactly what backgrounding would take away from it.
+ */
+function startServer(): ChildProcess {
+  return spawn(BORG_SERVER, ["start", "--foreground", "--data-dir", data, "--socket", socket], {
+    stdio: "pipe",
+  });
+}
+
+/**
+ * Wait for the **process**, not for the socket, and for the same reason `borg-server stop` does: a
+ * server stops accepting the moment its listener drops and *then* releases its advisory locks, so
+ * restarting on a quiet socket would race a predecessor that still holds them.
+ */
+async function stopServer(): Promise<void> {
+  if (server.exitCode !== null || server.signalCode !== null) return;
+  const gone = new Promise<void>((done) => server.once("exit", () => done()));
   server.kill("SIGTERM");
+  await gone;
+}
+
+/** Stop the server and start another on the same data directory and address. */
+async function bounce(): Promise<void> {
+  await stopServer();
+  server = startServer();
+  await untilListening(socket);
+}
+
+afterAll(async () => {
+  if (!available) return;
+  await stopServer();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -473,4 +499,264 @@ suite.skipIf(!available)("the client SDK, over borg-server", () => {
     await expect(bc.branches()).rejects.toThrow(/client_version/);
     bc.close();
   });
+});
+
+/**
+ * **Connection urls, and reconnection.** SPEC.md §17.7, `examples/personal-crm/FRICTION.md` #11.
+ *
+ * The suite above is about what the engine answers. This one is about the connection itself: how a
+ * client says where to connect, and what happens to a long-lived one when the server it is talking
+ * to goes away and comes back. Both were things an application had to own by hand, and #11 recorded
+ * what that cost — a `borg serve` restart made every later request throw *forever*, and the only
+ * recovery was restarting the api.
+ *
+ * These bounce a **real** server rather than a stand-in, because the claim is about surviving a real
+ * restart: locks released and retaken, a registry reopened from its log, a transaction picked up out
+ * of the sidecar it lives in. One test below does use a stand-in, and says why.
+ */
+suite.skipIf(!available)("connection urls and reconnection", () => {
+  /** How many times the soak below bounces. See `scenarios/200-determinism` on why 5 is a smoke test. */
+  const BOUNCES = Number(process.env["BORG_RECONNECT_BOUNCES"] ?? 5);
+
+  test("a url names the socket and the registry, and reaches the same store as the explicit form", async () => {
+    // The registry is named here, where the suite above leaves it out — one store is hosted, so
+    // both are correct, and asserting they agree is what makes the routing a fact rather than a
+    // coincidence of there being nothing else to route to.
+    const byUrl = await createBorgContext({ url: `borg+unix://${socket}/main` });
+    const tx = await byUrl.branch("main").begin();
+    await tx.object(Company, "#70").set("headcount", 3);
+    await tx.commit();
+    expect(byUrl.address).toBe(socket);
+    byUrl.close();
+
+    const explicit = await createBorgContext({ socket, registry: "main" });
+    expect((await explicit.branch("main").get("Company#70.headcount")).value).toBe("3");
+    explicit.close();
+
+    // A trailing slash names no registry, which the server answers with its sole one (§17.6).
+    const unnamed = await createBorgContext({ url: `borg+unix://${socket}/` });
+    expect((await unnamed.branch("main").get("Company#70.headcount")).value).toBe("3");
+    unnamed.close();
+  });
+
+  test("$BORG_URL configures a client that was given nothing", async () => {
+    const bc = await createBorgContext({ env: { BORG_URL: `borg+unix://${socket}/main` } });
+    expect((await bc.branches()).map((b) => b.name)).toContain("main");
+    bc.close();
+
+    // …and a client given nothing at all, with nothing in the environment, is told both ways to
+    // say it rather than left to read a stack trace about `undefined`.
+    await expect(createBorgContext({ env: {} })).rejects.toThrow(/BORG_URL/);
+  });
+
+  test("a registry the server does not host is refused by name, with the ones it does", async () => {
+    // **The refusal arrives at the first request, not at the handshake**, which is the server's
+    // recorded deviation (`ROADMAP.md`, *The handshake names a registry*): the server does not
+    // acknowledge an accepted hello, so there is nowhere to put a refusal at connect time. The cost
+    // is exactly this — `createBorgContext` resolves for a registry that does not exist.
+    const bc = await createBorgContext({ url: `borg+unix://${socket}/nope` });
+    await expect(bc.branches()).rejects.toThrow(/nope/);
+    await expect(bc.branches()).rejects.toThrow(/main/);
+    bc.close();
+  });
+
+  /**
+   * **The exact complaint the owner hit**, and the sentence that answers it. `ECONNREFUSED` and
+   * `ENOENT` on a borg address mean one thing, and reporting the errno reports the symptom to
+   * somebody who needs the cause.
+   */
+  test("no server at the address says so, and says how to start one", async () => {
+    const nowhere = join(dir, "nothing-here.sock");
+    const refused = await createBorgContext({ url: `borg+unix://${nowhere}/main` }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(refused).toBeInstanceOf(BorgUnreachableError);
+    expect((refused as Error).message).toBe(
+      `no borg server at ${nowhere} — start one with: borg-server start`,
+    );
+  });
+
+  /**
+   * **FRICTION #11.** One context, a server restarted underneath it, and no new context anywhere.
+   *
+   * The close arrives while this process is idle, so the dead socket is dropped *before* the next
+   * request is written rather than after it fails — which is what makes a bounce cost nothing at
+   * all rather than one guaranteed error per client. Nothing is retried either way: nothing had
+   * been sent.
+   */
+  test("a context survives the server being stopped and started under it", async () => {
+    const bc = await createBorgContext({ url: `borg+unix://${socket}/main` });
+    const tx = await bc.branch("main").begin();
+    await tx.object(Company, "#71").set("headcount", 1);
+    await tx.commit();
+    expect(bc.connected).toBe(true);
+
+    await bounce();
+
+    expect((await bc.branch("main").get("Company#71.headcount")).value).toBe("1");
+    expect(bc.connected).toBe(true);
+
+    // And it can still write, which is the half a read-only reconnect would not prove.
+    const after = await bc.branch("main").begin();
+    await after.object(Company, "#71").set("headcount", 2);
+    await after.commit();
+    expect((await bc.branch("main").get("Company#71.headcount")).value).toBe("2");
+    bc.close();
+  });
+
+  /**
+   * **Transactions survive reconnection by construction**, which is the whole reason §12.2 puts a
+   * transaction beside the store rather than in the connection: the handle is an id, the state is a
+   * sidecar, and a socket is not part of either.
+   *
+   * *Failing means the reconnect story §12.2 was designed for does not actually work, and a client
+   * that loses its connection mid-transaction loses the transaction with it.*
+   */
+  test("a transaction begun before a bounce commits after it", async () => {
+    const bc = await createBorgContext({ url: `borg+unix://${socket}/main` });
+    const tx = await bc.branch("main").begin();
+    const contact = await tx.create(Contact);
+    await contact.set("name", "Grace");
+    const id = contact.id;
+
+    await bounce();
+
+    // The same handle, over a connection that did not exist when it was opened.
+    const landed = await tx.commit();
+    expect(landed).toMatch(/^L\d+$/);
+    expect(await bc.branch("main").list(Contact)).toContain(id);
+
+    // And the other half of §12.2: a *new* context can pick one up by id, which is what a process
+    // that restarted rather than merely reconnected has to do.
+    const second = await bc.branch("main").begin();
+    await second.object(Contact, id).set("name", "Grace Hopper");
+    await bounce();
+    const resumed = (await createBorgContext({ url: `borg+unix://${socket}/main` })).transaction(
+      second.id,
+    );
+    await resumed.commit();
+    expect(await bc.branch("main").begin().then((t) => t.object(Contact, id).get("name"))).toBe(
+      "Grace Hopper",
+    );
+    bc.close();
+  });
+
+  /**
+   * **An operation that was in flight when the socket died fails, and is never retried.**
+   *
+   * A stand-in server, and the one in this file — because what is under test is the SDK's own
+   * behaviour when a reply never comes, and making a *real* server drop a connection at exactly
+   * that instant is a race rather than a test. This one accepts, says hello, and then destroys the
+   * socket the moment a request arrives, which is the failure a `kill -9` mid-request produces.
+   *
+   * A retry here is the thing that must not happen: `tx_commit` is not idempotent, and a commit
+   * whose answer was lost is indistinguishable from one that never arrived (`BorgDisconnectedError`).
+   */
+  test("a request whose answer never comes fails as disconnected, and the context recovers", async () => {
+    const path = join(dir, "rude.sock");
+    let requests = 0;
+    const rude: Server = createServer((peer) => {
+      peer.write(`${JSON.stringify({ version: 1, codecs: ["json"] })}\n`);
+      // Counted by *lines* rather than by `data` events: the hello and the first request are two
+      // writes that the kernel is free to deliver as one chunk, and a stand-in that assumed
+      // otherwise would pass or hang depending on timing.
+      let seen = 0;
+      let pending = "";
+      peer.on("data", (chunk: Buffer) => {
+        pending += chunk.toString("utf8");
+        for (let nl = pending.indexOf("\n"); nl >= 0; nl = pending.indexOf("\n")) {
+          pending = pending.slice(nl + 1);
+          seen += 1;
+          // Line 1 is the client's hello. Line 2 is a request, and this server answers none.
+          if (seen >= 2) {
+            requests += 1;
+            peer.destroy();
+            return;
+          }
+        }
+      });
+    });
+    await new Promise<void>((done) => rude.listen(path, done));
+
+    const bc = await createBorgContext({ url: `borg+unix://${path}/main` });
+    const failed = await bc.branches().then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(failed).toBeInstanceOf(BorgDisconnectedError);
+    expect((failed as Error).message).toContain("not retried");
+    expect((failed as BorgDisconnectedError).address).toBe(path);
+    expect(bc.connected).toBe(false);
+
+    // The next operation dials again — one connection per failure, and exactly one request sent per
+    // operation. Two requests for two operations is the assertion that nothing was resent.
+    await expect(bc.branches()).rejects.toBeInstanceOf(BorgDisconnectedError);
+    expect(requests).toBe(2);
+
+    bc.close();
+    await new Promise<void>((done) => rude.close(() => done()));
+  });
+
+  /**
+   * A process that starts *before* its server — a supervisor bringing both up, a container, a dev
+   * script — and answers honestly until the server arrives. This is the shape
+   * `examples/personal-crm`'s api takes, and the regression test for the original complaint.
+   */
+  test("a context can be built with no server running, and works once one appears", async () => {
+    // Its own data directory: the one the suite's server is holding is locked by it, which is the
+    // *point* of the lock and would make this a test of that instead.
+    const home = join(dir, "late");
+    const path = join(home, "borg.sock");
+    execFileSync(BORG, ["--store", join(home, "main", "borg.db"), "init"], { stdio: "pipe" });
+
+    const later = await createBorgContext({
+      url: `borg+unix://${path}/main`,
+      connect: "on-demand",
+    });
+    expect(later.connected).toBe(false);
+    // Nothing there yet, and it says the same sentence a failed dial says.
+    await expect(later.branches()).rejects.toBeInstanceOf(BorgUnreachableError);
+    await expect(later.branches()).rejects.toThrow(/borg-server start/);
+
+    const late = spawn(BORG_SERVER, ["start", "--foreground", "--data-dir", home, "--socket", path], {
+      stdio: "pipe",
+    });
+    const gone = new Promise<void>((done) => {
+      if (late.exitCode !== null || late.signalCode !== null) done();
+      else late.once("exit", () => done());
+    });
+    try {
+      await untilListening(path);
+      // No new context, no restart: the same object that was failing a moment ago now works.
+      expect((await later.branches()).map((b) => b.name)).toContain("main");
+      expect(later.connected).toBe(true);
+    } finally {
+      late.kill("SIGTERM");
+      await gone;
+      later.close();
+    }
+  }, 60_000);
+
+  /**
+   * **The soak.** Bounce timing is racy territory and this project's history is explicit about the
+   * frequency that counts: milestone C's ordering bug appeared one run in six and an EPIPE panic one
+   * in forty, and both read as flakes. So this loops, and the count is
+   * `$BORG_RECONNECT_BOUNCES` — 5 by default so the suite stays quick, and turned up to 25+ by hand.
+   */
+  test(
+    "reconnection survives being done over and over",
+    async () => {
+      const bc = await createBorgContext({ url: `borg+unix://${socket}/main` });
+      for (let round = 0; round < BOUNCES; round++) {
+        await bounce();
+        const tx = await bc.branch("main").begin();
+        await tx.object(Company, "#72").set("headcount", round);
+        await tx.commit();
+        expect((await bc.branch("main").get("Company#72.headcount")).value).toBe(String(round));
+      }
+      bc.close();
+    },
+    300_000,
+  );
 });

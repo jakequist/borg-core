@@ -23,6 +23,16 @@ export interface ClientHello {
   codec: "json";
   /** The def-layer this client's generated code was built from. Absent means the branch head. */
   client_version?: string;
+  /**
+   * **Which registry on this server the connection is for** (§17.6). Settled once, here, because
+   * the registry is what a connection is *to* — repeating it per message would put a tenancy
+   * decision on every line.
+   *
+   * **Absent means the server's sole registry, when it has exactly one**, and is refused with the
+   * options when it hosts more. That rule lives in the server and is deliberately not mirrored
+   * here: a client that guessed would be re-implementing half of it.
+   */
+  registry?: string;
 }
 
 export type Request =

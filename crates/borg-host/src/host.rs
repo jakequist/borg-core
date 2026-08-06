@@ -90,6 +90,17 @@ pub fn default_socket(data_dir: &Path) -> PathBuf {
     }
 }
 
+/// **The address `borg://localhost` resolves to.** SPEC.md §17.7.
+///
+/// [`default_socket`] over [`default_data_dir`], named because a client's URL says *the local
+/// transport* rather than a path, and something has to be the one place that turns the first into
+/// the second. `borg_protocol::url` deliberately does not: it sits below this crate, and a second
+/// copy of the `$XDG_RUNTIME_DIR`-or-data-dir rule is exactly the drift CLAUDE.md forbids.
+#[must_use]
+pub fn well_known_socket() -> PathBuf {
+    default_socket(&default_data_dir())
+}
+
 /// Whether a name may be a registry.
 ///
 /// Letters, digits, `-` and `_`. Deliberately narrow: the name is a directory under the data dir, a

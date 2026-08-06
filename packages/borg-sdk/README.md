@@ -3,7 +3,9 @@
 Borg in TypeScript. **Two entry points, deliberately opposite:**
 
 - `borg-sdk` — the **author side**. Declare structs, write pipelines, serve them to the engine.
-- `borg-sdk/client` — the **consumer side**. Read and write through transactions over `borg serve`.
+- `borg-sdk/client` — the **consumer side**. Read and write through transactions over `borg-server`,
+  addressed by a connection url: `createBorgContext({ url: "borg://localhost/<registry>" })`, or
+  `$BORG_URL`. The context reconnects on its own when the server it is talking to restarts.
 
 Same struct name, opposite directions. The `Company` below is the *source* of a definition; a
 client's `Company` is *generated from* one by `borg generate` and carries the def-version it was

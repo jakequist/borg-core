@@ -21,7 +21,8 @@
 //! What it is *not* any more is a server. `borg serve` is gone; `borg-server` is the process that
 //! stays up, and it hosts a directory of registries rather than the one store a `--store` names
 //! (SPEC.md §17.6). While a store is served, every command here is refused by name and told the
-//! socket — except [`crate::generate`], which connects to it.
+//! socket — except the two that *connect* to it, [`crate::generate`] and `repo push`, which take a
+//! `--url` naming a server and a registry rather than a `--store` naming a file (§17.7).
 
 use borg_core::{
     BorgError, BranchId, DefEvent, LayerAuthor, LayerId, LayerKind, MergeMode, ProducerId, RepoId,
@@ -75,9 +76,15 @@ struct Args {
     timeout: u64,
     /// `--tx`. Which open transaction a `borg tx …` command speaks to. See [`transaction_id`].
     tx: Option<String>,
-    /// `--socket`. Which socket `borg generate` reads through, when the store's own lock record
-    /// (`borg_host::serving`) does not already name one. Nothing else here speaks to a socket.
-    socket: Option<PathBuf>,
+    /// `--url`, or `$BORG_URL`. **Which server, and which registry on it** (SPEC.md §17.7).
+    ///
+    /// Read by the two commands that speak to a socket rather than opening a store — `generate`
+    /// and `repo push` — and by nothing else, because nothing else here is a protocol client. An
+    /// explicit `--url` on any other command is refused rather than ignored: it says the caller
+    /// meant a server, and the answer they would silently have got is about a file.
+    url: Option<String>,
+    /// Whether [`Args::url`] came from the flag rather than from `$BORG_URL`. See there.
+    url_was_a_flag: bool,
     /// `--lang`. Which SDK `borg generate` emits.
     lang: String,
     /// `-o` / `--out`. Where `borg generate` writes its module.
@@ -117,6 +124,7 @@ borg — an event-sourced data backend
   borg def version                     the branch's current def-version
 
   borg repo push <dir>                 push a repo: defs and pipelines
+  borg repo push <dir> --url <url>     …asking a running server to push it, live
   borg producer list                   registered producers
   borg derive [--quiet]                run producers until caught up
   borg derive --rebuild                recompute derived data from source, ignoring the cache
@@ -188,6 +196,23 @@ one command are opposite lifecycles, not two modes. **One process serves a store
 served, every borg invocation against it is refused and told the socket to speak to. `borg` itself
 stays what it always was, which is a client operating directly on a store nobody is serving.
 
+**A connection url is how you name a server instead of a store**: one string carrying both halves a
+client needs, the way DATABASE_URL does.
+
+  borg://localhost/personal-crm              the well-known socket, registry personal-crm
+  borg+unix:///path/to/borg.sock/crm         an explicit socket; the last segment is the registry
+  borg+unix:///path/to/borg.sock             …and a trailing slash, or no name, says none
+
+A registry left out of the url is left out of the handshake, and the server answers with its sole
+registry when it hosts one and names the options when it hosts more. `borg+ws://` is reserved for
+the browser transport and is refused by name today rather than invented later.
+
+`--url`, or $BORG_URL, is read by the two commands that speak to a server rather than opening a
+store — `generate`, which reads a def view, and `repo push`, which asks the *server* to run the
+push against a path on its own disk, so a schema can be pushed into a running server without
+stopping it. Every other command here is embedded borg and works on --store; passing --url to one
+is refused rather than quietly ignored.
+
 `borg generate` writes the other half: a TypeScript module holding an interface and a runtime
 descriptor per struct, and a `createBorgContext` with **this branch's def-version baked in as the
 client's ClientVersion**. That stamp is the point. borg itself has no generated code and so is
@@ -221,7 +246,7 @@ Options:
   --settled                 read at the settled frontier, not at the ragged head
   --timeout <seconds>       how long `frontier reaches` waits (default 0)
   --tx <id>                 which open transaction to speak to (or $BORG_TX)
-  --socket <path>           `generate`: the socket to read through, if not the store's own
+  --url <url>               which server and registry: `generate` and `repo push` only
   --lang <name>             `generate`: which SDK to emit (ts)
   -o, --out <dir>           `generate`: where to write the module
   --watch                   `generate`: rewrite it whenever the def-version moves
@@ -254,7 +279,11 @@ fn parse_args() -> Args {
         retry_broken: false,
         timeout: 0,
         tx: None,
-        socket: None,
+        // `$BORG_URL` is the ambient form and the flag overrides it, exactly as `DATABASE_URL` and
+        // a `--database-url` relate. An empty value is treated as unset, so `BORG_URL= borg …` is
+        // how a shell that exported one opts back out for one command.
+        url: std::env::var("BORG_URL").ok().filter(|url| !url.is_empty()),
+        url_was_a_flag: false,
         lang: "ts".to_string(),
         out: None,
         watch: false,
@@ -268,7 +297,10 @@ fn parse_args() -> Args {
             "--client-version" => args.ops.version = raw.next().as_deref().map(layer_id),
             "--freshness" => args.ops.freshness = freshness(raw.next().as_deref()),
             "--settled" => args.ops.settled = true,
-            "--socket" => args.socket = raw.next().map(PathBuf::from),
+            "--url" => {
+                args.url = raw.next();
+                args.url_was_a_flag = true;
+            }
             "--lang" => args.lang = raw.next().unwrap_or_else(|| usage()),
             "-o" | "--out" => args.out = raw.next().map(PathBuf::from),
             "--watch" => args.watch = true,
@@ -306,6 +338,34 @@ fn freshness(mode: Option<&str>) -> borg_core::FreshnessRequirement {
     mode.and_then(ops::freshness).unwrap_or_else(|| usage())
 }
 
+/// Where a socket-speaking command should connect, if the caller named a server. SPEC.md §17.7.
+///
+/// **Two commands here are protocol clients** — `generate`, which reads a def view, and `repo
+/// push`, which asks the server to run a push against a path on its own disk. Everything else is
+/// embedded Borg and works on a `--store`. So this answers `None` when no URL was given, and the
+/// two commands fall back to what they did before: `generate` reads the store's own lock record,
+/// and `repo push` opens the store.
+///
+/// `borg://` is resolved here rather than in the parser because the well-known address is
+/// `borg_host::host`'s to know (`borg_protocol::url::Transport::Local`).
+struct Dial {
+    socket: PathBuf,
+    /// The registry to name in the handshake. `None` is `None` on the wire — the server's n=1
+    /// convenience and n≥2 refusal are one rule and live there (§17.6).
+    registry: Option<String>,
+}
+
+fn dial(args: &Args) -> Result<Option<Dial>> {
+    let Some(text) = args.url.as_deref() else {
+        return Ok(None);
+    };
+    let url = borg_protocol::url::ConnectionUrl::parse(text)?;
+    Ok(Some(Dial {
+        socket: url.socket(&borg_host::host::well_known_socket()),
+        registry: url.registry,
+    }))
+}
+
 /// A layer id as written by `borg layer head` — `L7` — or bare.
 fn layer_id(text: &str) -> LayerId {
     LayerId(
@@ -319,24 +379,45 @@ async fn run(args: Args) -> Result<()> {
     let verb = args.rest.first().map(String::as_str).unwrap_or("");
     let rest: Vec<&str> = args.rest.iter().skip(1).map(String::as_str).collect();
 
+    // The two commands that are protocol clients rather than embedded operations (SPEC.md §17.7).
+    // Named in one place because three things below key off the same fact: whether a URL is
+    // honoured, whether the store is opened at all, and whether an explicit `--url` was a mistake.
+    let connects = matches!(
+        (verb, rest.as_slice()),
+        ("generate", _) | ("repo", ["push", _])
+    );
+    let dialled = if connects { dial(&args)? } else { None };
+    if args.url_was_a_flag && !connects {
+        // Refused rather than ignored: `--url` says the caller meant a server, and what they would
+        // silently have got is an answer about `--store`. `$BORG_URL` is ambient and is left alone,
+        // for the same reason an exported variable does not break every unrelated command.
+        return Err(BorgError::Storage(format!(
+            "`--url` names a server, and `borg {verb}` operates on a store directly — the commands \
+             that connect are `generate` and `repo push`"
+        )));
+    }
+
     // **One process serves a store.** Sidecars and the in-process sequencer are not multi-process
     // safe, and they were not before there was a server either — what a server changes is that the
     // second process is now likely rather than hypothetical. So a served store refuses everyone else
     // by name, and says where the socket is (`borg_host::serving`).
     //
-    // `generate` is the one exception, and it is not an exemption: it does not open a served store
-    // either, it *connects to the socket* instead. That is SDK-DRAFT §2.6's remote-connection future
-    // arriving for exactly one read-only command — see `crate::generate` for why it stops there.
-    if verb != "generate" {
+    // The commands that connect are the exception, and it is not an exemption: they do not open a
+    // served store either, they *speak to the socket* instead. That is SDK-DRAFT §2.6's
+    // remote-connection future arriving for two commands — a pure read and a push the server
+    // performs — and deliberately not for the write path, which needs answers about `--tx` and
+    // `$BORG_TX` that a socket has none of.
+    let embedded = !connects || (verb == "repo" && dialled.is_none());
+    if embedded {
         serving::refuse_if_served(&args.ops.store)?;
     }
 
     // Reaping sweeps **opportunistically, when a process opens the store** — the same place the
     // indexes are already rebuilt — so there is no daemon, and an idle store sweeps nothing because
-    // nothing is growing (SPEC.md §12). Not for `generate`, which may not be touching this store's
-    // files at all: sweeping a served store's transaction table from a second process is exactly the
-    // thing the lock exists to prevent.
-    if verb != "generate" {
+    // nothing is growing (SPEC.md §12). Not for a command that connects, which may not be touching
+    // this store's files at all: sweeping a served store's transaction table from a second process
+    // is exactly the thing the lock exists to prevent.
+    if embedded {
         ops::reap_transactions(&args.ops)?;
     }
 
@@ -364,7 +445,7 @@ async fn run(args: Args) -> Result<()> {
         ("def", ["version"]) => def_version(&args).await,
         ("layer", ["list"]) => layer_list(&args).await,
         ("layer", ["head"]) => layer_head(&args).await,
-        ("repo", ["push", dir]) => repo_push(&args, dir).await,
+        ("repo", ["push", dir]) => repo_push(&args, dialled.as_ref(), dir).await,
         ("producer", ["list"]) => producer_list(&args).await,
         ("derive", ["pause"]) => derive_pause(&args, true).await,
         ("derive", ["resume"]) => derive_pause(&args, false).await,
@@ -380,7 +461,8 @@ async fn run(args: Args) -> Result<()> {
                     lang: args.lang.clone(),
                     out,
                     watch: args.watch,
-                    socket: args.socket.clone(),
+                    socket: dialled.as_ref().map(|dial| dial.socket.clone()),
+                    registry: dialled.as_ref().and_then(|dial| dial.registry.clone()),
                 },
             )
             .await
@@ -1002,14 +1084,51 @@ fn flag<'a>(tail: &[&'a str], name: &str) -> Option<&'a str> {
 /// [`borg_host::push::repo_push`], which is what `borg-server` runs when a client sends `repo_push`
 /// — so a schema pushed from a terminal and a schema pushed into a running server are the same
 /// operation reported twice, rather than two things that happen to agree today.
-async fn repo_push(args: &Args, dir: &str) -> Result<()> {
-    let pushed = push::repo_push(&args.ops, Path::new(dir)).await?;
+///
+/// **With a `--url` it is the second of those**, and that is what retires *"pushing a schema means
+/// stopping the server"*. A push moves definitions, which travel the log, and implementations,
+/// which are a sidecar beside the store — so a second process doing it is the second writer the
+/// advisory lock refuses (§17.6). The way out is not to let this process write; it is to ask the
+/// server to, which is one `repo_push` message and no new operation.
+async fn repo_push(args: &Args, dial: Option<&Dial>, dir: &str) -> Result<()> {
+    let report = match dial {
+        Some(dial) => over_socket_push(args, dial, dir)?,
+        None => push::repo_push(&args.ops, Path::new(dir)).await?.report,
+    };
     // Everything is accepted and committed by now, so this is a report rather than a running
-    // commentary.
-    for line in &pushed.report {
+    // commentary — and it is the same report either way, because it is the same operation.
+    for line in &report {
         outln!("{line}");
     }
     Ok(())
+}
+
+/// Ask the server to push, and hand back the lines it reported. SPEC.md §17.6.
+fn over_socket_push(args: &Args, dial: &Dial, dir: &str) -> Result<Vec<String>> {
+    // **Absolute, because `path` is a path on the server's disk** and this process's working
+    // directory is not the server's. Canonicalised here rather than sent raw so that the failure
+    // for a directory that does not exist is *this* one — naming the path the caller typed — and
+    // not a server-side error about a path the caller never wrote.
+    let path = std::fs::canonicalize(dir)
+        .map_err(|err| BorgError::Storage(format!("{dir}: {err}")))?
+        .display()
+        .to_string();
+    let request = borg_protocol::client::Request::RepoPush {
+        // Absent: the handshake already settled which registry this connection is for, and naming
+        // it twice would let the two disagree. The field exists for a deploy client pushing to
+        // several registries over one connection, which is not this.
+        registry: None,
+        branch: args.ops.branch.clone(),
+        path: Some(path),
+    };
+    match borg_protocol::client::ask(&dial.socket, dial.registry.as_deref(), &request)? {
+        borg_protocol::client::Response::Pushed { report, .. } => Ok(report),
+        borg_protocol::client::Response::Error { message } => Err(BorgError::Storage(message)),
+        other => Err(BorgError::Storage(format!(
+            "{}: expected a push report, got {other:?}",
+            dial.socket.display()
+        ))),
+    }
 }
 
 async fn producer_list(args: &Args) -> Result<()> {

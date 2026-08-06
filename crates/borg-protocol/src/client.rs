@@ -56,7 +56,62 @@
 //! The one exception is [`Request::RepoPush`], which may name another, because a deploy client
 //! pushing to three registries should not need three connections to do it.
 
+use borg_core::{BorgError, Result};
 use serde::{Deserialize, Serialize};
+use std::io::BufReader;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+
+/// **One request to a running server: connect, greet, ask, read.** SPEC.md §17.5.
+///
+/// Thirty lines, and that is the claim rather than an accident — §17.5 has no hidden client
+/// library, which is the same thing `scenarios/250-serve`'s `client.py` says from the other side.
+/// What it is *not* is thirty lines in three places: `borg-server status`, `borg-server create`,
+/// `borg generate` and `borg repo push --url` all speak this protocol, and four copies of a
+/// handshake is four places for a field to be forgotten when the handshake grows one. Everything
+/// stateful — a connection held across requests, a transaction, a reconnect — is an SDK's job and
+/// deliberately not here (`packages/borg-sdk`).
+///
+/// `registry` is the handshake's (§17.6) and is `None` for the questions that are about the
+/// *server* rather than about a store — `registries` and `registry_create` — which a connection
+/// that settled no registry can still ask.
+///
+/// **A refusal to connect is [`crate::url::unreachable`]'s sentence**, not an `io::Error`: nothing
+/// listening on a socket is the commonest failure a client has and "Connection refused" is the
+/// least useful way to report it.
+pub fn ask(socket: &Path, registry: Option<&str>, request: &Request) -> Result<Response> {
+    let broke = |what: &str, err: &dyn std::fmt::Display| {
+        BorgError::Storage(format!("{}: {what}: {err}", socket.display()))
+    };
+    let stream =
+        UnixStream::connect(socket).map_err(|err| crate::url::unreachable(socket, &err))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| broke("cannot read", &err))?,
+    );
+    let mut writer = stream;
+
+    let _: crate::ServerHello = crate::read_message(&mut reader, crate::Codec::Json)
+        .map_err(|err| broke("no hello", &err))?;
+    let hello = ClientHello {
+        version: VERSION,
+        // **No `client_version`.** Every caller of this is asking what the store *is* right now —
+        // administering a server, or generating code from the schema in force. Stating a version
+        // would be making a claim about somebody else's code (§5.4).
+        client_version: None,
+        codec: "json".to_string(),
+        registry: registry.map(str::to_string),
+        // Nothing to present, and nothing checks it yet (§17.6).
+        credential: None,
+    };
+    crate::write_message(&mut writer, crate::Codec::Json, &hello)
+        .map_err(|err| broke("cannot greet", &err))?;
+    crate::write_message(&mut writer, crate::Codec::Json, request)
+        .map_err(|err| broke("cannot ask", &err))?;
+
+    crate::read_message(&mut reader, crate::Codec::Json).map_err(|err| broke("no answer", &err))
+}
 
 /// The client protocol's version, negotiated separately from the worker protocol's [`crate::VERSION`]
 /// even though both currently read `1`. They are two contracts over one framing and there is no

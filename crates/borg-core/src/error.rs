@@ -111,6 +111,17 @@ pub enum BorgError {
     #[error("storage: {0}")]
     Storage(String),
 
+    /// **Nothing is listening where a client was told to connect.** SPEC.md §17.7.
+    ///
+    /// Its own variant, and printed with no prefix, because it is the one error whose whole value
+    /// is the sentence: *no borg server at <addr> — start one with: `borg-server start`*. A
+    /// `storage:` in front of that is noise in front of the only words a reader needs, and the
+    /// variant is also what lets a caller tell "the server is down" from "the server said no" —
+    /// which is the distinction `examples/personal-crm/FRICTION.md` #11 is about. Built by
+    /// `borg_protocol::url::unreachable`, which is where the sentence lives.
+    #[error("{0}")]
+    Unreachable(String),
+
     #[error(transparent)]
     Parse(#[from] crate::parse::ParseError),
 

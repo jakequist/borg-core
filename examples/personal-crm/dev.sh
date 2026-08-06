@@ -1,38 +1,47 @@
 #!/usr/bin/env bash
-# Boot the whole CRM: a store, a schema, a server, a generated client, an api and a ui.
+# Boot the whole CRM: a server, a registry, a schema, a generated client, an api and a ui.
 #
 # Re-runnable. Everything it does is either idempotent or skipped when it has already been done, so
-# `./dev.sh` twice in a row is `./dev.sh` once — and `./dev.sh --reset` throws the store away and
-# starts from nothing.
+# `./dev.sh` twice in a row is `./dev.sh` once.
 #
-# ## The order is not arbitrary
+# ## This script does not own the server
 #
-# **`borg repo push` has to happen before `borg serve` starts**, and this is the single most
-# important line in the file. A served store refuses every other `borg` invocation by name
-# (SPEC.md §17.5, CLAUDE.md) — `repo push` reads a *directory* off this machine's disk and is not on
-# the socket, so there is no way to push a schema into a running server. The sequence is therefore:
-# push while nothing is serving, then serve. Changing the schema means stopping the server, which
-# for a dev script means re-running this one.
+# `borg-server` is a process that stays up, and this is a script you `^C`. It **ensures** one is
+# running — `status || start` — and leaves it running when you stop the script; the api and the ui
+# are the only things the trap below kills. That is the right split for the same reason `borg-server
+# start` backgrounds by default: a server is a thing you operate, not a thing a dev loop owns.
 #
-# `borg generate`, by contrast, is happy either way: it is the one command that connects to the
-# socket rather than being turned away by it, so it runs *after* the server is up and reads the
-# definitions through it.
+#     ./dev.sh --stop     when you do want it gone
 #
-#     usage: ./dev.sh [--reset] [--no-ui] [--headless]
+# **The schema is pushed into the running server**, which used to be impossible. `repo push` is a
+# protocol message now and the *server* executes it against a path on its own disk (SPEC.md §17.6),
+# so there is no push-before-serve ordering left to get right and no restart when you edit the
+# schema — the earlier version of this file was built around that constraint and said so at length.
 #
-#       --reset      delete data/ first: new store, new ids, no contacts
+#     usage: ./dev.sh [--reset] [--no-ui] [--headless] [--stop]
+#
+#       --reset      recreate the registry's store: new ids, no contacts (see below)
 #       --no-ui      skip vite (the api is still up on $API_PORT)
 #       --headless   --no-ui, and say so — for driving the api with curl from another shell
+#       --stop       stop the dev server and exit, doing nothing else
+#
+#       CRM_DATA=…   the data directory to host (default ./data). bench.sh uses its own.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
-DATA="$HERE/data"
-STORE="$DATA/borg.db"
+# A **data directory of registries**, which is what a server hosts (§17.6), holding one registry.
+DATA="${CRM_DATA:-$HERE/data}"
+REGISTRY="personal-crm"
 SOCK="$DATA/borg.sock"
+# The socket is named rather than left to the well-known address on purpose: `borg://localhost` is
+# one address per machine, and a demo that took it would fight whatever else the reader is running.
+URL="borg+unix://$SOCK/$REGISTRY"
+
 BORG="${BORG_BIN:-$ROOT/target/debug/borg}"
+BORG_SERVER="${BORG_SERVER_BIN:-$ROOT/target/debug/borg-server}"
 SDK="$ROOT/packages/borg-sdk"
 
 API_PORT="${API_PORT:-8787}"
@@ -41,19 +50,25 @@ UI_PORT="${UI_PORT:-5173}"
 RESET=0
 UI=1
 HEADLESS=0
+STOP=0
 for arg in "$@"; do
     case "$arg" in
         --reset) RESET=1 ;;
         --no-ui) UI=0 ;;
         --headless) UI=0; HEADLESS=1 ;;
-        *) echo "usage: ./dev.sh [--reset] [--no-ui] [--headless]" >&2; exit 2 ;;
+        --stop) STOP=1 ;;
+        *) echo "usage: ./dev.sh [--reset] [--no-ui] [--headless] [--stop]" >&2; exit 2 ;;
     esac
 done
 
 say() { printf '\033[1m▸ %s\033[0m\n' "$*"; }
 die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Every background process this script owns, killed on the way out however we leave.
+server() { "$BORG_SERVER" --data-dir "$DATA" --socket "$SOCK" "$@"; }
+borg() { "$BORG" "$@"; }
+
+# Every background process **this script** owns, killed on the way out however we leave. The server
+# is deliberately not one of them: see the header.
 PIDS=()
 cleanup() {
     for pid in "${PIDS[@]:-}"; do
@@ -65,6 +80,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+if [ "$STOP" = 1 ]; then
+    [ -x "$BORG_SERVER" ] || die "no borg-server at $BORG_SERVER"
+    server stop
+    exit 0
+fi
+
 # ── 0. Tools ──────────────────────────────────────────────────────────────────────────────────────
 
 command -v node >/dev/null || die "node is required (22.18+, for running .ts files directly)"
@@ -72,9 +93,9 @@ node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(
     || die "node $(node -v) cannot run a .ts file directly — 22.18+ strips types natively"
 command -v pnpm >/dev/null || die "pnpm is required (for the ui's dependencies)"
 
-if [ ! -x "$BORG" ]; then
-    say "building borg"
-    (cd "$ROOT" && cargo build -p borg-cli) || die "cargo build failed"
+if [ ! -x "$BORG" ] || [ ! -x "$BORG_SERVER" ]; then
+    say "building borg and borg-server"
+    (cd "$ROOT" && cargo build -p borg-cli -p borg-server) || die "cargo build failed"
 fi
 
 if [ ! -f "$SDK/dist/client.js" ] || [ -n "$(find "$SDK/src" -newer "$SDK/dist/client.js" -print -quit)" ]; then
@@ -92,73 +113,79 @@ link_sdk() {
 link_sdk "$HERE/repo"
 link_sdk "$HERE/api"
 
-# ── 1. The store ──────────────────────────────────────────────────────────────────────────────────
+# ── 1. The reset, which is the one thing that needs the server *down* ──────────────────────────────
+#
+# **Stop, delete the registry's directory, start again.** The alternative would be a `registry_delete`
+# on the protocol, and that is deliberately not built: it is a destructive operation on a wire whose
+# `credential` nothing checks yet (§17.6), which is exactly the shape `borg-server stop` avoided by
+# being a SIGTERM rather than a message. Throwing a store away is a thing you do with filesystem
+# access, on purpose.
+#
+# Only this registry's directory goes. The server's pidfile and log live beside it in the data dir
+# and are worth keeping — the log is where the reason a previous run died is written.
 
 if [ "$RESET" = 1 ]; then
-    say "--reset: deleting $DATA"
-    rm -rf "$DATA"
+    if server status >/dev/null 2>&1; then
+        say "--reset: stopping the server so its store can be thrown away"
+        server stop >/dev/null
+    fi
+    say "--reset: deleting $DATA/$REGISTRY"
+    rm -rf "${DATA:?}/$REGISTRY"
 fi
 
-mkdir -p "$DATA"
-if [ ! -f "$STORE" ]; then
-    say "creating the store"
-    "$BORG" --store "$STORE" init
+# ── 2. The server ─────────────────────────────────────────────────────────────────────────────────
+#
+# `status` exits non-zero when nothing is answering, which is what makes this one line. `start`
+# waits until the server actually answers before it returns, so there is no socket-file race to
+# lose here and no retry loop to write — the earlier version of this script had one.
+
+if server status >/dev/null 2>&1; then
+    say "borg-server is already up on $SOCK"
+else
+    say "starting borg-server on $SOCK (data dir $DATA)"
+    server start >/dev/null || { server logs -n 40 >&2 2>/dev/null || true; die "borg-server would not start"; }
 fi
 
-# ── 2. The schema — while nothing is serving ──────────────────────────────────────────────────────
+# ── 3. The registry ───────────────────────────────────────────────────────────────────────────────
 #
-# Pushed unconditionally, every boot. This used to be gated behind a `cksum` stamp of `repo/`,
-# because `repo push` emitted a new def layer every time it ran and a dev script that pushed on every
-# boot would walk the branch's def-version up by one each time — and regenerate the client with it.
+# Created **through the server**, because a directory appearing under a running server's data dir is
+# a store it has not locked, is not hosting and will not route to (§17.6). `create` goes over the
+# socket whenever one is up, which is what makes this idempotent-by-checking rather than by luck.
+
+if server status | grep -q "^  $REGISTRY "; then
+    say "registry $REGISTRY is hosted"
+else
+    say "creating registry $REGISTRY"
+    server create "$REGISTRY" >/dev/null || die "could not create the registry"
+fi
+
+# ── 4. The schema — into the running server ───────────────────────────────────────────────────────
 #
-# `repo push` is a diff now, on both halves. Definitions the branch already holds emit nothing, and a
-# producer whose implementation fingerprint has not moved emits nothing either (SPEC.md §9.2), so an
-# unchanged repo pushed twice lands no layer at all. The stamp was a worse version of that check
-# living outside the tool: it hashed file contents, which is what the fingerprint does, but compared
-# them with a file beside the store rather than with what the store *believes*. Keeping the two in
-# step was this script's job — `--reset` had to remember to delete the stamp, and pushing to another
-# branch would have needed a stamp per branch.
-#
-# The other half is why deleting it is a fix and not a tidy-up: when the pipeline body *has* changed,
-# the push now recomputes every value that pipeline owns. The stamp used to decide whether to push;
-# nothing decided whether to invalidate, and the answer was always "no" (FRICTION.md #17).
-say "pushing the repo (schema + the display_name pipeline)"
+# Pushed unconditionally, every boot, and it costs nothing when nothing changed: `repo push` is a
+# diff on both halves. Definitions the branch already holds emit nothing, and a producer whose
+# implementation fingerprint has not moved emits nothing either (§9.2), so an unchanged repo pushed
+# twice lands no layer at all. When the pipeline body *has* changed, the push recomputes every value
+# that pipeline owns — which is FRICTION #17, and is also the precondition for pushing into a live
+# server rather than a stopped one.
+
+say "pushing the repo into $REGISTRY (schema + the display_name pipeline)"
 # The pipeline is invoked as a program, so it has to be executable. A repo checked out without the
 # mode bit fails here with `Permission denied` and no other clue.
 chmod +x "$HERE"/repo/pipelines/*.ts
-"$BORG" --store "$STORE" repo push "$HERE/repo" || die "repo push failed"
-say "def-version $("$BORG" --store "$STORE" def version)"
+borg --url "$URL" repo push "$HERE/repo" || die "repo push failed"
 
-# ── 3. The server ─────────────────────────────────────────────────────────────────────────────────
-
-rm -f "$SOCK"
-say "starting borg serve on $SOCK"
-"$BORG" --store "$STORE" serve --socket "$SOCK" >"$DATA/serve.log" 2>&1 &
-PIDS+=($!)
-
-# A socket file exists a moment before anything is listening on it, so the wait is for an answer and
-# not for a path.
-for _ in $(seq 100); do
-    if node -e '
-const net = require("node:net");
-const s = net.connect(process.argv[1]);
-s.on("connect", () => { s.end(); process.exit(0); });
-s.on("error", () => process.exit(1));
-' "$SOCK" 2>/dev/null; then ok=1; break; fi
-    sleep 0.1
-done
-[ "${ok:-0}" = 1 ] || { cat "$DATA/serve.log" >&2; die "borg serve never came up"; }
-
-# ── 4. The generated client ───────────────────────────────────────────────────────────────────────
+# ── 5. The generated client ───────────────────────────────────────────────────────────────────────
 #
-# Through the socket, because the store is served now. `generate` says which way it read.
-say "generating the typed client into api/gen"
-"$BORG" --store "$STORE" generate --lang ts -o "$HERE/api/gen" || die "generate failed"
+# Through the same url, so the schema this reads is the schema the push just landed — one address,
+# named once, for every client in this file.
 
-# ── 5. The api ────────────────────────────────────────────────────────────────────────────────────
+say "generating the typed client into api/gen"
+borg --url "$URL" generate --lang ts -o "$HERE/api/gen" || die "generate failed"
+
+# ── 6. The api ────────────────────────────────────────────────────────────────────────────────────
 
 say "starting the api on http://localhost:$API_PORT"
-BORG_SOCKET="$SOCK" PORT="$API_PORT" node "$HERE/api/server.ts" &
+BORG_URL="$URL" PORT="$API_PORT" node "$HERE/api/server.ts" &
 PIDS+=($!)
 
 for _ in $(seq 100); do
@@ -169,7 +196,7 @@ fetch(`http://localhost:${process.argv[1]}/api/health`).then(r => process.exit(r
 done
 [ "${api:-0}" = 1 ] || die "the api never came up"
 
-# ── 6. The ui ─────────────────────────────────────────────────────────────────────────────────────
+# ── 7. The ui ─────────────────────────────────────────────────────────────────────────────────────
 
 if [ "$UI" = 1 ]; then
     if [ ! -d "$HERE/ui/node_modules" ]; then
@@ -183,11 +210,12 @@ fi
 
 printf '\n\033[1;32mup\033[0m  api http://localhost:%s' "$API_PORT"
 [ "$UI" = 1 ] && printf '   ui http://localhost:%s' "$UI_PORT"
-printf '   store %s\n' "$STORE"
+printf '   borg %s\n' "$URL"
+printf '    the server stays up when this script stops — `./dev.sh --stop` ends it\n'
 
 if [ "$HEADLESS" = 1 ]; then
-    # Used by the smoke test: everything is serving, the caller drives it with curl. The trap still
-    # tears it all down, so the caller keeps the script running and kills it when done.
+    # Used by the smoke test: everything is serving, the caller drives it with curl. The trap tears
+    # down the api and the ui, so the caller keeps the script running and kills it when done.
     printf 'headless: ctrl-c to stop\n'
 fi
 

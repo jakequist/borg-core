@@ -36,7 +36,6 @@
 //! server is running"* on its own sends somebody to read `--help`. Each of them names the data
 //! directory it looked in and the command that would start one.
 
-use crate::client;
 use borg_core::{BorgError, Result};
 use borg_host::host::{self, Host, LOG_FILE, PID_FILE};
 use borg_host::ops::Ops;
@@ -237,10 +236,12 @@ pub struct Status {
 }
 
 /// Ask the server what it is. **Through the socket**, because which registries a server hosts and
-/// which it has opened are facts about the server rather than about the directory — see
-/// `crate::client`.
+/// which it has opened are facts about the server rather than about the directory — one read from
+/// the filesystem would answer about a directory, and would answer nothing at all once the server
+/// being asked about is on another machine. `borg_protocol::client::ask` is the thirty lines that
+/// takes, shared with the CLI's two socket commands so there is one handshake and not three.
 pub fn status(data_dir: &Path, socket: &Path) -> Status {
-    let registries = match client::ask(socket, None, &Request::Registries {}) {
+    let registries = match borg_protocol::client::ask(socket, None, &Request::Registries {}) {
         Ok(Response::Registries(hosted)) => Some(hosted),
         _ => None,
     };
@@ -261,7 +262,7 @@ pub fn status(data_dir: &Path, socket: &Path) -> Status {
 /// way to give it anything.
 pub async fn create(data_dir: &Path, socket: &Path, name: &str, base: &Ops) -> Result<bool> {
     if serving::is_listening(socket) {
-        return match client::ask(
+        return match borg_protocol::client::ask(
             socket,
             None,
             &Request::RegistryCreate {

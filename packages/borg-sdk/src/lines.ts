@@ -2,7 +2,7 @@
  * Newline-delimited JSON messages over a duplex pair, in strict request/response order.
  *
  * **Shared by both protocols this SDK speaks**, and that is the point of it being here: §17.4 (the
- * engine talking to a worker) and §17.5 (a client talking to `borg serve`) are two message sets over
+ * engine talking to a worker) and §17.5 (a client talking to `borg-server`) are two message sets over
  * *one* framing, and the Rust side says so by putting `read_message`/`write_message` in one crate.
  * A second copy of the buffering below would be a second place for a multi-byte character split
  * across two chunks to be handled slightly differently.
@@ -21,11 +21,24 @@ import { StringDecoder } from "node:string_decoder";
 import type { Readable, Writable } from "node:stream";
 
 export class BorgProtocolError extends Error {
-  override readonly name = "BorgProtocolError";
+  // Annotated `string` rather than left to infer the literal, so that the subclasses in
+  // `./client.ts` can name themselves. A `name` narrowed to one literal makes every specialisation
+  // of an error a compile error, which is the opposite of what naming an error class is for.
+  override readonly name: string = "BorgProtocolError";
 }
 
 /** A message stream. `In` is what arrives, `Out` is what may be sent. */
 export interface MessageStream<In, Out> {
+  /**
+   * Whether the other end has already gone away.
+   *
+   * What it buys is a *transparent* reconnect: a client SDK that finds its socket in this state
+   * before it has written anything can dial a fresh one and nothing has been sent twice. Without
+   * it, the first operation after a server restart is always a failure — the connection is dead and
+   * only writing to it discovers that — which turns a bounce into one guaranteed error per client
+   * rather than none.
+   */
+  readonly closed: boolean;
   /** The next message from the other end, or `null` once it has hung up. */
   receive(): Promise<In | null>;
   send(message: Out): void;
@@ -77,6 +90,14 @@ export class LineStream<In, Out> implements MessageStream<In, Out> {
     const waiter = this.#waiting.shift();
     if (waiter) waiter(line);
     else this.#ready.push(line);
+  }
+
+  /**
+   * See [`MessageStream.closed`]. Buffered lines still count as arrived, so this is about the
+   * *stream*: once it has ended, nothing more will ever arrive on it.
+   */
+  get closed(): boolean {
+    return this.#ended;
   }
 
   #finish(): void {

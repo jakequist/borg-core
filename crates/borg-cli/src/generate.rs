@@ -10,15 +10,24 @@
 //!
 //! ## Where the definitions come from
 //!
-//! **From the socket if the store is served, from the store if it is not**, decided per read and not
-//! by a flag. A served store refuses every other `borg` invocation (§17.5), so a `generate` that
-//! only knew how to open a file would fail exactly when a developer is most likely to run it — with
-//! their server up — and the fix would be to stop the server, regenerate, and start it again.
+//! **From a `--url` if one was given; otherwise from the socket if the store is served, and from the
+//! store if it is not** — decided per read and not by a mode flag. A served store refuses every
+//! other `borg` invocation (§17.5), so a `generate` that only knew how to open a file would fail
+//! exactly when a developer is most likely to run it — with their server up — and the fix would be
+//! to stop the server, regenerate, and start it again.
 //!
-//! This is the first place the CLI *connects to* the socket instead of being turned away by it,
-//! which SDK-DRAFT §2.6 names as the remote-connection future. It
-//! is scoped to this one command on purpose: `generate` only reads, so it needs none of the answers
-//! the general case needs about transactions, `$BORG_TX`, or which process owns a write.
+//! A url (SPEC.md §17.7) is the *complete* answer — an address and a registry — and it is the only
+//! one that works against a server whose store this machine cannot see. It replaced `--socket`,
+//! which named half of a connection: one socket hosts a directory of registries and the handshake is
+//! what routes, so an address without a name is a request to an arbitrary store. Where no url is
+//! given, the store's own lock record supplies both halves, which is what keeps `borg generate`
+//! working with no arguments at all.
+//!
+//! This was the first place the CLI *connects to* the socket instead of being turned away by it,
+//! which SDK-DRAFT §2.6 names as the remote-connection future; `repo push --url` is the second, and
+//! there are deliberately no others. `generate` only reads, and a push is a write the *server*
+//! performs — neither needs the answers the general case needs about transactions, `$BORG_TX`, or
+//! which process owns a write.
 //!
 //! ## `--watch`
 //!
@@ -35,10 +44,7 @@ use borg_core::{BorgError, Result};
 use borg_host::ops::{self, Ops};
 use borg_host::render::struct_def;
 use borg_host::serving;
-use borg_protocol::client::{ClientHello, Request, Response, SchemaDef, StructDef};
-use borg_protocol::{Codec, ServerHello};
-use std::io::BufReader;
-use std::os::unix::net::UnixStream;
+use borg_protocol::client::{Request, Response, SchemaDef, StructDef};
 use std::path::{Path, PathBuf};
 
 /// The file a generated module lands in. Named rather than derived from the branch or the schema
@@ -56,8 +62,12 @@ pub struct Generate {
     /// `-o` / `--out`.
     pub out: PathBuf,
     pub watch: bool,
-    /// `--socket`, to override the socket the store's own lock record names.
+    /// From `--url` / `$BORG_URL`: the socket to read through, instead of the one the store's own
+    /// lock record names. See [`read_schema`].
     pub socket: Option<PathBuf>,
+    /// From the same URL: which registry on that socket (SPEC.md §17.6, §17.7). `None` is `None` in
+    /// the handshake, and the server's n=1 convenience decides.
+    pub registry: Option<String>,
 }
 
 pub async fn run(args: &Ops, options: &Generate) -> Result<()> {
@@ -135,18 +145,26 @@ fn write(out: &Path, source: &str) -> Result<PathBuf> {
 
 /// The schema, and a phrase saying how it was obtained. See the module header.
 async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, String)> {
-    // The store's own lock record says both halves of what a connection needs: where the server is
-    // listening, and **what it calls this store** — one socket serves a directory of registries and
-    // the handshake is what routes (§17.6), so a generator that knew only the address would be
-    // asking an arbitrary registry for its schema.
-    let served = serving::served_on(&args.store);
+    // A `--url` is a complete answer — a socket *and* a registry — and it is the only way to
+    // generate against a server whose store this machine cannot see. Without one, the store's own
+    // lock record says both halves: where the server is listening, and **what it calls this store**.
+    // One socket serves a directory of registries and the handshake is what routes (§17.6), so a
+    // generator that knew only the address would be asking an arbitrary registry for its schema.
+    let served = if options.socket.is_some() {
+        None
+    } else {
+        serving::served_on(&args.store)
+    };
     let socket = options
         .socket
         .clone()
         .or_else(|| served.as_ref().map(|served| served.socket.clone()));
     match socket {
         Some(socket) => {
-            let registry = served.and_then(|served| served.registry);
+            let registry = options
+                .registry
+                .clone()
+                .or_else(|| served.and_then(|served| served.registry));
             let schema = over_socket(&socket, registry.as_deref(), args.branch.as_deref())?;
             Ok((schema, format!("through {}", socket.display())))
         }
@@ -161,50 +179,20 @@ async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, Strin
     }
 }
 
-/// The first Rust client of §17.5, and it is deliberately small: connect, hello, one request, one
-/// response. If this needed a client library, the protocol would have the hidden complexity
-/// `scenarios/250-serve` exists to disprove.
+/// One request over §17.5: which registry, and give me its def view.
+///
+/// The connect-greet-ask is `borg_protocol::client::ask` — thirty lines shared with `repo push` and
+/// with `borg-server`'s own lifecycle commands, because a handshake written out four times is four
+/// places to forget a field when the handshake grows one.
+///
+/// The registry comes from the URL, or from the store's lock record so that a server hosting
+/// several is asked about *this* store. Absent where the record predates named registries, which
+/// the server reads as "the sole registry" — the same default a hand-written client takes (§17.6).
 fn over_socket(socket: &Path, registry: Option<&str>, branch: Option<&str>) -> Result<SchemaDef> {
-    let refused = |what: &str, err: &dyn std::fmt::Display| {
-        BorgError::Storage(format!("{}: {what}: {err}", socket.display()))
+    let request = Request::DefView {
+        branch: branch.map(str::to_string),
     };
-    let stream = UnixStream::connect(socket).map_err(|err| refused("cannot connect", &err))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|err| refused("cannot read", &err))?,
-    );
-    let mut writer = stream;
-
-    let _: ServerHello = borg_protocol::read_message(&mut reader, Codec::Json)
-        .map_err(|err| refused("no hello", &err))?;
-    // **No `client_version`.** Generation is asking what the schema *is* right now; stating a
-    // version would be asking what it looked like to somebody else.
-    let hello = ClientHello {
-        version: borg_protocol::client::VERSION,
-        client_version: None,
-        codec: "json".to_string(),
-        // From the store's lock record, so that a server hosting several registries is asked about
-        // *this* one. Absent where the record predates named registries, which the server reads as
-        // "the sole registry" — the same default a hand-written client takes (§17.6).
-        registry: registry.map(str::to_string),
-        // Nothing to present, and nothing checks it yet (§17.6).
-        credential: None,
-    };
-    borg_protocol::write_message(&mut writer, Codec::Json, &hello)
-        .map_err(|err| refused("cannot greet", &err))?;
-    borg_protocol::write_message(
-        &mut writer,
-        Codec::Json,
-        &Request::DefView {
-            branch: branch.map(str::to_string),
-        },
-    )
-    .map_err(|err| refused("cannot ask", &err))?;
-
-    let response: Response = borg_protocol::read_message(&mut reader, Codec::Json)
-        .map_err(|err| refused("no answer", &err))?;
-    match response {
+    match borg_protocol::client::ask(socket, registry, &request)? {
         Response::Defs(schema) => Ok(schema),
         Response::Error { message } => Err(BorgError::Storage(message)),
         other => Err(BorgError::Storage(format!(
@@ -336,10 +324,14 @@ fn preamble(version: &str) -> String {
 export const CLIENT_VERSION = "{version}";
 
 /**
- * Connect to `borg serve`, as a client authored against `{version}`.
+ * Connect to a `borg-server`, as a client authored against `{version}`.
+ *
+ * ```ts
+ * const bc = await createBorgContext({{ url: "borg://localhost/<registry>" }});
+ * ```
  *
  * Every option the SDK's own `createBorgContext` takes except the version, which is not an option
- * here: generation decided it.
+ * here: generation decided it. `$BORG_URL` is read when neither `url` nor `socket` is given.
  */
 export function createBorgContext(
   options: Omit<BorgContextOptions, "clientVersion">,

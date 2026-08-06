@@ -17,7 +17,7 @@ cargo fmt
 ```
 
 There are **two binaries**: `borg` (the client, `crates/borg-cli`) and `borg-server` (the server,
-`crates/borg-server`). Scenarios 250, 260, 270, 280 and 300 start a real server, so both have to be
+`crates/borg-server`). Scenarios 250, 260, 270, 280, 300 and 310 start a real server, so both have to be
 built before `run-all.sh`; `check.sh` builds both.
 
 ```
@@ -54,7 +54,9 @@ crates/borg-storage-sqlite  SQLite backend
 crates/borg-exec            ExecutionProvider + ProducerCtx traits
 crates/borg-exec-native     in-process Rust producers
 crates/borg-exec-process    subprocess producers, over stdio or a unix socket
-crates/borg-protocol        the worker wire contract; `client.rs` is the client one (§17.5)
+crates/borg-protocol        the worker wire contract; `client.rs` is the client one (§17.5) and
+                            holds the thirty-line `ask` every Rust caller speaks it with; `url.rs`
+                            is the connection-url parser a client is configured from (§17.7)
 crates/borg-engine          log, branches, defs, derivation, resolver, registry
 crates/borg-host            what it takes to *host* a store, shared by both binaries: `ops.rs` is
                             what the commands do, `push.rs` is `repo push`, `sidecar.rs` the files
@@ -62,19 +64,24 @@ crates/borg-host            what it takes to *host* a store, shared by both bina
                             directory of registries (§17.6)
 crates/borg-cli             the `borg` binary — argv and printing over `borg-host`, plus
                             `generate.rs`, which emits the typed client (§15). Embedded Borg: it
-                            operates directly on a store nobody is serving, and has no `serve`
+                            operates directly on a store nobody is serving, and has no `serve`.
+                            `generate` and `repo push` are the two commands that take a `--url`
+                            and speak to a server instead (§17.7); the rest take `--store`
 crates/borg-server          the `borg-server` binary — `serve.rs` is `borg-host`'s ops over a
-                            socket, `lifecycle.rs` is start/stop/status/logs, and `client.rs` is
-                            the thirty lines `status` and `create` use to speak to a live server
+                            socket and `lifecycle.rs` is start/stop/status/logs; `status` and
+                            `create` are clients of the server they administer, over
+                            `borg_protocol::client::ask`
 packages/borg-sdk           the TypeScript SDK. Two entry points, deliberately opposite: `borg-sdk`
                             is the author-side DSL and the worker protocol, `borg-sdk/client` is
                             the consumer-side client over `borg-server`. `values.ts` is the one
-                            conversion table both use and `lines.ts` the one framing.
+                            conversion table both use, `lines.ts` the one framing, and
+                            `connection.ts` the url parser — the same table as `borg-protocol`'s,
+                            in the other language — plus the dial and its reconnect (§17.7)
 packages/borg-sdk-py        the Python SDK: the pipeline half, and the neutrality gate on the
                             contract
 scenarios/                  end-to-end scenarios driving the real binaries; `ts-lib.sh` is the
                             skip-if-no-node harness the TypeScript ones share, and `lib.sh` holds
-                            `BORG_SERVER_BIN` for the five that start a server
+                            `BORG_SERVER_BIN` for the six that start a server
 ```
 
 Dependency arrows point inward to `borg-core`. Trait crates (`borg-storage`, `borg-exec`) are
@@ -274,7 +281,22 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   retry in an SDK. **This is why a handshake that cannot be routed to a registry is not refused at
   the handshake**: the error is remembered and handed to the first request that needs a registry,
   which is a channel the client is definitely reading (`ROADMAP.md`, *The handshake names a
-  registry*).
+  registry*). **What that costs a client is now observable rather than theoretical**:
+  `createBorgContext({url})` resolves happily against a registry the server does not host, and the
+  refusal arrives at the first operation. Asserted that way round in `scenarios/310` and in the
+  SDK's client suite, so that the cost is recorded where somebody deciding whether to revisit the
+  deviation will see it.
+- **A client SDK's transparent reconnect is best-effort, and the honest path is the failing one.**
+  A socket the peer has already closed is dropped *before* the next request is written, so an
+  ordinary server bounce costs an idle client nothing — but that depends on the runtime having had a
+  turn to deliver the close. A client that was busy right through the outage discovers it by
+  failing, with `BorgDisconnectedError`, and **nothing is ever retried**: `tx_commit` is not
+  idempotent, so a commit whose answer was lost is indistinguishable from one that never arrived.
+  `scenarios/310` asserts the failing case deliberately, by bouncing the server from inside a
+  blocking call, because it is the case that is easy to stop testing once the happy one works.
+- **The Python SDK has no client half and therefore no url parser.** It is the pipeline half and the
+  neutrality gate on the worker contract (§17.4); nothing in it connects to a `borg-server`. The
+  parser is one file per language that has a client, which today is Rust and TypeScript.
 - **Reading a cell of a struct nobody declared answers an absent envelope rather than an error**, and
   its `origin` reads `derived`. `borg get Wombat#1.nose` prints exactly that, and the SDK reproduces
   it because there is one read path. Pre-dates the SDKs; asserted in `packages/borg-sdk`'s client

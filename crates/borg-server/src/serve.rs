@@ -270,8 +270,19 @@ pub async fn run(host: &Arc<Host>, base: &Ops) -> Result<()> {
     // `kill -9`, not for `^C`. Waking the loop takes a connection, because unlinking a socket does
     // not unblock an `accept` already waiting on it.
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = UnixStream::connect(&socket);
-    let _ = accepting.join();
+    // **The join is conditional on the wake having worked, and that is the whole of the fix for a
+    // server that would not stop.** If the socket file has been removed out from under a running
+    // server — a scenario's `rm -rf` on its scratch directory, a `tmpfiles` sweep, somebody
+    // tidying — there is no longer any way to reach the `accept` that thread is blocked in, and
+    // joining it waits forever: `SIGTERM` arrives, the signal handler runs, and the process hangs
+    // here holding its locks with nothing left that could ever release them. Found by noticing
+    // wedged `borg-server` processes left behind by scenario runs that had removed their own
+    // socket. Skipping the join loses only orderliness — the thread dies with the process a few
+    // lines below, and it can accept nothing, because `stop` is already set and the address it is
+    // listening on no longer exists.
+    if UnixStream::connect(&socket).is_ok() {
+        let _ = accepting.join();
+    }
     // Open connections are threads we do not join: a client mid-request is holding a gate, and a
     // server that waited for every reader to hang up would not stop when told. The lock files and
     // the socket go now, which is what the next `borg` needs.

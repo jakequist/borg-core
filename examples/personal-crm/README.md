@@ -26,31 +26,42 @@ That last one is the whole reason the detail page has a box at the bottom that a
 
 ```
 ./dev.sh              # boots everything, keeps your data
-./dev.sh --reset      # …after deleting the store
+./dev.sh --reset      # …after throwing the registry's store away
 ./dev.sh --no-ui      # api only, on :8787
+./dev.sh --stop       # stop the dev server and exit
+./smoke.sh            # drive the whole thing headless and check it still works
 ```
 
-Needs `node` 22.18+ (it runs `.ts` files by stripping types), `pnpm`, and a `cargo build -p
-borg-cli` — `dev.sh` does the last one for you if `target/debug/borg` is missing.
+Needs `node` 22.18+ (it runs `.ts` files by stripping types), `pnpm`, and a `cargo build -p borg-cli
+-p borg-server` — `dev.sh` does the last one for you if either binary is missing.
 
 Then: <http://localhost:5173>.
 
-### What dev.sh does, and why in that order
+### dev.sh does not own the server
 
-1. builds `borg` and `packages/borg-sdk` if either is stale, and links the SDK into `repo/` and
-   `api/` (it is not published, so it is linked the way every scenario links it);
-2. `borg init`, if there is no store yet;
-3. **`borg repo push` — while nothing is serving.** A served store refuses every other `borg`
-   invocation by name (§17.5), and `repo push` reads a directory off this machine's disk, so it is
-   not on the socket and never can be as it stands. *Pushing a schema means stopping the server.*
-   That constraint is why this is step 3 and `serve` is step 4, and it is why changing the schema
-   means re-running this script rather than typing one command;
-4. `borg serve --socket data/borg.sock`;
-5. `borg generate --lang ts -o api/gen` — which reads **through the socket**, because `generate` is
-   the one command that connects to a served store instead of being turned away by it;
-6. the api, then vite.
+`borg-server` is a process that stays up; `dev.sh` is a script you `^C`. So it **ensures** one —
+`borg-server status || borg-server start` — and leaves it running when the script stops. Only the
+api and vite are the script's to kill. `./dev.sh --stop` is the verb for when you do want it gone.
 
-It is re-runnable, and step 3 pushes unconditionally. `repo push` is a diff over both halves of what
+1. builds `borg`, `borg-server` and `packages/borg-sdk` if any is stale, and links the SDK into
+   `repo/` and `api/` (it is not published, so it is linked the way every scenario links it);
+2. ensures a server on `data/borg.sock`, hosting `data/` as a **directory of registries** (§17.6);
+3. ensures the `personal-crm` registry *through the server*, because a directory appearing under a
+   running server's data dir is a store it has not locked and will not route to;
+4. `borg --url borg+unix://data/borg.sock/personal-crm repo push repo/` — **into the running
+   server**. `repo_push` is a protocol message and the server performs the push against a path on
+   its own disk (§17.6), so there is no push-before-serve ordering left and no restart when you edit
+   the schema. This file used to be built around the opposite and said so at length;
+5. `borg --url … generate --lang ts -o api/gen`, reading the schema the push just landed;
+6. the api with `BORG_URL` set, then vite.
+
+**One string configures every client here** (§17.7): `borg+unix://<socket>/personal-crm` names the
+socket and the registry together, and the CLI, the generator and the api are all pointed at it by
+copying one variable. The socket is named rather than left to the well-known `borg://localhost`
+address on purpose — that is one address per machine, and a demo that took it would fight whatever
+else you are running.
+
+It is re-runnable, and step 4 pushes unconditionally. `repo push` is a diff over both halves of what
 a repo describes — definitions the branch already holds emit nothing, and a producer whose
 implementation fingerprint has not moved emits nothing either (§9.2) — so pushing an unchanged repo
 lands no def layer and says `unchanged: 7 definitions already in force, nothing pushed`. This script
@@ -58,8 +69,33 @@ used to carry its own `cksum` stamp to avoid pushing; both that and the FRICTION
 (#2, #17) are gone.
 
 The other side of the same change: when you *do* edit `repo/pipelines/display_name.ts`, re-running
-this script recomputes every `displayName` in the store under the new code. Before, it recomputed
-none of them and served both builds' output side by side, each labelled `current`.
+this script recomputes every `displayName` in the store under the new code — in the server that is
+already running. Before, it recomputed none of them and served both builds' output side by side,
+each labelled `current`.
+
+### What `--reset` does, and why it stops the server
+
+It stops the server, deletes `data/personal-crm/`, and starts it again. There is no
+`registry_delete` on the protocol and deliberately so: destroying a store over a wire whose
+`credential` nothing checks yet is exactly the shape `borg-server stop` avoided by being a `SIGTERM`
+rather than a message. Throwing a store away is a thing you do with filesystem access, on purpose.
+Only the registry's directory goes — the server's pidfile and log live beside it in `data/`, and the
+log is where the reason a previous run died is written.
+
+### The api survives the server restarting
+
+`api/server.ts` connects with `connect: "on-demand"` and the SDK owns the connection: if no server
+is running when the api starts, every request answers `503` with
+
+```
+no borg server at data/borg.sock — start one with: borg-server start
+```
+
+and the moment a server appears the next request works — no restart, and no connection lifecycle in
+the application. That is FRICTION #11, fixed in the app that reported it. `smoke.sh` boots the whole
+stack headless, exercises create/list/detail, and then does exactly that: stops the server, starts
+the api against nothing, asserts the sentence, starts a server underneath it, and asserts it
+recovers.
 
 ## Layout
 

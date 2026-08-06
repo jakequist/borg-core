@@ -102,6 +102,19 @@ but the precondition: recomputing a source buffer on every push would be worse t
 at all. `290-a-code-change-invalidates` is `examples/personal-crm`'s FRICTION #17, measured again and
 the other way round.
 
+**And a client is one string, and outlives its server.** A connection url — `borg://localhost/crm`,
+or `borg+unix:///tmp/borg.sock/crm` — carries the two halves a client needs as one fact, so they
+cannot be changed independently into a client pointed at one deployment's socket with another's
+registry name. `borg+ws://` is reserved and refused by name rather than left to be invented. The
+TypeScript SDK reconnects: a broken connection is torn down, the next operation dials and
+re-handshakes, and what was in flight fails with an error that says it was **not** retried, because
+`tx_commit` is not idempotent. Transactions survive it by construction, which is what §12.2 was for.
+And nothing listening now says *no borg server at <addr> — start one with: `borg-server start`*,
+identically from the CLI and the SDK — the exact sentence the first application wanted and did not
+have. `examples/personal-crm` sheds server ownership with it: `dev.sh` ensures a server rather than
+being one, pushes its schema into the running one, and the api survives the server being stopped
+under it.
+
 **And serving is a server.** `borg-server` is a binary of its own, hosting a **directory of
 registries** — every store under a data dir, addressable by name, one socket for all of them because
 the handshake routes. The registry is the unit of tenancy, which makes this the local instance of a
@@ -306,6 +319,15 @@ pool must be running rather than what it was built with at boot. *Failing means 
 executing the program the log no longer describes, which is the FRICTION #17 failure arriving by a
 different route.* — `scenarios/250-serve` and `crates/borg-server/src/serve.rs`. The second half is
 the one that needs a live check: it was verified to fail with the pool reload removed.
+
+**S19 — a client is configured by one string, and survives its server restarting.** A url naming a
+registry reaches that registry over a socket hosting several; an address with nothing on it says how
+to start one, in the same words from the CLI and the SDK; and a session that is busy right through a
+server bounce loses exactly the operation that met the dead socket — with an error saying it was not
+retried — and carries on, committing a transaction that was open before the restart. *Failing means
+a client is configured by two variables that can disagree, or that a server restart is an
+application restart, which is what it was.* — `scenarios/310-connection-urls`,
+`packages/borg-sdk/test/client.test.ts` and `crates/borg-protocol/src/url.rs`.
 
 ### Determinism
 
@@ -1407,6 +1429,139 @@ expected to grow a sibling field rather than be replaced — a client that sends
 working against a server that also accepts bytes. What this does **not** do is pre-empt
 `ExecutionProvider`'s container future (§17.3): a container reference is a different way for the
 *server* to find code, which is the same sentence with a different noun.
+
+#### A server would not stop if its socket had been deleted
+
+Found while building the above, and fixed with it. `serve::run` wakes its blocking accept loop by
+connecting to its own socket and then **joins** that thread — but if the socket file has been removed
+out from under a running server (a scenario's `rm -rf` on its scratch directory, a `tmpfiles` sweep,
+somebody tidying), nothing can reach that `accept` any more and the join waits forever: `SIGTERM`
+arrives, the handler runs, and the process hangs holding its advisory locks with nothing left that
+could release them. `borg-server stop` then fails its own patience deadline.
+
+It surfaced as wedged `borg-server` processes accumulating from scenario runs that had failed
+part-way and taken their socket with them — which is exactly the shape of thing that reads as
+"something is slow today" until you count the processes. The fix is to join only when the wake
+connection succeeded; skipping it loses orderliness and nothing else, because the thread dies with
+the process moments later and `stop` is already set. `scenarios/310` also stops its server in a trap,
+since it is the one scenario that restarts servers and can therefore leave one behind.
+
+#### One string configures a client
+
+`borg://localhost/personal-crm`. The two halves a client needs — where the server is, which registry
+on it — are one fact, and carrying them separately is what lets them be changed independently into a
+client pointed at one deployment's socket with another deployment's registry name. `DATABASE_URL`
+is the precedent and it is the shape every deployment system already carries.
+
+**The scheme names the transport, so `borg://` can be redefined and `borg+ws://` cannot be
+invented.** `borg://` means *the local transport*, which today resolves to §17.6's well-known
+address; a client that wrote it keeps working if that address moves. `borg+unix://` is for saying
+the address out loud. `borg+ws://` is parsed and **refused by name** — the browser transport is the
+one that arrives next (SDK-DRAFT §5, `serve::Transport` exists for it), and the cost of not naming
+it now is that three people invent three spellings and the first real one cannot use any of them.
+
+**An absent registry stays absent**, and this is the rule the whole thing turns on. §17.6 already
+decides what no registry means — the sole one at n=1, an error naming the options at n≥2 — so a
+client that defaulted to `main` would be re-implementing half of that and disagreeing with the
+other half. The parser answers `None` and the handshake carries `None`.
+
+**Where the socket ends and the registry begins** was the one real ambiguity. The divider is the
+rule the server already enforces on registry names — letters, digits, `-` and `_` — so the last path
+segment is the registry when it could *be* one and part of the path when it could not, which makes
+`borg+unix:///tmp/borg.sock` read as the socket it obviously is. A trailing slash always means "no
+registry", so both readings of `/run/borg/crm` are sayable. The alternative considered was a query
+parameter (`?registry=crm`), rejected because it is a second syntax doing what the path was already
+doing, and because the two-form grammar then has three shapes instead of two.
+
+**One parser per language, and one deliberate duplication.** `borg_protocol::url` and
+`packages/borg-sdk/src/connection.ts` hold the same table, case for case, because the whole value of
+one string is that the *same* string can be pasted into a variable a Rust CLI reads and a variable a
+node process reads. What is genuinely duplicated rather than shared is the well-known address —
+`$XDG_RUNTIME_DIR` or the data dir — which is `borg_host::host`'s in Rust and cannot be called from
+node; `scenarios/310` is what holds the two answers together. Python's SDK is the pipeline half and
+has no client, so it has no parser and needs none yet.
+
+**Two CLI commands read a url, and the rest are refused.** `borg generate` and `borg repo push` are
+the two that speak to a server rather than opening a store, and `--url`/`$BORG_URL` is theirs.
+Everything else is embedded Borg on a `--store`, and an explicit `--url` on one of those is refused
+rather than ignored — it says the caller meant a server, and what they would silently have got is an
+answer about a file. `$BORG_URL` is ambient and is left alone, for the same reason an exported
+variable does not break every unrelated command. `borg generate --socket` is gone: it named half of
+what a connection is, and the store's own lock record — which names both halves — is still the
+default when no url is given.
+
+#### The SDK reconnects, and never retries
+
+`examples/personal-crm/FRICTION.md` #11: a `borg serve` restart made every later request through an
+existing `BorgContext` throw *forever*, and the only recovery was for the application to build a new
+context — with no event, no flag, and no way to tell "the server is down" from "this context is
+finished". The reconnect story §12.2 was designed for was designed for and not implemented.
+
+**A context is an address, not a socket.** At most one live connection to it; a failed send or read
+tears it down; the next operation dials again and repeats the handshake. The handshake is repeated
+rather than the socket merely re-opened because the handshake is what settles the registry (§17.6) —
+a reconnect that skipped it would be a connection to a server with no idea which store it is for.
+
+**Nothing is retried, and that is the load-bearing half.** `tx_commit` is not idempotent: a commit
+that reached the server and lost its answer on the way back is indistinguishable, from the client,
+from one that never arrived, and re-sending it either merges a second layer or fails against a
+transaction that no longer exists. `tx_create` allocates. So an operation that was in flight fails
+with `BorgDisconnectedError`, whose message says the outcome is unknown and that it was not retried;
+what to do about that needs the application's knowledge of what it was doing. A reader can still
+find out, because a transaction is durable — `bc.transaction(id)` and a read answer whether the
+write landed.
+
+**A socket the peer has already closed is dropped before it is used**, which is what makes an
+ordinary bounce cost nothing rather than one guaranteed failure per client: the close arrived while
+the client was idle, so nothing was in flight and nothing is being retried. It is best-effort by
+construction — it depends on the runtime having had a turn to deliver the close — and a client that
+was busy right through the outage still discovers the outage by failing. `scenarios/310` asserts
+that case deliberately, by bouncing the server from inside a blocking call.
+
+**Transactions survive by construction and needed no code.** A transaction is an id beside the store
+(§12.2), so one begun before a bounce commits after it, and `bc.transaction(id)` picks one up in a
+process that restarted rather than merely reconnected. What that cost was *not* keeping the
+transaction in the connection, which is the tempting shape.
+
+**`connect: "on-demand"`** is the one new knob, and it exists because eager dialling is right for a
+script and wrong for a process that legitimately starts before its server — a supervisor bringing
+both up, a container, an api whose job is to answer `503` until the backend is there. The default is
+unchanged: an error at construction names the address you just configured, and one at first use
+names whichever line happened to be first.
+
+#### Nothing listening says how to start one
+
+`no borg server at <addr> — start one with: borg-server start`, from `borg_protocol::url::
+unreachable` and from the SDK's `BorgUnreachableError`, word for word. It is a `BorgError` variant
+of its own — printed with no prefix — because the whole value of it is the sentence, and a
+`storage:` in front of it is noise in front of the only words a reader needs. It also lets a caller
+tell *the server is down* from *the server said no*, which is the distinction the SDK's separate
+error classes make on the other side.
+
+Anything that is not `ECONNREFUSED`/`ENOENT` is reported as itself. A permission error on a socket
+is news, and telling somebody to start a server they already started would be worse than the errno.
+
+#### The example sheds server ownership
+
+`examples/personal-crm/dev.sh` used to *be* the server's supervisor, and had to be: a schema could
+only be pushed while nothing was serving, so the script's order was load-bearing and changing the
+schema meant re-running the whole thing. Both halves are gone. It **ensures** a server — `status ||
+start` — pushes the repo into the running one by url, and leaves it running when you `^C` the
+script; only the api and the ui are the script's to kill. `./dev.sh --stop` is the verb that
+appears once a server outlives the script that started it.
+
+**`--reset` stops the server, deletes the registry's directory and starts it again**, rather than
+going through the socket. A `registry_delete` message would be a destructive operation on a wire
+whose `credential` nothing checks yet — which is the same argument that made `stop` a `SIGTERM`
+rather than a protocol message. Throwing a store away is a thing you do with filesystem access, on
+purpose. Only the registry's directory goes; the server's pidfile and log live beside it and are
+where the reason a previous run died is written.
+
+The api moved to `BORG_URL` and `connect: "on-demand"`, which is the FRICTION #11 fix arriving in
+the application that reported it: it starts before its server, answers `503` with the sentence
+naming the fix, and works the moment a server appears — with no restart and no connection lifecycle
+of its own. `smoke.sh` is that observation made repeatable; it is a tool and not a scenario, for the
+reason the example's README already gives.
 
 ### Performance, tooling and tests
 

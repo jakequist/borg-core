@@ -394,6 +394,26 @@ meaningful. The reconnect story is *designed for* and not *implemented*.
 **Severity** medium-high for a server-side client. For the browser client SDK-DRAFT §2.5 anticipates,
 it will be blocking — a laptop lid closing is this.
 
+### Fixed — the SDK reconnects, and the api no longer owns a lifecycle
+
+A `BorgContext` is an address now rather than a socket. A failed send or read tears the connection
+down and the next operation dials again and repeats the handshake; a socket the peer has already
+closed is dropped *before* the next request is written, so an ordinary `borg-server` bounce costs an
+idle client nothing at all. **Nothing is retried**, and that half is deliberate: `tx_commit` is not
+idempotent, so an operation that was in flight fails with `BorgDisconnectedError` — a class of its
+own, saying in words that it was not retried and that its outcome is unknown. Transactions survive
+by construction, which is what §12.2 was always for: one begun before a bounce commits after it.
+
+The api is where the difference shows. It connects `on-demand`, so it starts *before* its server
+without dying; with nothing listening it answers `503` with `no borg server at <addr> — start one
+with: borg-server start`, and the moment a server appears the next request works. No restart, no
+`reconnect()` call, no flag for the application to drive. `./smoke.sh` asserts exactly that
+sequence, and `scenarios/310-connection-urls` asserts the harder version of it — a client busy right
+through the outage, which is the one that discovers the outage by failing.
+
+What this entry asked for was "at minimum an event or a flag; ideally that `BorgContext` reconnect on
+demand". There is a `bc.connected` flag, and the reconnect is the ideal one.
+
 ---
 
 ## 12. The app's only write cannot conflict, so `ConflictError` is written blind

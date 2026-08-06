@@ -1,0 +1,26 @@
+{
+  // What a user's project looks like, as in 260 — except that there is no generated module here.
+  // The point of this one is the *connection*, and a client configured by a url is an ordinary
+  // un-generated client: it names structs as strings and gets values as text, which is what is
+  // honestly known about a schema this process never read.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    // Node runs these files by erasing types rather than compiling them, so nothing that needs an
+    // emit may appear.
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["client.ts"]
+}

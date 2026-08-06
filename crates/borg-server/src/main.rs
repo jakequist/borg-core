@@ -35,7 +35,6 @@ use borg_host::ops::Ops;
 use borg_protocol::client::RegistryInfo;
 use std::path::PathBuf;
 
-mod client;
 mod lifecycle;
 mod serve;
 

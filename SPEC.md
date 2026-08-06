@@ -2592,6 +2592,64 @@ exactly what they mean. For a remote one it means nothing, and the answer there 
 artifact — a further field on the same message, not a different message, which is why `path` is
 optional and why the payload is expected to grow rather than to be replaced.
 
+### 17.7 How a client is addressed
+
+§17.6 is what a server is. This is how a client is told which one, and which registry on it: **one
+string, the way a `DATABASE_URL` is one string.**
+
+```text
+borg://localhost/personal-crm               the well-known local address, registry personal-crm
+borg://localhost                            the well-known local address, no registry named
+borg+unix:///run/user/1000/borg.sock/crm    an explicit socket, registry crm
+borg+unix:///tmp/borg.sock                  an explicit socket, no registry named
+borg+ws://borg.example/crm                  reserved; parsed and refused
+```
+
+Everything a client needs to reach a store is *where the server is* and *which registry on it*, and
+those two are one fact. Carried separately — a socket variable and a registry variable, a flag and
+an environment variable — they can be changed independently, which is how a client ends up pointed
+at one deployment's socket with another deployment's registry name. A URL is the shape that cannot
+come apart, and it is the shape every deployment system already knows how to carry.
+
+**The scheme names the transport.** `borg://` is *the* local transport, whatever that is; today it
+resolves to the well-known address §17.6 defines, and a client that wrote `borg://localhost/crm`
+keeps working if that address ever moves. `borg+unix://` says the address out loud, for a scenario,
+a second server, or a container mount. `borg+ws://` is **reserved** for the transport a browser can
+open, and is parsed and refused by name — because the alternative is that everyone who needs one
+first invents a different spelling for it, and the wire is then unable to take the real one.
+
+**An absent registry is absent.** The parser does not default it, and neither does any client. §17.6
+already says what an absent registry means — the sole registry at n=1, an error naming the options
+at n≥2 — and a client that filled in a guess would be re-implementing half of that rule and
+disagreeing with the other half. So an absent registry travels absent in `ClientHello`.
+
+**For `borg+unix://`, the last path segment is the registry when it could be one.** The path holds
+both halves, so something has to divide them, and the divider is the rule §17.6 already enforces on
+registry names: letters, digits, `-` and `_`. `borg+unix:///tmp/borg.sock` is therefore all socket,
+because `borg.sock` has a dot in it and no registry may. A trailing slash always means "no
+registry", which is what makes both readings of a genuinely ambiguous path sayable:
+`borg+unix:///run/borg/crm` is the socket `/run/borg` and the registry `crm`, and
+`borg+unix:///run/borg/crm/` is the socket `/run/borg/crm`.
+
+**Nothing listening is not an errno.** `ECONNREFUSED` and `ENOENT` on a borg address mean one thing,
+and every client reports it in the same words:
+
+```text
+no borg server at /run/user/1000/borg.sock — start one with: borg-server start
+```
+
+Anything else — a permission error, a path that is not a socket — is reported as itself, because
+then the error *is* the news.
+
+**A connection outlives a socket.** A client SDK reconnects: a failed send or read tears the
+connection down, and the next operation dials again and repeats the handshake — including the
+registry, which is what a connection settles rather than a message. Operations that were in flight
+when it broke **fail, and are never retried**, because `tx_commit` and `tx_create` are not
+idempotent: a commit that reached the server and lost its answer on the way back is
+indistinguishable, from the client, from one that never arrived. What survives is the transaction
+itself, and by construction rather than by machinery — a transaction is an id beside the store
+(§12.2), so one begun before a server restart commits after it.
+
 ---
 
 ## 18. v1 Scope

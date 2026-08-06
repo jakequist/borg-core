@@ -16,8 +16,11 @@
 #       BORG_BIN=…   which binary to measure. Point it at another build to compare two.
 #       API_PORT=…   defaults to 8791, so this does not collide with a dev.sh you have running.
 #
-# It boots the whole stack through `dev.sh --headless` — a real store, a real `borg serve`, the real
-# api over the real socket — because a measurement taken through a stand-in measures the stand-in.
+# It boots the whole stack through `dev.sh --headless` — a real registry, a real `borg-server`, the
+# real api over the real socket — because a measurement taken through a stand-in measures the
+# stand-in. It hosts its **own** data directory, on its own socket, for the same reason it takes its
+# own port: a benchmark that reset the store a reader had a dev.sh pointed at would be a rude
+# benchmark. `dev.sh` no longer owns the server it starts, so this script stops the one it caused.
 
 set -euo pipefail
 
@@ -26,6 +29,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 
 API_PORT="${API_PORT:-8791}"
 BORG_BIN="${BORG_BIN:-$ROOT/target/debug/borg}"
+BORG_SERVER_BIN="${BORG_SERVER_BIN:-$ROOT/target/debug/borg-server}"
+# Its own data directory and therefore its own socket, so a dev.sh running beside this is untouched.
+CRM_DATA="$HERE/data-bench"
 CHECKPOINTS="45 60 80 100 140"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,12 +46,19 @@ API="http://localhost:$API_PORT/api"
 say() { printf '\033[1m▸ %s\033[0m\n' "$*" >&2; }
 die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; [ -f "$LOG" ] && tail -30 "$LOG" >&2; exit 1; }
 
-# `--reset` throws the store away, so every run measures a log this run built. Backgrounded, and its
-# own trap tears down the server, the api and the workers when we kill it.
-say "booting the crm on $BORG_BIN (port $API_PORT) — log: $LOG"
-BORG_BIN="$BORG_BIN" API_PORT="$API_PORT" "$HERE/dev.sh" --reset --headless >"$LOG" 2>&1 &
+# `--reset` throws this run's store away, so every run measures a log this run built. Backgrounded;
+# its trap tears down the api and the workers when we kill it, and the server it ensured is stopped
+# here — a server outliving the script that started it is the right default and the wrong thing to
+# leave behind after a benchmark.
+say "booting the crm on $BORG_BIN (port $API_PORT, data $CRM_DATA) — log: $LOG"
+CRM_DATA="$CRM_DATA" BORG_BIN="$BORG_BIN" BORG_SERVER_BIN="$BORG_SERVER_BIN" API_PORT="$API_PORT" \
+    "$HERE/dev.sh" --reset --headless >"$LOG" 2>&1 &
 DEV=$!
-cleanup() { kill "$DEV" 2>/dev/null || true; wait "$DEV" 2>/dev/null || true; }
+cleanup() {
+    kill "$DEV" 2>/dev/null || true
+    wait "$DEV" 2>/dev/null || true
+    CRM_DATA="$CRM_DATA" BORG_SERVER_BIN="$BORG_SERVER_BIN" "$HERE/dev.sh" --stop >/dev/null 2>&1 || true
+}
 trap cleanup EXIT INT TERM
 
 for _ in $(seq 300); do

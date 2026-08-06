@@ -30,10 +30,14 @@ import {
 export const CLIENT_VERSION = "L4";
 
 /**
- * Connect to `borg serve`, as a client authored against `L4`.
+ * Connect to a `borg-server`, as a client authored against `L4`.
+ *
+ * ```ts
+ * const bc = await createBorgContext({ url: "borg://localhost/<registry>" });
+ * ```
  *
  * Every option the SDK's own `createBorgContext` takes except the version, which is not an option
- * here: generation decided it.
+ * here: generation decided it. `$BORG_URL` is read when neither `url` nor `socket` is given.
  */
 export function createBorgContext(
   options: Omit<BorgContextOptions, "clientVersion">,

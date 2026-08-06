@@ -45,6 +45,14 @@ use std::io::{BufRead, Write};
 /// them living in one crate.
 pub mod client;
 
+/// **How a client is told where to connect** — one string, like `DATABASE_URL` (SPEC.md §17.7).
+///
+/// Beside the protocol rather than inside it because a URL never crosses the wire: it is what a
+/// client parses in order to *decide* what to dial and what to put in `ClientHello::registry`. It
+/// lives here because there must be one parser per language, and this crate is the one both the
+/// `borg` CLI and `borg-server` already depend on.
+pub mod url;
+
 pub const VERSION: u32 = 1;
 
 /// How messages are encoded on the wire.

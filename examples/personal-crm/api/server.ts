@@ -13,8 +13,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
   BorgClientError,
+  BorgDisconnectedError,
   BorgProtocolError,
   BorgStateError,
+  BorgUnreachableError,
   ConflictError,
   type BorgContext,
   type BranchHandle,
@@ -22,12 +24,15 @@ import {
 } from "borg-sdk/client";
 import { Contact, CLIENT_VERSION, createBorgContext } from "./gen/borg.generated.ts";
 
-const SOCKET = process.env.BORG_SOCKET;
+// One string says where the server is and which registry on it (§17.7). `dev.sh` sets it; a
+// deployment sets it the way it sets any other connection string. Not spelled `URL`, which is the
+// global the router below constructs.
+const BORG_URL = process.env.BORG_URL;
 const PORT = Number(process.env.PORT ?? 8787);
 const BRANCH = process.env.BORG_BRANCH ?? "main";
 
-if (SOCKET === undefined) {
-  throw new Error("BORG_SOCKET is not set — start `borg serve --socket <path>` first (see dev.sh)");
+if (BORG_URL === undefined) {
+  throw new Error("BORG_URL is not set — try borg://localhost/personal-crm, or see dev.sh");
 }
 
 // ── The fields this app knows about ───────────────────────────────────────────────────────────────
@@ -211,15 +216,34 @@ function failure(err: unknown): { status: number; body: Record<string, unknown> 
   if (err instanceof BorgClientError) {
     return { status: 400, body: { kind: "rejected", message: err.message } };
   }
-  if (err instanceof BorgProtocolError) {
+  // The two shapes of "there is no conversation right now", separated because a caller can act on
+  // the difference. `BorgUnreachableError` means nothing is listening and the message already says
+  // how to fix that; `BorgDisconnectedError` means the connection broke mid-request and the SDK
+  // deliberately did **not** retry it, because a `tx_commit` retry can apply twice. Neither is
+  // fatal to this process any more: the context reconnects on the next request, which is the whole
+  // of FRICTION #11.
+  if (err instanceof BorgUnreachableError) {
+    return {
+      status: 503,
+      body: {
+        kind: "no_server",
+        message: err.message,
+        hint: "this api reconnects on its own once a server is there — no restart needed",
+      },
+    };
+  }
+  if (err instanceof BorgDisconnectedError) {
     return {
       status: 503,
       body: {
         kind: "disconnected",
         message: err.message,
-        hint: "`borg serve` is not answering — is it still running?",
+        hint: "not retried on purpose: a commit whose answer was lost may already have landed",
       },
     };
+  }
+  if (err instanceof BorgProtocolError) {
+    return { status: 502, body: { kind: "protocol", message: err.message } };
   }
   return { status: 500, body: { kind: "error", message: String(err) } };
 }
@@ -251,7 +275,12 @@ async function readBody(req: IncomingMessage): Promise<Record<string, string>> {
   return out;
 }
 
-const bc = await createBorgContext({ socket: SOCKET });
+// **`on-demand`, because this process legitimately starts before its server does.** A supervisor
+// brings both up and does not promise an order; `dev.sh --reset` stops the server underneath a
+// running api. Answering `503` with a sentence naming the fix, and then working the moment a server
+// appears, is what a long-lived client should do — and it needs no connection lifecycle here,
+// because the SDK owns it now (FRICTION #11).
+const bc = await createBorgContext({ url: BORG_URL, connect: "on-demand" });
 const branch = bc.branch(BRANCH);
 
 const server = createServer((req, res) => {
@@ -302,7 +331,7 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`crm api on http://localhost:${PORT} — borg ${SOCKET}, branch ${BRANCH}, client ${CLIENT_VERSION}`);
+  console.log(`crm api on http://localhost:${PORT} — borg ${BORG_URL}, branch ${BRANCH}, client ${CLIENT_VERSION}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

@@ -1,12 +1,13 @@
 /**
  * # borg-sdk/client
  *
- * The consumer-side SDK: read and write data through transactions, over `borg serve`'s socket.
+ * The consumer-side SDK: read and write data through transactions, over `borg-server`'s socket.
  *
  * ```ts
  * import { Company, createBorgContext } from "./borg.generated.js";
  *
- * const bc = await createBorgContext({ socket: "/tmp/borg.sock" });
+ * // One string says where the server is and which registry on it (§17.7). `$BORG_URL` if omitted.
+ * const bc = await createBorgContext({ url: "borg://localhost/personal-crm" });
  * const tx = await bc.branch("main").begin();
  * const c = tx.object(Company, "o-100");   // a handle; no I/O yet
  * const hc = await c.get("headcount");     // read → recorded → guarded at commit
@@ -33,9 +34,27 @@
  * **It holds no transaction state.** A transaction is an id. It lives beside the store, not in this
  * connection (§12.2), so [`BorgContext.transaction`] can pick one up after a reconnect and one
  * nobody comes back for is the idle reaper's problem (§12.3).
+ *
+ * ## …and one thing it now does: reconnect
+ *
+ * A `BorgContext` outlives its socket. A failed send or read tears the connection down and the
+ * *next* operation dials again and re-handshakes; operations that were in flight when it broke fail
+ * with [`BorgDisconnectedError`] and are **never** retried. See that class for why the retry is the
+ * application's decision and not this library's.
+ *
+ * Transactions survive a reconnection by construction rather than by machinery: a transaction is an
+ * id beside the store (§12.2), so one begun before a server bounce commits after it — the handle
+ * outlives the socket that produced it, and [`BorgContext.transaction`] is how a process that lost
+ * its context picks one up.
  */
 
-import { openUnixSocket } from "./connection.js";
+import {
+  borgSocket,
+  dialBorgServer,
+  parseBorgUrl,
+  URL_ENV,
+  type BorgUrl,
+} from "./connection.js";
 import { BorgProtocolError, LineStream, type MessageStream } from "./lines.js";
 import type {
   BranchInfo,
@@ -70,6 +89,13 @@ export {
 // has to read as one word. See `RefText` in ./values.ts for why a client gets a branded string.
 export type { RefText as Ref } from "./values.js";
 export { BorgProtocolError } from "./lines.js";
+export {
+  BorgUnreachableError,
+  BorgUrlError,
+  parseBorgUrl,
+  wellKnownSocket,
+  type BorgUrl,
+} from "./connection.js";
 export type {
   BranchInfo,
   WireEnvelope,
@@ -84,6 +110,38 @@ export type {
 /** Anything the server refused that is not a conflict: a bad cell, a rejected write, an expired tx. */
 export class BorgClientError extends Error {
   override readonly name = "BorgClientError";
+}
+
+/**
+ * **The connection broke while this operation was in flight, and it was not retried.**
+ * `examples/personal-crm/FRICTION.md` #11.
+ *
+ * The context is *not* finished: it drops the dead socket and the next operation dials again and
+ * re-handshakes. What it will not do is redo this one, and that is a decision rather than an
+ * omission — **a retried `tx_commit` can apply twice.** A commit that reached the server and whose
+ * answer was lost on the way back is indistinguishable, from here, from one that never arrived; the
+ * first is already merged and re-sending it either merges a second layer or fails against a
+ * transaction that no longer exists. The same is true of `tx_create`, which allocates. So the
+ * outcome of *this* operation is **unknown** and saying so is the only honest thing available; what
+ * to do about it needs the application's knowledge of what it was doing, which an SDK does not
+ * have. A reader can find out: a transaction is durable (§12.2), so `bc.transaction(id)` and a read
+ * answer whether the write landed.
+ *
+ * It is a [`BorgProtocolError`], so code that already treated "the socket went away" as one kind of
+ * thing keeps working; the subclass is what lets code that cares tell it from a malformed message.
+ */
+export class BorgDisconnectedError extends BorgProtocolError {
+  override readonly name = "BorgDisconnectedError";
+  /** The address the connection was to. */
+  readonly address: string;
+
+  constructor(address: string, why: string) {
+    super(
+      `${why} (${address}) — this operation was not retried, so whether it took effect is ` +
+        `unknown; the next one reconnects`,
+    );
+    this.address = address;
+  }
 }
 
 /**
@@ -356,8 +414,33 @@ export interface BranchHandle {
 }
 
 export interface BorgContextOptions {
-  /** The unix socket `borg serve --socket` is listening on. */
-  socket: string;
+  /**
+   * **A connection url: where the server is and which registry on it, in one string** (§17.7).
+   *
+   * ```ts
+   * createBorgContext({ url: "borg://localhost/personal-crm" });
+   * createBorgContext({ url: "borg+unix:///tmp/borg.sock/personal-crm" });
+   * ```
+   *
+   * `$BORG_URL` is read when neither this nor [`socket`](BorgContextOptions.socket) is given, which
+   * is what makes a deployment configurable without a code change. See `parseBorgUrl` for the
+   * grammar and for why an absent registry stays absent.
+   */
+  url?: string;
+  /**
+   * The unix socket a `borg-server` is listening on — **the explicit form**, for when the two
+   * halves are already separate variables and assembling a url out of them would be theatre.
+   * Mutually exclusive with [`url`](BorgContextOptions.url).
+   */
+  socket?: string;
+  /**
+   * Which registry on that socket (§17.6). Goes with [`socket`](BorgContextOptions.socket); a url
+   * names its own.
+   *
+   * **Absent is absent in the handshake**, and the server answers with its sole registry when it
+   * hosts exactly one and names the options when it hosts more. Nothing is guessed here.
+   */
+  registry?: string;
   /**
    * The def-layer this client's code was generated from — its ClientVersion (§5.4).
    *
@@ -366,6 +449,21 @@ export interface BorgContextOptions {
    * offer it as an option, because generation is what decided it.
    */
   clientVersion?: string;
+  /**
+   * **When to dial.** `"now"` is the default and is right for anything short-lived: an error at
+   * construction names the address you just configured, and one at first use names whichever line
+   * happened to be first.
+   *
+   * `"on-demand"` is for a process that legitimately starts *before* its server — a supervisor
+   * bringing both up, a container, a dev script, an api whose job is to answer `503` until the
+   * backend is there. It is the honest spelling of "I will find out at first use", and it exists so
+   * that such a process does not have to own connection lifecycle by hand, which is exactly what
+   * `examples/personal-crm/FRICTION.md` #11 said it should not have to. A url that is not a url is
+   * still refused here, whichever is chosen: that is a mistake, not an outage.
+   */
+  connect?: "now" | "on-demand";
+  /** The environment `$BORG_URL` and the well-known address are read from. For tests. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface BorgContext {
@@ -381,6 +479,16 @@ export interface BorgContext {
    * same id on a new socket and carries on.
    */
   transaction(id: string): Tx;
+  /** The address this context connects to. What an error message or a health check wants. */
+  readonly address: string;
+  /**
+   * Whether a connection is up **right now**, without asking the server anything.
+   *
+   * `false` means either "not dialled since the last failure" or "torn down", which from here are
+   * the same state: the next operation dials. It is deliberately not a liveness probe — a probe
+   * that answered `true` would be answering about the moment before the one you care about.
+   */
+  readonly connected: boolean;
   close(): void;
 }
 
@@ -389,69 +497,251 @@ export interface BorgContext {
 type Wire = MessageStream<Response | ServerHello, Request | ClientHello>;
 
 /**
- * Connect to `borg serve` and complete the handshake.
+ * Connect to a `borg-server` and complete the handshake.
  *
  * The server speaks first and always in JSON — a handshake cannot be encoded in a codec that has not
  * been agreed yet — and JSON is also all this SDK offers back: MessagePack would buy a dependency,
  * and being dependency-free is what lets this package be dropped into anything.
+ *
+ * **It dials here rather than at first use**, which is the same choice as before: an error at
+ * construction names the thing you just configured, and one at first use names whatever line
+ * happened to be first. What is new is that this is no longer the *only* dial — see [`Session`].
  */
 export async function createBorgContext(options: BorgContextOptions): Promise<BorgContext> {
-  const socket = await openUnixSocket(options.socket, `borg socket ${options.socket}`);
-  const wire: Wire = new LineStream(socket, socket, () => socket.end(), "the server");
-
-  const hello = await wire.receive();
-  if (hello === null) throw new BorgProtocolError("the server hung up before saying hello");
-  if (!("version" in hello) || !("codecs" in hello)) {
-    throw new BorgProtocolError(`the server's opening message was not a hello: ${stringify(hello)}`);
-  }
-  const reply: ClientHello = { version: hello.version, codec: "json" };
-  if (options.clientVersion !== undefined) reply.client_version = options.clientVersion;
-  wire.send(reply);
-
-  return new Context(wire);
+  // Resolved before anything is dialled, so that a malformed url is refused whichever mode this is
+  // in: a url that is not a url is a mistake, not an outage.
+  const session = new Session(whereToConnect(options), options.clientVersion);
+  if (options.connect !== "on-demand") await session.connect();
+  return new Context(session);
 }
 
-class Context implements BorgContext {
-  readonly #wire: Wire;
+/** Where a set of options says to connect, and which registry to name. */
+function whereToConnect(options: BorgContextOptions): { socket: string; registry: string | undefined } {
+  const env = options.env ?? process.env;
+  if (options.url !== undefined && options.socket !== undefined) {
+    throw new BorgClientError(
+      "createBorgContext takes a url or a socket, not both — a url already names the socket",
+    );
+  }
+  if (options.url !== undefined) {
+    if (options.registry !== undefined) {
+      throw new BorgClientError(
+        `createBorgContext was given both a url and a registry — \`${options.url}\` names its own`,
+      );
+    }
+    return connectionOf(parseBorgUrl(options.url), env);
+  }
+  if (options.socket !== undefined) {
+    return { socket: options.socket, registry: options.registry };
+  }
+  const ambient = env[URL_ENV];
+  if (ambient === undefined || ambient === "") {
+    throw new BorgClientError(
+      `createBorgContext needs somewhere to connect: pass { url: "borg://localhost/<registry>" }, ` +
+        `or { socket }, or set $${URL_ENV}`,
+    );
+  }
+  return connectionOf(parseBorgUrl(ambient), env);
+}
 
-  constructor(wire: Wire) {
-    this.#wire = wire;
+function connectionOf(
+  url: BorgUrl,
+  env: NodeJS.ProcessEnv,
+): { socket: string; registry: string | undefined } {
+  return { socket: borgSocket(url, env), registry: url.registry ?? undefined };
+}
+
+/**
+ * **One address, and however many connections it takes.** `examples/personal-crm/FRICTION.md` #11.
+ *
+ * A `BorgContext` used to *be* a socket, so a server restart made it permanently useless and the
+ * only recovery was for the application to build a new one — with no event, no flag and no way to
+ * tell "the server is down" from "this context is finished". This is the piece that was missing: an
+ * address, at most one live connection to it, and a redial on the next operation after a failure.
+ *
+ * **Nothing is retried.** A request that was in flight when the socket broke fails with
+ * [`BorgDisconnectedError`] and stops there; see that class for why a `tx_commit` in particular
+ * must not be re-sent. The redial happens for the *next* operation, which the caller chose to make.
+ */
+class Session {
+  readonly #address: { socket: string; registry: string | undefined };
+  readonly #clientVersion: string | undefined;
+  #wire: Wire | null = null;
+  /** A dial in progress, so two concurrent operations open one socket rather than two. */
+  #dialling: Promise<Wire> | null = null;
+  #closed = false;
+
+  constructor(
+    address: { socket: string; registry: string | undefined },
+    clientVersion: string | undefined,
+  ) {
+    this.#address = address;
+    this.#clientVersion = clientVersion;
   }
 
-  branch(name?: string): BranchHandle {
-    return new Branch(this.#wire, name);
+  get address(): string {
+    return this.#address.socket;
   }
 
-  async branches(): Promise<BranchInfo[]> {
-    return expect(await ask(this.#wire, { branch_list: {} }), "branches");
+  get connected(): boolean {
+    return this.#wire !== null;
   }
 
-  transaction(id: string): Tx {
-    return new Transaction(this.#wire, id);
+  /** Dial now, so that a misconfigured address fails where it was configured. */
+  async connect(): Promise<void> {
+    await this.#connection();
+  }
+
+  #connection(): Promise<Wire> {
+    if (this.#closed) {
+      throw new BorgClientError("this BorgContext is closed");
+    }
+    // **A socket the peer has already closed is dropped before it is used, not after.** This is
+    // what makes a server bounce cost nothing rather than one guaranteed failure per client: the
+    // close arrived while this process was idle, so nothing was in flight and nothing is being
+    // retried — the request about to be made has not been sent anywhere yet.
+    if (this.#wire !== null && this.#wire.closed) this.#drop(this.#wire);
+    if (this.#wire !== null) return Promise.resolve(this.#wire);
+    this.#dialling ??= this.#dial().then(
+      (wire) => {
+        this.#dialling = null;
+        // A context closed while the dial was in flight must not adopt the socket it opened.
+        if (this.#closed) {
+          wire.close();
+          throw new BorgClientError("this BorgContext is closed");
+        }
+        this.#wire = wire;
+        return wire;
+      },
+      (err: unknown) => {
+        this.#dialling = null;
+        throw err;
+      },
+    );
+    return this.#dialling;
+  }
+
+  async #dial(): Promise<Wire> {
+    const socket = await dialBorgServer(this.#address.socket);
+    const wire: Wire = new LineStream(socket, socket, () => socket.end(), "the server");
+
+    const hello = await wire.receive();
+    if (hello === null) throw new BorgProtocolError("the server hung up before saying hello");
+    if (!("version" in hello) || !("codecs" in hello)) {
+      throw new BorgProtocolError(
+        `the server's opening message was not a hello: ${stringify(hello)}`,
+      );
+    }
+    const reply: ClientHello = { version: hello.version, codec: "json" };
+    if (this.#clientVersion !== undefined) reply.client_version = this.#clientVersion;
+    // **The registry is settled here, once per connection** (§17.6) — which is exactly why a
+    // reconnect has to re-handshake rather than merely re-open: a new socket that skipped this
+    // would be a connection to a server with no idea which store it is for.
+    if (this.#address.registry !== undefined) reply.registry = this.#address.registry;
+    wire.send(reply);
+    return wire;
+  }
+
+  /** One request, one reply, with `error` turned into a throw and `conflict` optionally allowed. */
+  async ask(request: Request, options?: { conflicts: boolean }): Promise<Response> {
+    const wire = await this.#connection();
+    let reply: Response | ServerHello | null;
+    try {
+      reply = await wire.request(request);
+    } catch (err) {
+      this.#drop(wire);
+      // The framing layer's own words, rewritten to say what a caller has to decide about: the
+      // socket is gone, this operation was not retried, and the next one will reconnect.
+      throw new BorgDisconnectedError(
+        this.#address.socket,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    if (reply === null) {
+      this.#drop(wire);
+      throw new BorgDisconnectedError(this.#address.socket, "the server hung up");
+    }
+    if ("error" in reply) throw new BorgClientError(reply.error.message);
+    if ("conflict" in reply && options?.conflicts !== true) {
+      throw new ConflictError(reply.conflict.cell, reply.conflict.reason, reply.conflict.message);
+    }
+    return reply as Response;
+  }
+
+  /**
+   * Tear a connection down, if it is still the current one.
+   *
+   * Guarded on identity because several operations can be in flight over one socket and every one
+   * of them fails when it breaks: without the check, the second failure would discard a connection
+   * the first had already replaced.
+   */
+  #drop(wire: Wire): void {
+    if (this.#wire !== wire) return;
+    this.#wire = null;
+    try {
+      wire.close();
+    } catch {
+      // Closing a socket that is already gone is not news.
+    }
   }
 
   close(): void {
-    this.#wire.close();
+    this.#closed = true;
+    const wire = this.#wire;
+    this.#wire = null;
+    if (wire !== null) wire.close();
+  }
+}
+
+class Context implements BorgContext {
+  readonly #session: Session;
+
+  constructor(session: Session) {
+    this.#session = session;
+  }
+
+  get address(): string {
+    return this.#session.address;
+  }
+
+  get connected(): boolean {
+    return this.#session.connected;
+  }
+
+  branch(name?: string): BranchHandle {
+    return new Branch(this.#session, name);
+  }
+
+  async branches(): Promise<BranchInfo[]> {
+    return expect(await this.#session.ask({ branch_list: {} }), "branches");
+  }
+
+  transaction(id: string): Tx {
+    return new Transaction(this.#session, id);
+  }
+
+  close(): void {
+    this.#session.close();
   }
 }
 
 class Branch implements BranchHandle {
-  readonly #wire: Wire;
+  readonly #session: Session;
   readonly name: string | undefined;
 
-  constructor(wire: Wire, name: string | undefined) {
-    this.#wire = wire;
+  constructor(session: Session, name: string | undefined) {
+    this.#session = session;
     this.name = name;
   }
 
   async begin(): Promise<Tx> {
-    const { tx } = expect(await ask(this.#wire, { tx_begin: { branch: this.name } }), "tx");
-    return new Transaction(this.#wire, tx);
+    const { tx } = expect(await this.#session.ask({ tx_begin: { branch: this.name } }), "tx");
+    return new Transaction(this.#session, tx);
   }
 
   async get(cell: string, options?: ReadOptions & { as?: AnyFieldType }): Promise<Resolved<never>> {
     const wire = expect(
-      await ask(this.#wire, {
+      await this.#session.ask({
         get: {
           branch: this.name,
           cell,
@@ -466,7 +756,10 @@ class Branch implements BranchHandle {
 
   async list(struct: StructDescriptor<unknown, string> | string): Promise<never[]> {
     const name = typeof struct === "string" ? struct : struct.name;
-    const ids = expect(await ask(this.#wire, { list: { branch: this.name, struct: name } }), "ids");
+    const ids = expect(
+      await this.#session.ask({ list: { branch: this.name, struct: name } }),
+      "ids",
+    );
     // Branded, not converted: an id is a PID and a PID is its text (§3.1). The brand is a claim
     // about which struct it belongs to, which the descriptor is what made checkable.
     return ids as never[];
@@ -474,40 +767,40 @@ class Branch implements BranchHandle {
 
   async explain(cell: string): Promise<Lineage> {
     const wire: WireLineage = expect(
-      await ask(this.#wire, { explain: { branch: this.name, cell } }),
+      await this.#session.ask({ explain: { branch: this.name, cell } }),
       "lineage",
     );
     return wire;
   }
 
   async head(): Promise<string> {
-    return expect(await ask(this.#wire, { branch_head: { branch: this.name } }), "head").layer;
+    return expect(await this.#session.ask({ branch_head: { branch: this.name } }), "head").layer;
   }
 
   async defs(): Promise<WireSchemaDef> {
-    return expect(await ask(this.#wire, { def_view: { branch: this.name } }), "defs");
+    return expect(await this.#session.ask({ def_view: { branch: this.name } }), "defs");
   }
 }
 
 class Transaction implements Tx {
-  readonly #wire: Wire;
+  readonly #session: Session;
   readonly id: string;
 
-  constructor(wire: Wire, id: string) {
-    this.#wire = wire;
+  constructor(session: Session, id: string) {
+    this.#session = session;
     this.id = id;
   }
 
   object(struct: StructDescriptor<unknown> | string, id: string): ObjectHandle<never> {
     const descriptor = typeof struct === "string" ? undefined : struct;
     const name = typeof struct === "string" ? struct : struct.name;
-    return new Handle(this.#wire, this.id, name, id, descriptor) as ObjectHandle<never>;
+    return new Handle(this.#session, this.id, name, id, descriptor) as ObjectHandle<never>;
   }
 
   async create(struct: StructDescriptor<unknown> | string): Promise<ObjectHandle<never>> {
     const name = typeof struct === "string" ? struct : struct.name;
     const { id } = expect(
-      await ask(this.#wire, { tx_create: { tx: this.id, struct: name } }),
+      await this.#session.ask({ tx_create: { tx: this.id, struct: name } }),
       "created",
     );
     // The same handle `object()` builds, on an id the server chose rather than one the caller had.
@@ -517,7 +810,7 @@ class Transaction implements Tx {
   }
 
   async commit(): Promise<string> {
-    const reply = await ask(this.#wire, { tx_commit: { tx: this.id } }, { conflicts: true });
+    const reply = await this.#session.ask({ tx_commit: { tx: this.id } }, { conflicts: true });
     if ("conflict" in reply) {
       const { cell, reason, message } = reply.conflict;
       throw new ConflictError(cell, reason, message);
@@ -526,25 +819,25 @@ class Transaction implements Tx {
   }
 
   async abort(): Promise<void> {
-    expect(await ask(this.#wire, { tx_abort: { tx: this.id } }), "ok");
+    expect(await this.#session.ask({ tx_abort: { tx: this.id } }), "ok");
   }
 }
 
 class Handle implements ObjectHandle<never> {
-  readonly #wire: Wire;
+  readonly #session: Session;
   readonly #tx: string;
   readonly #fields: Record<string, FieldDescriptor<unknown>> | undefined;
   readonly cell: string;
   readonly id: never;
 
   constructor(
-    wire: Wire,
+    session: Session,
     tx: string,
     struct: string,
     id: string,
     descriptor: StructDescriptor<unknown> | undefined,
   ) {
-    this.#wire = wire;
+    this.#session = session;
     this.#tx = tx;
     this.cell = address(struct, id);
     this.id = id as never;
@@ -561,7 +854,7 @@ class Handle implements ObjectHandle<never> {
 
   async resolve(field: never, options?: ReadOptions): Promise<Resolved<never>> {
     const wire = expect(
-      await ask(this.#wire, {
+      await this.#session.ask({
         tx_get: {
           tx: this.#tx,
           cell: `${this.cell}.${String(field)}`,
@@ -587,7 +880,7 @@ class Handle implements ObjectHandle<never> {
     const type = this.#type(field);
     const text = value === null || value === undefined ? TOMBSTONE : encode(type, value);
     expect(
-      await ask(this.#wire, {
+      await this.#session.ask({
         tx_set: { tx: this.#tx, cell: `${this.cell}.${String(field)}`, value: text },
       }),
       "ok",
@@ -649,21 +942,6 @@ function encode(type: FieldType<unknown> | undefined, value: unknown): string {
   throw new BorgClientError(
     `an untyped field takes text, not ${typeof value} — generated code carries the conversion`,
   );
-}
-
-/** One request, one reply, with `error` turned into a throw and `conflict` optionally allowed. */
-async function ask(
-  wire: Wire,
-  request: Request,
-  options?: { conflicts: boolean },
-): Promise<Response> {
-  const reply = await wire.request(request);
-  if (reply === null) throw new BorgProtocolError("the server hung up in the middle of a request");
-  if ("error" in reply) throw new BorgClientError(reply.error.message);
-  if ("conflict" in reply && options?.conflicts !== true) {
-    throw new ConflictError(reply.conflict.cell, reply.conflict.reason, reply.conflict.message);
-  }
-  return reply as Response;
 }
 
 /** The payload of the single-key response named `K`. §17.4's single-key rule, as a type. */
