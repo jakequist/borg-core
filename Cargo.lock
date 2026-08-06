@@ -43,6 +43,7 @@ dependencies = [
  "borg-exec-native",
  "borg-exec-process",
  "borg-protocol",
+ "borg-storage",
  "borg-storage-sqlite",
  "serde",
  "serde_json",

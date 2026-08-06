@@ -233,6 +233,10 @@ fn parse_args() -> Args {
             version: None,
             freshness: borg_core::FreshnessRequirement::Validated,
             settled: false,
+            // The CLI is process-per-command, so it holds nothing: every command opens the store,
+            // rebuilds the projections and exits. That is the honest cost of a process that does not
+            // stay up, and it is unchanged — `borg serve` is the one caller that fills this in.
+            held: None,
         },
         value_only: false,
         quiet: false,

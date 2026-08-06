@@ -8,6 +8,7 @@
 //! * **Commit streams.** A layer may hold millions of mutations and can never be buffered whole.
 //! * **Locks are per-layer, never per-branch.** A branch-wide lock would serialize derivation.
 
+use crate::projection::{Projection, Projections};
 use crate::seams::LayerSequencer;
 use crate::touch::CellTouchIndex;
 use borg_core::{
@@ -15,7 +16,6 @@ use borg_core::{
     LayerKind, LayerState, Origin, ReadPath, Result,
 };
 use borg_storage::{OpenLayer, StorageProvider};
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +74,10 @@ pub struct LayerManager {
     storage: Arc<dyn StorageProvider>,
     sequencer: Arc<dyn LayerSequencer>,
     touches: Arc<CellTouchIndex>,
+    /// Everything a commit has to bring up to date. The touch index is always in here — commit is
+    /// its only live witness — and a registry adds the ones folded from derived layers. See
+    /// [`crate::projection`].
+    projections: Arc<Projections>,
     state: Mutex<State>,
 }
 
@@ -100,12 +104,28 @@ impl LayerManager {
         sequencer: Arc<dyn LayerSequencer>,
         touches: Arc<CellTouchIndex>,
     ) -> Self {
+        let projections = Arc::new(Projections::new([
+            Arc::clone(&touches) as Arc<dyn Projection>
+        ]));
         Self {
             storage,
             sequencer,
             touches,
+            projections,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Replace the projection set with the registry's full one.
+    ///
+    /// [`new`](Self::new) starts with the touch index alone because a `LayerManager` assembled by
+    /// hand — which every engine test does — has no derivation standing behind it and so has nothing
+    /// else to fold. A [`Registry`](crate::registry::Registry) hands over the set that includes the
+    /// dependency index and the watermarks, so that one commit path serves both.
+    #[must_use]
+    pub fn with_projections(mut self, projections: Arc<Projections>) -> Self {
+        self.projections = projections;
+        self
     }
 
     pub fn register_branch(&self, branch: Branch) {
@@ -463,16 +483,16 @@ impl LayerManager {
             }
         }
 
-        // Feed the touch index by streaming the committed layer. Source layers only: guards may name
-        // source cells only, and derived layers are the enormous ones.
-        if matches!(layer.author, LayerAuthor::Source) {
-            let mut stream = self.storage.read_layer(layer.id).await?;
-            let mut cells = Vec::new();
-            while let Some(row) = stream.next().await {
-                cells.push(row?.cell);
-            }
-            self.touches.record(layer.branch, layer.id, &cells)?;
-        }
+        // Bring the projections up to this layer. **This is the live half of the fold** — the same
+        // fold `Registry::open` runs from zero, arriving one layer at a time instead of all at once,
+        // which is what lets a process that never exits skip the replay entirely
+        // (`crate::projection`). Only source layers are read back here; a derived layer's edges and
+        // watermark reached the index and the frontier from the engine that wrote them.
+        let mut committed = layer.clone();
+        committed.state = LayerState::Committed;
+        self.projections
+            .committed(&committed, self.storage.as_ref())
+            .await?;
         Ok(layer.id)
     }
 

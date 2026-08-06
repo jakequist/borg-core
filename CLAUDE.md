@@ -135,7 +135,14 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   write therefore pays for the derivation it causes; §9.6 says that is a latency property, not a
   semantic one, and a server moves the same call behind a signal.
 - `scan_buffer` and `read_layer` materialise results before streaming them.
-- SQLite `Registry::open` rebuilds indexes by replaying the log — `O(log)` per CLI invocation.
+- **`Registry::open` brings the log's projections to head, which for a fresh set means replaying the
+  log — `O(log)` per CLI invocation.** That is process-per-command's honest cost and it is unchanged:
+  a process that exits between commands has nothing to keep. What changed is that it is no longer
+  *also* per read, because `borg serve` now holds one registry (below). The indexes are
+  `borg_engine::projection::Projection`s — a fold over committed layers, with a position — and the
+  two lifecycles (rebuilt from zero, maintained live) are held to the same answers by
+  `crates/borg-engine/tests/projections.rs`. **A performance change to an index belongs behind that
+  seam and is not finished until those tests pass against both lifecycles.**
 - Writes to list and untyped-container cells are **not** validated: there is no `ListDef` event to
   validate against, so requiring a declaration would make them unwritable (§8).
 - Nothing registers a ClientVersion as live (§5.5), so the live-version set is empty and every
@@ -172,7 +179,9 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   on its own branch and one per *producer* on the parent (§16.5). Forks are `O(1)` and layers are
   cheap, but `Registry::open` replays the log on every CLI invocation, so the `O(log)` open grows
   with it. The transactional-model draft flagged this; the fan-out benchmark cannot see it, because
-  it drives the engine rather than the CLI.
+  it drives the engine rather than the CLI. **Multiplied by a server that opened per request, this
+  was `examples/personal-crm/FRICTION.md` #9** — the first time the two costs above met, and the
+  reason the sentence "documented separately, never multiplied" is worth watching for.
 - **A producer that has never succeeded has no cell to call `broken`.** §14's state is a label on a
   stored record (§10.4), and a pipeline that threw on its first run wrote none, so its output reads
   as simply absent. Enumerating the cells a producer *might* have written is not a set anything can
@@ -194,12 +203,17 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.
-- **`borg serve` opens the store per request and serves one request at a time.** A real server holds
-  the store open, and the reason this one cannot is not the socket: `ops::tx_commit` drops its
-  registry so that `auto_derive` can open another with an executor, because two live `Registry`
-  instances over one store break the single-process assumption. Making the server hold one is a change
-  to derivation's lifecycle — the same change that turns the post-write `catch_up` call into a signal
-  (§9.6) — and should be made there rather than worked around here.
+- **`borg serve` holds one registry and still serves one request at a time.** The registry was the
+  fix (`FRICTION.md` #9): it used to be opened per request, which replayed the log per read, and the
+  reason was derivation's lifecycle rather than the socket — `ops::tx_commit` dropped its registry so
+  that `auto_derive` could open another one *with* an executor, because two live `Registry` instances
+  over one store break the single-process assumption. The long-lived registry now carries the
+  executor, so both use the same instance. What makes it safe is the advisory lock: serve is the only
+  writer, so every mutation flows through the instance maintaining the projections.
+  **The gate is deliberately still there.** Requests are serialised store-wide; the replay was the
+  cost, not the gate, and letting reads overlap is its own change with its own soak (`ROADMAP.md`).
+  What is still deferred is turning the post-write `catch_up` call into a signal (§9.6) — a write
+  still pays for the derivation it causes, inside the request that caused it.
 - **A served store locks every other `borg` invocation out** — except `borg generate`, which speaks
   to the socket instead (SPEC.md §17.5, `crates/borg-cli/src/generate.rs`). The lock is honest about
   the assumption that was always there; the CLI connecting rather than being refused is the

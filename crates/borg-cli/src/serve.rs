@@ -26,16 +26,52 @@
 //! the final answer is the CLI connecting to the socket instead of being turned away by it, which is
 //! the same remote-connection feature that supersedes `serve` itself.
 //!
-//! **The store is opened per request, not held.** This is the one place the brief's shape and the
-//! code's shape disagree, and the code won for a specific reason: the ops layer opens and *drops*
-//! registries around derivation — `tx_commit` drops its registry and `auto_derive` opens another,
-//! with an executor — because two live `Registry` instances over one store are exactly what the
-//! single-process assumption forbids. Holding one open across requests is not a change to serve, it
-//! is a change to derivation's lifecycle, and it is the first thing a real server should do. What
-//! serve does instead is serialise: one request at a time, store-wide, which is the same discipline
-//! process-per-command gave the CLI for free. The cost is the `O(log)` open per request that
-//! `CLAUDE.md` already records against the CLI; the benefit is that serve cannot be wrong in a way
-//! the CLI is not.
+//! **The store is opened once and held.** `serve` boots one deriving `Registry` and every request
+//! goes through it. This was the first thing a real server had to do and it was a change to
+//! derivation's lifecycle rather than to this file: `tx_commit` used to drop its registry so that
+//! `auto_derive` could open another one *with* an executor, and two live `Registry` instances over
+//! one store are exactly what the single-process assumption forbids — so the long-lived registry
+//! carries the executor and the dance is gone (`crate::ops::Held`).
+//!
+//! **What makes it safe is the lock, not the loop.** A registry's in-memory indexes are projections
+//! of the log (`borg_engine::projection`); holding them across requests is only sound if every
+//! mutation of the store flows through the instance maintaining them, and that is exactly what the
+//! advisory lock below already guarantees — the CLI is refused by name, and `repo push` requires the
+//! server to be stopped. The lock was built to be honest about the single-process assumption; it
+//! turns out to be the precondition for the cache.
+//!
+//! What this was worth: `examples/personal-crm/FRICTION.md` #9 measured a read costing 18.4 ms at
+//! branch head L441 and 53.0 ms at L1391 — a cost tracking the length of the log rather than the
+//! size of the request, because opening the store per request replayed the log per request.
+//!
+//! **Requests are still serialised**, one at a time, store-wide. The replay was the cost, not the
+//! gate; relaxing the gate is a separate change with a soak of its own (`ROADMAP.md`).
+//!
+//! ## The sidecars, one at a time
+//!
+//! Holding a registry means holding whatever it read on the way up, so every piece of state beside
+//! the store had to be re-examined: is it *owned* by this process, *re-read* whenever it is used, or
+//! *unreachable* while serving? Anything else would be a cache with no invalidation.
+//!
+//! * **`borg.serving.json`** — owned. Written here at boot, removed on the way out, and read only by
+//!   other processes deciding whether to refuse. Nothing holds a copy.
+//! * **`borg.transactions.json`** — re-read per use. Every `tx_*` operation and the per-request reap
+//!   sweep load and save it; nothing survives a request.
+//! * **`borg.derivation.json`, the pause flags** — re-read per use. `auto_derive` loads them on every
+//!   call, and `set_paused` re-reads before writing so that the two halves of the file cannot clobber
+//!   each other.
+//! * **`borg.derivation.json`, the poison table** — owned, and the one this change lengthened.
+//!   `ops::FilePoison` reads it once and holds it, which used to mean *for one command* and now means
+//!   *for the server's life*. Sound because the holder is also the only writer: every poisoning and
+//!   every clear goes through this instance, which updates memory and flushes. The file can only move
+//!   underneath it if a second process writes it (refused by the lock) or if fixed code is pushed
+//!   (`repo push`, which requires stopping the server). §14's recovery is unchanged: push fixed code,
+//!   which still means a restart here.
+//! * **`borg.producers.json`** — stable while serving, and asserted rather than assumed. `repo push`
+//!   is the only writer and is refused while served, so the worker pool built at boot cannot be
+//!   running the wrong code; `ops::Held::producers_moved` checks anyway and says so loudly.
+//! * **`borg.allocations.json`** — re-read per use. `ops::allocate` loads, increments and saves
+//!   before every creation, which is what makes the counter crash-safe (SDK-DRAFT §4.5).
 //!
 //! ## Transport
 //!
@@ -223,12 +259,18 @@ impl Peer for UnixPeer {
 
 /// What every connection shares: the store, and the right to touch it one at a time.
 ///
-/// Not a `Registry` — see the module header for why that is a change to derivation and not to serve.
+/// The `Ops` here carries the held registry (`ops::Held`), which is what makes this a store and not
+/// a path to one. Every session clones it, so every request in the process works through the same
+/// `Registry` and the same worker pool.
 pub struct Store {
     args: Ops,
     /// Store-wide, held across a whole operation. Two `borg` processes could never interleave
     /// mid-command; two connections must not either, and the mutex is what buys serve the same
     /// discipline process-per-command gave the CLI for free.
+    ///
+    /// **Kept deliberately.** Holding one registry removed the per-request replay; it did not make
+    /// concurrent requests safe, and pretending otherwise would trade a measured win for an unmeasured
+    /// risk. Letting reads overlap is its own change, with its own soak — `ROADMAP.md`.
     gate: Mutex<()>,
 }
 
@@ -266,12 +308,24 @@ pub async fn run(args: &Ops, socket: Option<&Path>) -> Result<()> {
         },
     )?;
 
-    // Printed, and printed *first*, because a scenario or a supervisor waits for this line to know
-    // the socket is bindable rather than merely named.
+    // **The one open**, and it happens after the lock so that a store somebody else is serving is
+    // refused before this process replays its log. Every request below works through this registry;
+    // see `ops::Held` for why that is safe and what it is worth.
+    //
+    // Before the line below rather than after it, because that line is what a supervisor waits for:
+    // a server that announced itself and *then* spent the length of the log opening the store would
+    // be telling its watcher it was ready while it was not.
+    let held = ops::hold(args).await?;
+
+    // Printed once the socket is bound and the store is open, which together are what "serving"
+    // means — a scenario or a supervisor waits for this line rather than for the path to exist.
     eprintln!("serving {} on {}", args.store.display(), socket.display());
 
     let store = Arc::new(Store {
-        args: args.clone(),
+        args: Ops {
+            held: Some(Arc::clone(&held)),
+            ..args.clone()
+        },
         gate: Mutex::new(()),
     });
 
@@ -298,6 +352,11 @@ pub async fn run(args: &Ops, socket: Option<&Path>) -> Result<()> {
     // Open connections are threads we do not join: a client mid-request is holding the gate, and a
     // server that waited for every reader to hang up would not stop when told. The lock file and the
     // socket go now, which is what the next `borg` needs.
+    //
+    // The worker pool *is* joined, because it is subprocesses rather than threads: they outlive this
+    // process unless they are told, and leaving a pipeline's interpreter running after the server
+    // that started it has stopped is the kind of leak a supervisor discovers days later.
+    held.shutdown().await;
     drop(lock);
     eprintln!("stopped serving {}", args.store.display());
     Ok(())
@@ -697,10 +756,16 @@ mod tests {
             version: None,
             freshness: FreshnessRequirement::Validated,
             settled: false,
+            held: None,
         }
     }
 
     /// A store with a schema and one company in it, driven through the real CLI ops.
+    ///
+    /// **Returned with the registry held**, because that is what `run` hands every session and
+    /// therefore what every assertion below should be making claims about. The fixture is built
+    /// through the unheld path first, which is also honest: a store is created by a CLI before a
+    /// server is pointed at it.
     async fn store_with_a_company(dir: &Path) -> Ops {
         let args = ops_for(&dir.join("borg.db"));
         let registry = ops::open(&args).await.unwrap();
@@ -731,7 +796,11 @@ mod tests {
             .await
             .unwrap();
         ops::tx_commit(&args, &tx).await.unwrap();
-        args
+
+        Ops {
+            held: Some(ops::hold(&args).await.unwrap()),
+            ..args
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -776,6 +845,69 @@ mod tests {
             direct.resolved.fresh_as_of.to_string()
         );
         assert_eq!(envelope.landed_at, direct.resolved.landed_at.to_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **A held registry answers what a freshly-opened one answers.**
+    ///
+    /// The serve-level statement of the engine's rebuild-and-diff property
+    /// (`crates/borg-engine/tests/projections.rs`): `serve` now holds one registry for its lifetime,
+    /// so every question a client can ask has to come back the same as it would from a process that
+    /// opened the store this instant. Asked **after** writes have gone through the held instance,
+    /// because a maintained cache is the only kind worth doubting — an untouched one agrees with a
+    /// rebuild trivially.
+    #[tokio::test]
+    async fn a_held_registry_answers_what_a_freshly_opened_one_answers() {
+        let dir = temp_dir("held");
+        let held = store_with_a_company(&dir).await;
+        let fresh = ops_for(&held.store);
+
+        // Three more writes through the held instance, each of which moves the projections: a
+        // creation, a write and a commit that catches the parent up.
+        for value in ["11", "12", "13"] {
+            let Response::Tx { tx } = answer(&held, Request::TxBegin { branch: None }).await else {
+                panic!("tx_begin should answer with a handle")
+            };
+            let Response::Ok {} = answer(
+                &held,
+                Request::TxSet {
+                    tx: tx.clone(),
+                    cell: "Company#1.headcount".into(),
+                    value: value.into(),
+                },
+            )
+            .await
+            else {
+                panic!("tx_set should be accepted")
+            };
+            let Response::Committed { .. } = answer(&held, Request::TxCommit { tx }).await else {
+                panic!("the commit should land")
+            };
+        }
+
+        let by_held = ops::get(&held, "Company#1.headcount").await.unwrap();
+        let by_fresh = ops::get(&fresh, "Company#1.headcount").await.unwrap();
+        assert_eq!(by_held.rendered.as_deref(), Some("13"));
+        assert_eq!(by_held.rendered, by_fresh.rendered);
+        assert_eq!(
+            by_held.resolved.landed_at, by_fresh.resolved.landed_at,
+            "a held registry and a fresh one must agree about where a value landed"
+        );
+        assert_eq!(
+            by_held.resolved.fresh_as_of, by_fresh.resolved.fresh_as_of,
+            "…and about how fresh it is, which is the watermark projection speaking"
+        );
+
+        // The head, which is what the layer table says, and the enumeration, which is a buffer scan:
+        // one is the durable half of the log and the other is a read through the branch's ancestry.
+        assert_eq!(
+            ops::branch_head(&held).await.unwrap(),
+            ops::branch_head(&fresh).await.unwrap(),
+        );
+        assert_eq!(
+            ops::list(&held, "Company").await.unwrap(),
+            ops::list(&fresh, "Company").await.unwrap(),
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

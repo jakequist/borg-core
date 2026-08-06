@@ -1395,8 +1395,10 @@ configured **idle timeout**: a transaction untouched for longer than that is rea
 
 Idle rather than elapsed, so a long but active transaction survives and an abandoned short one does
 not — the predictor of a doomed transaction is silence, not age. Reaping sweeps **opportunistically
-when a process opens the store**, the same moment the indexes are already rebuilt (§16), so there is
-no daemon and an idle store sweeps nothing because nothing is growing.
+when a process opens the store**, so there is no daemon and an idle store sweeps nothing because
+nothing is growing. For a process that holds the store open, that reads as *whenever it takes a
+request*: the sweep is a scan of one small file beside the store and does not depend on anything the
+open rebuilt (§17.1).
 
 The sweep sits *above* the store rather than inside it. Transaction state is operational state beside
 the store (§12.2), and the layer that opens a `StorageProvider` is the one place that must never
@@ -1732,6 +1734,7 @@ Five planes. The derivation plane is a cycle, and that cycle is the system.
 | `FrontierTracker` | per-producer watermarks, settled frontier, `frontier.reaches()` |
 | `CellTouchIndex` | `cell → layers that wrote it`, source layers only; backs guard validation (§12.4) |
 | `PoisonProvider` | which producers are broken, and the ClientVersion each judgement was made against (§14.2) |
+| `Projection` | what the three rows above **are**: a fold over committed layers, with a position. Opening a store brings each to head; a projection already at head folds nothing (§17.1) |
 
 ### 16.2 Verbs
 
@@ -2127,6 +2130,29 @@ projection of it. Everything else the engine holds — the dependency index, the
 watermarks, poisonings — is a cache rebuildable by replaying committed layers, so none of it appears
 above.
 
+**"Rebuildable" is a named seam, not a property nobody exercises.** Each of those caches is a
+`Projection`: what it answers, how to fold one committed layer into it, and the **position** it has
+folded through. Opening a store is *bring every projection to head*, and the cost of that is the
+distance from each position to the head rather than the length of the log. Two lifecycles fall out,
+and they are the same code:
+
+- **Rebuilt from zero.** Positions start at `L0`, so opening folds every committed layer. This is
+  what a process-per-command client does, and `O(log)` per invocation is the honest price of exiting
+  between commands.
+- **Maintained live.** A process that stays up folds each layer as it commits, so its projections are
+  already at head and opening folds nothing. This is what lets a server hold a store open. Which
+  layers a projection reads back is its own business: the touch index is folded from source layers at
+  commit, while the dependency index and the watermarks are told what an invocation read and wrote by
+  the engine that ran it, before the layer holding it commits (§16.3.8) — re-reading a derived layer
+  to learn what the engine already said would put a scan of the largest layers in the system on the
+  write path.
+
+The two must answer identically, and that is a testable claim rather than a design intention: fold a
+store from zero and compare, question for question, against the live-maintained set. Approximate
+implementations of this seam — a snapshotted index, a probabilistic summary — are legitimate provided
+their error is **one-sided** in the direction `CellTouchIndex::moved_since` already establishes: a
+`true` may only mean *check properly*, never stand in for the answer.
+
 **Interning is unscoped, and that is the whole point.** `intern` takes no branch, no layer and no
 def-version, because a content PID has none (§3.1); a provider that scoped it would reintroduce
 exactly the conflict the scheme exists to eliminate. Nor is it written into a layer: interning takes
@@ -2418,6 +2444,20 @@ invocation against that store is refused and told the socket to speak to. The lo
 the socket itself — a record whose socket does not answer is stale and is cleared — because a lock
 that can outlive its holder is worse than no lock. This is v1 honesty and not the destination: the
 destination is the CLI connecting to the socket rather than being turned away by it.
+
+**A server opens the store once and holds it**, and the lock above is what makes that sound rather
+than merely convenient. A registry's indexes are projections of the log (§17.1); holding them across
+requests is safe exactly when every mutation of the store flows through the instance maintaining
+them, which is what "one process serves a store" already guarantees. Holding the registry also means
+holding the `ExecutionProvider` on it: derivation and the read path must share one registry, because
+two live over one store is precisely what the single-process assumption forbids — a server that
+opened one per operation could never chase a write without dropping the registry it was answering
+through. Opening per request instead costs an `O(log)` replay *per read*, which is the multiplication
+that made the first application on this system unusable at a hundred and forty objects.
+
+Requests are still answered one at a time, store-wide. That is a separate decision from the one
+above: process-per-command gave a client serialisation for free, a server has to choose it, and
+choosing it is what keeps a served store no less correct than an unserved one.
 
 ---
 

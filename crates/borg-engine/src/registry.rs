@@ -4,31 +4,43 @@
 //!
 //! Only two things are stored in their own right — **layers and branches**, the shape of the log.
 //! The dependency index, the cell-touch index and the per-producer watermarks are all **caches**,
-//! and every one of them is recovered by replaying committed layers on open.
+//! and every one of them is recovered by replaying committed layers.
 //!
 //! That is not a shortcut, it is a property worth having: a derived cell already records the exact
 //! read-set it was computed from (§4.3), and a derived layer already records the source layer it
 //! reflects (§6.3). The indexes are those facts turned around for lookup, so losing them costs
 //! nothing but time.
 //!
-//! It does mean open is `O(log)`. Fine for a CLI over a development store, and the fix — materialize
-//! the indexes alongside the log — needs no interface change, because they already sit behind
-//! providers.
+//! ## Opening is not the same as replaying
+//!
+//! Those caches are [`Projection`](crate::projection::Projection)s, and open is *"bring each one to
+//! head"* rather than *"replay the log"*. The two are the same call only when the projections start
+//! empty:
+//!
+//! * A **process-per-command CLI** builds them fresh every time, so open folds the whole log and is
+//!   `O(log)`. That is the honest cost of exiting between commands, and it is unchanged.
+//! * A **process that stays up** — `borg serve` — opens once and keeps the registry. Its projections
+//!   are maintained by the commits flowing through it, so they are already at head and there is no
+//!   replay to pay for. Before this, serve opened per request and multiplied the `O(log)` open by
+//!   the number of reads (`examples/personal-crm/FRICTION.md` #9).
+//!
+//! What is *not* a projection is the layer and branch table this open reads first. §17.1 puts it
+//! plainly: those are the structure of the log rather than a fold over it, so they are read from
+//! storage and not rebuilt from anything.
 
 use crate::branch::BranchManager;
 use crate::defs::DefRegistry;
 use crate::derive::DerivationEngine;
-use crate::index::{DependencyIndexProvider, Invocation, MemoryDependencyIndex};
+use crate::index::{DependencyIndexProvider, MemoryDependencyIndex};
 use crate::log::LayerManager;
 use crate::poison::{MemoryPoison, PoisonProvider};
+use crate::projection::{DependencyProjection, FrontierProjection, Projection, Projections};
 use crate::resolve::{FrontierTracker, InlineDerivation, Resolver};
 use crate::seams::InProcessSequencer;
 use crate::touch::CellTouchIndex;
 use crate::values::Values;
 use crate::write::WriteSession;
-use borg_core::{
-    BranchId, CellAt, ClientVersion, LayerAuthor, LayerId, LayerState, Result, Writer,
-};
+use borg_core::{BranchId, ClientVersion, LayerAuthor, LayerId, Result, Writer};
 use borg_exec::ExecutionProvider;
 use borg_storage::StorageProvider;
 use futures_util::StreamExt;
@@ -49,6 +61,14 @@ pub struct Registry {
     /// `intern` and every client-facing read through `render`, so a string is a string on the way in
     /// and on the way out (§3.4).
     pub values: Arc<Values>,
+    /// The dependency graph. Public for the same reason `poison` is: `explain` is answered from it,
+    /// and the rebuild-and-diff tests have to be able to ask it questions.
+    pub index: Arc<dyn DependencyIndexProvider>,
+    /// `cell -> layers that wrote it`, which guard validation is checked against (§12.4).
+    pub touches: Arc<CellTouchIndex>,
+    /// The caches above, as the folds over the log that they are. See [`crate::projection`] — this
+    /// is the seam that makes "held open across requests" a lifecycle choice rather than a risk.
+    pub projections: Arc<Projections>,
 }
 
 impl Registry {
@@ -78,15 +98,28 @@ impl Registry {
         let index: Arc<dyn DependencyIndexProvider> = Arc::new(MemoryDependencyIndex::new());
         let frontier = Arc::new(FrontierTracker::new());
 
+        // Three folds over the log, named as such. Built before the log manager, because the log is
+        // what feeds them and it has to be handed the set.
+        let dependencies = Arc::new(DependencyProjection::new(Arc::clone(&index)));
+        let watermarks = Arc::new(FrontierProjection::new(Arc::clone(&frontier)));
+        let projections = Arc::new(Projections::new([
+            Arc::clone(&touches) as Arc<dyn Projection>,
+            Arc::clone(&dependencies) as Arc<dyn Projection>,
+            Arc::clone(&watermarks) as Arc<dyn Projection>,
+        ]));
+
         let known = storage.read_layers().await?;
         let highest = known.iter().map(|layer| layer.id.0).max().unwrap_or(0);
-        let layers = Arc::new(LayerManager::new(
-            Arc::clone(&storage),
-            // Resume the sequence rather than restarting it, or a second CLI invocation would try to
-            // reuse layer ids that already exist.
-            Arc::new(InProcessSequencer::resuming_after(LayerId(highest))),
-            Arc::clone(&touches),
-        ));
+        let layers = Arc::new(
+            LayerManager::new(
+                Arc::clone(&storage),
+                // Resume the sequence rather than restarting it, or a second CLI invocation would
+                // try to reuse layer ids that already exist.
+                Arc::new(InProcessSequencer::resuming_after(LayerId(highest))),
+                Arc::clone(&touches),
+            )
+            .with_projections(Arc::clone(&projections)),
+        );
 
         for branch in storage.read_branches().await? {
             layers.register_branch(branch);
@@ -137,61 +170,18 @@ impl Registry {
             frontier,
             poison,
             values,
+            index,
+            touches,
+            projections,
         };
+        // **Not "replay the log" — "bring the projections to head."** For this registry they are
+        // empty, so the two are the same call and it is `O(log)`; for one that has been maintained
+        // live there is nothing to fold. See `crate::projection`.
         registry
-            .rebuild_caches(&known, index.as_ref(), &touches)
+            .projections
+            .bring_to_head(registry.storage.as_ref(), &known)
             .await?;
         Ok(registry)
-    }
-
-    /// Replay committed layers to restore the indexes.
-    ///
-    /// Layer ids are registry-unique and monotonic, so id order is replay order across every branch.
-    async fn rebuild_caches(
-        &self,
-        known: &[borg_core::Layer],
-        index: &dyn DependencyIndexProvider,
-        touches: &CellTouchIndex,
-    ) -> Result<()> {
-        let mut ordered: Vec<_> = known
-            .iter()
-            .filter(|layer| layer.state == LayerState::Committed)
-            .collect();
-        ordered.sort_by_key(|layer| layer.id.0);
-
-        for layer in ordered {
-            // A layer's *membership*, which for a merge layer is the child's events — so the touch
-            // index learns that those cells were touched on the parent at the merge layer, which is
-            // where a guard re-evaluated on the parent must see them.
-            let mut stream = self.storage.read_layer(layer.id).await?;
-            let mut events = Vec::new();
-            while let Some(row) = stream.next().await {
-                events.push(row?);
-            }
-
-            match layer.author {
-                // Guards may name source cells only, so the touch index only ever needed these.
-                LayerAuthor::Source => {
-                    let refs: Vec<_> = events.into_iter().map(|event| event.cell).collect();
-                    touches.record(layer.branch, layer.id, &refs)?;
-                }
-                LayerAuthor::Derived { producer, reflects } => {
-                    for event in events {
-                        let Some(derivation) = event.derivation else {
-                            continue;
-                        };
-                        let invocation = Invocation {
-                            producer,
-                            input: *event.cell.pid(),
-                        };
-                        let written = [CellAt::new(event.cell, event.version)];
-                        index.record(layer.branch, &invocation, &derivation.read_set, &written)?;
-                    }
-                    self.frontier.advance(layer.branch, producer, reflects);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The branch a bare command operates on: the first root, by convention named `main`.

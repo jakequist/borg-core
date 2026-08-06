@@ -7,7 +7,8 @@
 //! can never appear in a guard — and derived layers are the enormous ones. Skipping them bounds the
 //! index by authored data rather than by everything the derivation engine produces.
 
-use borg_core::{BranchId, CellRef, LayerId, ReadPath, Result};
+use crate::projection::{Position, Projection};
+use borg_core::{BranchId, CellRef, Event, Layer, LayerAuthor, LayerId, ReadPath, Result};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -20,6 +21,9 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub struct CellTouchIndex {
     inner: Mutex<Touches>,
+    /// How far this index has been folded. See [`crate::projection`]: the touch index is a
+    /// projection of the log, and this is the field that lets a live one skip a replay.
+    position: Position,
 }
 
 #[derive(Default)]
@@ -38,6 +42,7 @@ impl CellTouchIndex {
     /// Record that a layer wrote these cells. Fed by streaming a committed layer, never by
     /// buffering one — a layer may hold millions of mutations (SPEC.md §6.2).
     pub fn record(&self, branch: BranchId, layer: LayerId, cells: &[CellRef]) -> Result<()> {
+        self.position.reached(layer);
         let mut inner = self.inner.lock().unwrap();
         let highest = inner.highest.entry(branch).or_insert(layer);
         if layer.0 > highest.0 {
@@ -113,5 +118,35 @@ impl CellTouchIndex {
             }
         }
         earliest
+    }
+}
+
+/// `cell -> layers that wrote it`, folded from the source layers of the log.
+///
+/// The live feed is `LayerManager::commit`, which is the only witness a client write has. See
+/// [`crate::projection`] for what the two lifecycles are and why they must agree.
+impl Projection for CellTouchIndex {
+    fn name(&self) -> &'static str {
+        "touch index"
+    }
+
+    fn position(&self) -> LayerId {
+        self.position.get()
+    }
+
+    fn wants(&self, layer: &Layer) -> bool {
+        matches!(layer.author, LayerAuthor::Source)
+    }
+
+    fn apply(&self, layer: &Layer, events: &[Event]) -> Result<()> {
+        if matches!(layer.author, LayerAuthor::Source) {
+            // A layer's *membership*, which for a merge layer is the child's events — so the touch
+            // index learns that those cells were touched on the parent at the merge layer, which is
+            // where a guard re-evaluated on the parent must see them (§13).
+            let cells: Vec<CellRef> = events.iter().map(|event| event.cell.clone()).collect();
+            self.record(layer.branch, layer.id, &cells)?;
+        }
+        self.position.reached(layer.id);
+        Ok(())
     }
 }

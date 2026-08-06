@@ -16,9 +16,10 @@ Solutions are proposed only where one is obvious. Most of these are observations
 ## The three that matter most
 
 If nothing else here is read: **#9** (a personal CRM is unusable at 140 contacts, and the reason is
-not the N+1), **#17** (two versions of a pipeline's output coexist in one store, both labelled
-`current`, and nothing can tell them apart), and **#6/#7** (a broken producer marks 140 innocent rows
-broken and leaves the one guilty row reading `current`).
+not the N+1 — **since fixed**, and the entry keeps both curves because the shape of the before is the
+finding), **#17** (two versions of a pipeline's output coexist in one store, both labelled `current`,
+and nothing can tell them apart), and **#6/#7** (a broken producer marks 140 innocent rows broken and
+leaves the one guilty row reading `current`).
 
 ---
 
@@ -269,6 +270,48 @@ should be made there rather than worked around here"). This is the evidence that
 
 Secondary and much smaller: a `POST /contacts` measured 315–760 ms, of which the transaction is a
 handful of messages and the rest is the same tax plus the derivation the write pays for (§9.6).
+
+### Fixed — `borg serve` holds one registry
+
+The change was the one CLAUDE.md named, made where it named it. `Registry::open` no longer means
+"replay the log"; it means **bring the log's projections to head** (`borg_engine::projection`), and a
+projection a process has been maintaining is already there. `borg serve` therefore opens the store
+once and every request shares that registry. The executor moved onto it too, which is what removed
+the drop-and-reopen dance `tx_commit` needed and was the actual reason a server could not hold a
+store open. Requests are still serialised through the same store-wide gate: the replay was the cost,
+not the gate.
+
+`./bench.sh` is the measurement, so the table below is reproducible rather than remembered. Same
+machine, same `target/debug`, one process, one socket, localhost — the row above and the row below
+differ only in the binary:
+
+| contacts | branch head | `POST /contacts` | `GET /contacts` | `GET /contacts/:id` | ms per read (list) | ms per read (detail) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 45 | L451 | 378 ms | 27 ms | 3 ms | 0.3 | 0.4 |
+| 60 | L601 | 375 ms | 35 ms | 3 ms | 0.3 | 0.4 |
+| 80 | L801 | 372 ms | 56 ms | 3 ms | 0.3 | 0.4 |
+| 100 | L1001 | 371 ms | 70 ms | 3 ms | 0.3 | 0.4 |
+| 140 | L1401 | 369 ms | 160 ms | 5 ms | 0.6 | 0.7 |
+| 200 | L2001 | 384 ms | 141 ms | 3 ms | 0.4 | 0.4 |
+| 300 | L3001 | 374 ms | 295 ms | 4 ms | 0.5 | 0.6 |
+| 400 | L4001 | 364 ms | 328 ms | 3 ms | 0.4 | 0.4 |
+
+**Read the last two columns again.** They no longer move: 0.3–0.6 ms per read from L451 to L4001,
+where before they went 18.4 → 53.0 ms over a third of that range. **The cost of a read is now a fact
+about the read.** The list view is `O(n)` — 801 reads in 328 ms — which is the N+1 the design intends
+to be visible and nothing else; 140 contacts went from 14.9 s to 0.16 s, and a thousand contacts is
+now under a second rather than the extrapolated twelve minutes.
+
+The write path lost the same tax: `POST /contacts` was 636 ms at 45 contacts rising to 891 ms at 140
+on the same machine, and is now flat at ~370 ms. What remains is the transaction's round trips plus
+the derivation the write pays for (§9.6) — neither of which grows with the log. Turning that
+`catch_up` into a signal is still deferred, and is what the remaining 370 ms is mostly made of.
+
+**What is unchanged, on purpose.** The CLI still rebuilds per command: process-per-command has
+nothing to keep, and that is honest rather than lazy. Requests are still one at a time. And a
+`--reset` while a server is running still deletes the advisory lock out from under it, which is how
+this measurement was first taken twice with two servers on one store — a footgun in `dev.sh`, not in
+the engine.
 
 ---
 

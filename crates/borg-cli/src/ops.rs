@@ -31,6 +31,7 @@ use borg_core::{
 };
 use borg_engine::{Poisoning, Registry};
 use borg_exec_native::NativeExecutor;
+use borg_storage::StorageProvider;
 use borg_storage_sqlite::SqliteStorage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -68,6 +69,14 @@ pub struct Ops {
     pub freshness: FreshnessRequirement,
     /// Read at the settled frontier rather than at the ragged head (SPEC.md §10.5).
     pub settled: bool,
+    /// The registry this process holds open for its whole life, if it is a process that holds one.
+    ///
+    /// **`None` is the CLI and `Some` is `borg serve`**, and it is on `Ops` rather than threaded
+    /// through every operation for a reason worth stating: not one function below changes shape.
+    /// [`open`] answers "the registry to work through" either way, so an operation cannot tell which
+    /// lifecycle it is running in — which is exactly the property that makes a held registry a
+    /// lifecycle change rather than a second implementation of every command.
+    pub held: Option<Arc<Held>>,
 }
 
 impl Ops {
@@ -83,17 +92,157 @@ impl Ops {
 
 // --- Opening the store --------------------------------------------------------------------------
 
-pub async fn open(args: &Ops) -> Result<Registry> {
+/// A store held open for the life of a process, with the workers that derive on it.
+///
+/// **One `Registry`, and that is the whole point.** `Registry::open` brings the log's projections to
+/// head (`borg_engine::projection`), which for a fresh set means replaying every committed layer. A
+/// process-per-command CLI pays that once per command, which is honest. A server that opened per
+/// *request* paid it per read, and that multiplication is `examples/personal-crm/FRICTION.md` #9:
+/// 18.4 ms per read at L441 rising to 53.0 ms at L1391, on a request whose size never changed.
+///
+/// **Safe because the advisory lock already made serve the only writer.** `borg serve` takes the
+/// lock and every other `borg` invocation against that store is refused by name (`crate::serve`), so
+/// every mutation of this store flows through this instance — which is precisely the precondition a
+/// cache needs. The lock was built for honesty about the single-process assumption; holding a
+/// registry is what that honesty buys.
+///
+/// The executor is here rather than rebuilt per derivation because it is the other half of the same
+/// lifecycle: `tx_commit` used to drop its registry so that `auto_derive` could open another one
+/// *with* an executor, and two live registries over one store are what the single-process assumption
+/// forbids. Carrying the executor on the long-lived registry removes the dance rather than working
+/// around it.
+pub struct Held {
+    registry: Registry,
+    workers: Arc<borg_exec_process::ProcessExecutor>,
+    /// The producer table as it stood when the executor was built. See [`Held::producers_moved`].
+    registered: Vec<String>,
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Held({} producers)", self.registered.len())
+    }
+}
+
+impl Held {
+    /// Whether the producer sidecar has moved under a running server.
+    ///
+    /// **It cannot, and this is the assertion that says so.** `borg repo push` writes
+    /// `producers.json` and reads a directory off this machine's disk, so it is not on the socket
+    /// (SDK-DRAFT §4.3) and is refused outright while a store is served — pushing a schema means
+    /// stopping the server (`CLAUDE.md`). That refusal is what makes registration-at-boot sound: the
+    /// executor is built once from a table nothing can edit while it is in use. If that ever stops
+    /// being true, the symptom would be a producer silently running the wrong binary, which is the
+    /// worst possible way to find out — so it is checked rather than assumed, on the derivation path
+    /// where a small file read is already lost in the noise.
+    fn producers_moved(&self, args: &Ops) -> bool {
+        current_registrations(&load_impls(args)) != self.registered
+    }
+
+    /// Stop the worker pool. Called when the server stops, and only then.
+    pub async fn shutdown(&self) {
+        self.workers.shutdown().await;
+    }
+}
+
+/// Everything about the producer table that the executor was built from.
+///
+/// All four fields, not just the command: a producer whose `source` moved maps over a different
+/// struct and one whose transport changed is spoken to differently, and either would make the pool
+/// wrong in a way no error would name.
+fn current_registrations(impls: &Implementations) -> Vec<String> {
+    let mut found: Vec<String> = impls
+        .producers
+        .iter()
+        .map(|p| {
+            format!(
+                "{}|{}|{}|{:?}",
+                p.id,
+                p.source,
+                p.command.display(),
+                p.transport
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Open the store for the life of a server: one registry, one worker pool, both held.
+///
+/// The counterpart to every `let registry = open(args).await?` below — those answer *this* registry
+/// once it exists. See [`Held`] for why it is safe and what it is worth.
+pub async fn hold(args: &Ops) -> Result<Arc<Held>> {
+    let storage = Arc::new(SqliteStorage::open(&args.store)?);
+    let impls = load_impls(args);
+    // **A store with no root branch is refused here rather than per request.** It used to start and
+    // answer *run `borg init`* to everything asked of it, because it opened per request; a server
+    // that decides once has to decide at boot. Said as its own sentence, because "no branches" at
+    // startup reads like a defect in the server rather than a store that has not been created.
+    let (registry, workers) = open_with_workers(args, storage, &impls)
+        .await
+        .map_err(|err| match err {
+            BorgError::Storage(message) if message.contains("borg init") => BorgError::Storage(
+                format!("{message} — a store has to exist before it can be served"),
+            ),
+            other => other,
+        })?;
+    // Producers for the default branch, at boot. A request naming another branch registers that
+    // branch's producers on the way through (`auto_derive`); `register` is an insert into a map, so
+    // doing it again costs a def-view fold and nothing else.
+    //
+    // **A `--branch` naming a branch that does not exist is not a boot failure.** It is a default a
+    // request may never take: every message may name its own branch, and refusing to start over a
+    // default nothing asks for would be a new opinion arriving on a lifecycle change. A store with
+    // no branches *at all* was already refused above, which is the different statement.
+    if let Ok(branch) = branch_of(&registry, args.branch.as_deref()) {
+        registry.register_producers(branch).await?;
+    }
+    Ok(Arc::new(Held {
+        registry,
+        workers,
+        registered: current_registrations(&impls),
+    }))
+}
+
+/// The registry an operation works through: the one this process holds, or one opened for this call.
+///
+/// A `Deref` rather than two code paths. Every operation below says `open(args).await?` and then
+/// uses it as a `Registry`; whether that registry outlives the call is not a question any of them
+/// asks, and `drop`ping this is a no-op when it is held — which is what lets `tx_commit` keep its
+/// explicit drop and mean the same thing in both lifecycles.
+pub enum Session<'a> {
+    Owned(Registry),
+    Held(&'a Registry),
+}
+
+impl std::ops::Deref for Session<'_> {
+    type Target = Registry;
+
+    fn deref(&self) -> &Registry {
+        match self {
+            Self::Owned(registry) => registry,
+            Self::Held(registry) => registry,
+        }
+    }
+}
+
+pub async fn open(args: &Ops) -> Result<Session<'_>> {
+    if let Some(held) = &args.held {
+        return Ok(Session::Held(&held.registry));
+    }
     let storage = Arc::new(SqliteStorage::open(&args.store)?);
     // The poison table comes from beside the store even on the read path, and especially there:
     // the reader is the one §14 owes an explanation to, and it is never the process that discovered
     // the failure (SPEC.md §14).
-    Registry::open_with_poison(
-        storage,
-        Arc::new(NativeExecutor::new()),
-        Arc::new(FilePoison::new(args)),
-    )
-    .await
+    Ok(Session::Owned(
+        Registry::open_with_poison(
+            storage,
+            Arc::new(NativeExecutor::new()),
+            Arc::new(FilePoison::new(args)),
+        )
+        .await?,
+    ))
 }
 
 /// The branch the `Struct#100` shorthand names ids on.
@@ -815,6 +964,12 @@ pub async fn tx_commit(args: &Ops, tx: &str) -> Result<LayerId> {
     set_paused(args, state.branch, false)?;
 
     let landed = landing(&registry, &state, &replayed);
+    // **Dropped here, and it used to be load-bearing.** `auto_derive` opens a registry *with* an
+    // executor, and two live `Registry` instances over one store are what the single-process
+    // assumption forbids — so this drop was what made the next line legal, and it is why `borg serve`
+    // could not hold a store open (`CLAUDE.md`, `crate::serve`). A held registry carries the executor
+    // itself, so the drop is a no-op there and `auto_derive` reuses the same instance. Kept because
+    // the CLI still opens one per command and still has to put it down before opening the next.
     drop(registry);
     // **The commit landed, whatever happens next.** Derivation is chased here because there is no
     // scheduler to hand it to (§9.6), and a merge that succeeded must not be reported as a failure
@@ -914,21 +1069,38 @@ pub fn remember(
 /// follows a write, and a `--freshness current` read. Producer *definitions* live in the log and
 /// producer *implementations* in the sidecar beside it (§9.2), so being able to run anything at all
 /// means joining the two — and doing that in three places is how they drift.
-pub async fn open_deriving(
-    args: &Ops,
-) -> Result<(Registry, Arc<borg_exec_process::ProcessExecutor>)> {
+pub async fn open_deriving(args: &Ops) -> Result<(Session<'_>, Workers)> {
+    if let Some(held) = &args.held {
+        // Already open, already registered, workers already warm. The one call that used to be
+        // impossible to make twice against one store is now the same call as any other read.
+        return Ok((Session::Held(&held.registry), Workers::Held));
+    }
     let storage = Arc::new(SqliteStorage::open(&args.store)?);
     let impls = load_impls(args);
+    let (registry, executor) = open_with_workers(args, storage, &impls).await?;
+    registry
+        .register_producers(branch_of(&registry, args.branch.as_deref())?)
+        .await?;
+    Ok((Session::Owned(registry), Workers::Owned(executor)))
+}
 
+/// Build the executor and the registry behind it, for whoever is going to hold them.
+///
+/// Shared by [`open_deriving`] and [`hold`] so that a server and a CLI command derive through
+/// identically-configured machinery: the pool size, the poison table and the allocation branch a
+/// worker resolves shorthands against are all decided in exactly one place.
+async fn open_with_workers(
+    args: &Ops,
+    storage: Arc<SqliteStorage>,
+    impls: &Implementations,
+) -> Result<(Registry, Arc<borg_exec_process::ProcessExecutor>)> {
     // A worker resolves the `Company#1` shorthand against the allocating branch, which is a fact
-    // about the store — so the store has to be open before the executor can be built.
-    let probe = Registry::open(
-        Arc::clone(&storage) as Arc<_>,
-        Arc::new(NativeExecutor::new()),
-    )
-    .await?;
-    let allocation = allocation_branch(&probe)?;
-    drop(probe);
+    // about the store — so the store has to be readable before the executor can be built. Read from
+    // the branch table rather than by opening a whole registry: §17.1 says the branch table is the
+    // structure of the log rather than a projection of it, so the one question asked here is answered
+    // by one read, and opening a registry to ask it used to replay the entire log a second time on
+    // every deriving command.
+    let allocation = allocation_branch_of(storage.as_ref()).await?;
 
     let parallelism = derive_parallelism();
     let executor = borg_exec_process::from_registrations(
@@ -954,11 +1126,42 @@ pub async fn open_deriving(
     )
     .await?;
     registry.engine.set_parallelism(parallelism);
-
-    registry
-        .register_producers(branch_of(&registry, args.branch.as_deref())?)
-        .await?;
     Ok((registry, executor))
+}
+
+/// The worker pool an operation derived through: this call's, or the server's.
+///
+/// [`shutdown`](Workers::shutdown) is a no-op on a held pool, which is the whole reason this is a
+/// type and not an `Option`. `auto_derive` shuts its workers down because it started them; a server's
+/// pool outlives every request, and an operation that could not tell the difference would tear down
+/// the server's workers after the first commit.
+pub enum Workers {
+    Owned(Arc<borg_exec_process::ProcessExecutor>),
+    Held,
+}
+
+impl Workers {
+    pub async fn shutdown(&self) {
+        match self {
+            Self::Owned(workers) => workers.shutdown().await,
+            Self::Held => {}
+        }
+    }
+}
+
+/// The root branch, straight from the branch table.
+///
+/// The same answer [`allocation_branch`] gives, without a registry to give it: a PID's branch
+/// component names where an object was *allocated*, so it always resolves against the root.
+async fn allocation_branch_of(storage: &SqliteStorage) -> Result<BranchId> {
+    storage
+        .read_branches()
+        .await?
+        .into_iter()
+        .filter(|branch| branch.origin.is_none())
+        .map(|branch| branch.id)
+        .min_by_key(|id| id.0)
+        .ok_or_else(|| BorgError::Storage("store has no branches — run `borg init`".into()))
 }
 
 /// How many invocations a round runs at once, and how many worker processes back them.
@@ -995,7 +1198,22 @@ pub async fn auto_derive(args: &Ops, branch: BranchId) -> Result<()> {
     if load_impls(args).producers.is_empty() {
         return Ok(());
     }
+    if let Some(held) = &args.held {
+        // See `Held::producers_moved`: `repo push` is refused while a store is served, so the table
+        // the executor was built from cannot have moved. Said out loud because the failure mode of a
+        // wrong assumption here is a producer running stale code and nothing looking wrong.
+        if held.producers_moved(args) {
+            eprintln!(
+                "warning: the producer table changed under a running server — the worker pool was \
+                 built at boot and is now stale. Stop the server and start it again."
+            );
+        }
+    }
     let (registry, workers) = open_deriving(args).await?;
+    // The branch being caught up, which is not always the one the command named: a commit catches up
+    // the transaction's *parent*. Registration is an insert into a map, so doing it for a branch
+    // already registered costs a def-view fold and nothing else (§9.2).
+    registry.register_producers(branch).await?;
     let before: Vec<_> = broken_here(args, &registry, branch)?
         .into_iter()
         .map(|(_, poisoning)| poisoning.producer)
@@ -1247,6 +1465,7 @@ mod tests {
     async fn store_with_contacts(dir: &Path) -> Ops {
         let args = Ops {
             store: dir.join("borg.db"),
+            held: None,
             branch: None,
             version: None,
             freshness: FreshnessRequirement::Validated,

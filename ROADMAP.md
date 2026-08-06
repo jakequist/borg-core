@@ -83,6 +83,15 @@ something already derived — is discovered by an ordinary `borg derive` instead
 rebuild. What it gives up is written down in §6.3: how many intermediate derived snapshots a backlog
 leaves is now a property of the schedule, and nothing can ask.
 
+**And the first application found the cost nobody had multiplied.** `examples/personal-crm` is the
+instrument and `FRICTION.md` is the reading; #9 measured a read costing 18 ms at branch head L441 and
+53 ms at L1391 — a cost tracking the log rather than the request, because `borg serve` opened the
+store per request and each open replayed the log. Both halves were documented; nothing said what they
+multiplied to. The fix drew the seam first: the rebuilt indexes are `Projection`s of the log, opening
+is *bring each to head*, and a process that stays up is already there. `borg serve` holds one deriving
+registry, per-read cost is flat at 0.3–0.6 ms from L451 to L4001, and the two lifecycles are held to
+the same answers by a rebuild-and-diff harness rather than by argument.
+
 Act 1 is the modern ORM.
 
 ---
@@ -101,6 +110,16 @@ them forward, and the CLI is doing the SDK's job well enough to keep learning fr
 enumerating it is what would make merge asymptotically free; the model now permits it and the old
 one forbade it. It needs read-path compaction to pay for itself, so what landed is the honest
 version: `n` membership rows and `n` index entries per merged layer instead of `n` full records.
+
+**Concurrent requests in `borg serve`.** The server holds one registry now, so the per-request replay
+is gone, but requests are still serialised through one store-wide gate. Relaxing it is a separate
+change and needs a soak of its own: the engine's internals are `Arc`/`Mutex` and were soaked at
+parallelism 16 in the concurrency milestone, but that proves the engine tolerates concurrent *tasks*,
+not that two client operations may interleave mid-flight. What has to be established first is the
+sidecars — the transaction table, the pause flags and the PID counter are read-modify-write on files
+beside the store, and today the gate is the only thing making that safe. The gate is also what buys a
+served store the serialisation process-per-command gave the CLI for free, so removing it is a change
+to what a client is promised, not only to throughput.
 
 A **`Watermark` newtype**, and it is the one deferral that has already cost four bugs. Four pairs of
 `LayerId` have been conflated so far — `read_at` vs `reflects`, `authored` vs `landed`, the round
@@ -1121,6 +1140,100 @@ label. `broken` is a label on a stored record (§10.4), and enumerating the cell
 have written is not a set anything can produce.
 
 ### Performance, tooling and tests
+
+#### The rebuilt indexes are `Projection`s, and a server holds one registry
+
+The abstraction came first and the fix fell out of it, deliberately in that order: the owner's rule
+is that performance work lives behind a seam that cannot taint correctness, and the seam here is the
+one the spec had already described in prose. §17.1 said the dependency index, the cell-touch index
+and the watermarks are "a cache rebuildable by replaying committed layers". That sentence is now a
+type. A `Projection` says what it answers, how to fold one committed layer in, and the **position** it
+has folded through; `Registry::open` is *bring every projection to head*, which for a fresh set is
+today's replay and for a maintained one is nothing at all.
+
+**What was deliberately left out of the trait.** No snapshot hook, no serialisation, no way to fold
+backwards, no notion of a summary that might be wrong. Three methods and a position, which is what
+the two lifecycles that actually exist genuinely share. `wants(layer)` is in because both of them
+already had it — the touch index has never read derived layers (§12.4) and the frontier reads no
+events at all — and a fold that needs no membership must not make a replay read one. Everything else
+a future implementation might want is an *implementation* of this seam rather than a hook on it:
+
+- A **materialised** projection — one that persists alongside the log and comes back at a position
+  near head — needs nothing new. It answers `position()` with what it loaded and folds the tail.
+- A **probabilistic** one — a bloom filter over the touch index, graded lineage from per-record to
+  per-buffer (`index.rs`) — is legitimate provided its error is one-sided in the direction
+  `CellTouchIndex::moved_since` already established: *"a `true` says only check properly. It never
+  stands in for a guard failure."* That is the contract an approximation has to meet, and it is a
+  precedent rather than a new rule.
+- Sharding either index by cell key (§17.2) is orthogonal and already permitted.
+
+**The correctness harness is the point, not the trait shape.** `crates/borg-engine/tests/projections.rs`
+folds a real store from zero and compares it against the live-maintained set, question for question,
+after derivation with re-runs, a round that merged, a transaction that merged and a fork that did
+not. Without it, a divergence is invisible: everything rebuilt from zero answers correctly, so a
+served store could quietly answer something else while every existing test passed. It is what makes
+future hacks behind this seam safe to try, and it found something on the first run — see below.
+
+**Then the fix.** `borg serve` holds one deriving `Registry` for its lifetime and every request shares
+it. The blocker was never the socket: `ops::tx_commit` dropped its registry so `auto_derive` could
+open another one *with* an executor, and two live registries over one store are what the
+single-process assumption forbids. The long-lived registry carries the executor, so both use the same
+instance and the dance is gone. What makes it *safe* is the advisory lock — serve is the only writer,
+the CLI is refused by name, and `repo push` requires a stop — so every mutation flows through the
+instance maintaining the projections. The lock was built to be honest about a single-process
+assumption; it turns out to be the precondition for the cache.
+
+The measurement, `examples/personal-crm/FRICTION.md` #9, reproduced with `examples/personal-crm/bench.sh`
+against both binaries on one machine:
+
+| contacts | head | `GET /contacts` before | after | ms/read before | ms/read after |
+|---:|---:|---:|---:|---:|---:|
+| 45 | L451 | 1 708 ms | 27 ms | 18.8 | 0.3 |
+| 100 | L1001 | 8 157 ms | 70 ms | 40.6 | 0.3 |
+| 140 | L1401 | 15 556 ms | 160 ms | 55.4 | 0.6 |
+| 400 | L4001 | — | 328 ms | — | 0.4 |
+
+The per-read cost stopped tracking the branch head. `POST /contacts` went from 636 ms rising to
+891 ms, to flat at ~370 ms. The fan-out benchmark is unchanged, which is the other half of the claim:
+this moved a lifecycle, not a hot path.
+
+**What was deliberately not done.** The store-wide gate stays: requests are still answered one at a
+time. The replay was the cost and the gate was not, and letting reads overlap is a different change
+with a soak of its own — the engine's internals are `Arc`/`Mutex` and were soaked at parallelism 16
+in the concurrency milestone, but "the engine tolerates concurrent tasks" is not "two requests may
+interleave mid-operation", which is the property process-per-command gave the CLI for free and which
+nothing here re-establishes. The CLI still rebuilds per command, because a process that exits has
+nothing to keep. And the post-write `catch_up` is still a call rather than a signal (§9.6) — a write
+still pays for the derivation it causes, inside the request that caused it, and that is most of what
+the residual 370 ms is.
+
+#### The replay keys a round's own derived layers on the round branch
+
+Found by the rebuild-and-diff harness above, on its first run, and **not fixed here**.
+
+`Registry::open`'s replay folds a derived layer's edges under `layer.branch`. For the derived layers a
+round merged onto the trunk that is right; for the round's *own* copies of them, still sitting on the
+round branch, it keys the same edges a second time under the round branch — which is what §16.3.8 and
+`CLAUDE.md` #11 say must never happen. The live index does it correctly, because the engine records
+against `at.home`.
+
+On the trunk the two agree exactly, and no read path ever includes a round branch, so the surplus is
+unreachable memory rather than a wrong answer — for a round that merged in full. The case that is not
+merely wasteful is **partial application** (§16.5): a dropped invocation's derived layer never reaches
+the trunk, so a replay files its edges under a branch nobody looks up and the trunk loses them. That
+is the exact failure invariant 11 is written to prevent, arriving through the back door of a rebuild
+rather than through the keying.
+
+It is left alone because fixing it means telling a round branch from an ordinary one out of the log,
+and a round branch is currently identified only by having no name — which is a convention, not a fact.
+Giving `Branch` a kind is a durable-format change and belongs with the branch-reaping question already
+open under *Concerns carried over from the transactional-model draft*. The harness pins what is true
+today: the tests compare on the branches something can name, and assert separately that the live index
+holds nothing at all under a round's branch.
+
+The change above reduces the blast radius rather than enlarging it — a served store now answers from
+the live index instead of rebuilding one per request — but the CLI still rebuilds per command, so this
+is live code and not a curiosity.
 
 #### Workers are a pool per command
 
