@@ -865,6 +865,46 @@ The recorded read-set is `{(company, website), (company, founders), (founder_i, 
 **Pushing new pipeline source is a `DefEvent`** that moves the producer's ClientVersion and
 invalidates all of its prior output, triggering a full recompute across its source buffer.
 
+A producer standing **below its own ClientVersion** has not run at the version it is now defined at,
+which is the same statement as "has never run here" and takes the same path: its whole source buffer,
+enumerated (§9.6). This is what makes the sentence above true rather than merely asserted — the
+alternative is a store in which one field holds output from two different programs, every value
+labelled `current`, with nothing in the envelope (§10.4) to tell them apart.
+
+**A repo says what its code is, and that is part of the producer's definition.** `describe` (§17.4)
+carries an optional **implementation fingerprint** per producer: an opaque string whose only contract
+is that it changes when the code changes. `ProducerDef` records it, so it is folded, forked and merged
+like the rest of the definition, and `borg repo push` diffs it like the rest of the definition — a
+changed fingerprint re-emits `PushProducer` and nothing else does.
+
+It has to be part of the *definition* rather than a fact about a machine, because the diff is where
+this decision is made. A repo emits the shape it believes in and the branch says what it already
+believes (§17.4); before the fingerprint, the comparable surface was a producer's name, source buffer
+and declared fields, and **an edit to a pipeline body moves none of them**. So an edited pipeline
+diffed as unchanged, no event was emitted, and the machinery above never fired. Where the code *lives*
+stays outside the log all the same — see *Definition and implementation are separate* below, which is
+the line this sits on and does not cross.
+
+Four consequences, all deliberate:
+
+- **A fingerprint change is not a schema change.** It emits no `MutateField`, demands no migration and
+  moves no field's def-version. The producer's own definition re-lands and its output is recomputed in
+  place, at the version those values already had (§5.3). A migration bridges two shapes that coexist;
+  here the old output is simply wrong.
+- **An unchanged repo emits nothing at all**, and that is what makes this affordable. The recompute is
+  `O(the producer's source buffer)` per *edit*, not per push, which is the difference between a
+  guarantee and a dev loop nobody would leave switched on.
+- **Absent means never invalidate on a code change.** A fingerprint is optional on the wire: a repo
+  that supplies none gets one from the pusher, which hashes the executable it just ran — that is what
+  covers a worker written in `bash` and `jq`, which cannot reasonably digest itself. A producer that
+  can be fingerprinted by neither route behaves exactly as every producer did before fingerprints
+  existed. What an SDK's own fingerprint covers is the SDK's to state and varies by language; nothing
+  compares one producer's fingerprint with another's, or with the same producer's under a different
+  scheme, so they need not agree on anything but changing.
+- **Absent → present is a change**, so the first push against a store that predates this recomputes
+  once. Nothing recorded what produced the values already there, and one recompute is the only honest
+  answer to that.
+
 **A pipeline's output field must be declared, and its repo is what declares it.** A producer write is
 validated like any other (§8), so a pipeline whose output field nobody declared cannot write at all.
 The repo therefore emits its struct definitions alongside its producers, and both land in one def
@@ -875,9 +915,17 @@ authored: the layer id does not exist when the event is built, and a merge repla
 another branch as a different layer. What the event carries is a placeholder.
 
 **Definition and implementation are separate.** The log records only the *definition* — `ProducerId`,
-source buffer, ClientVersion. The `ExecutionProvider` (§17) resolves that ID to an *implementation*.
-In v1 that resolution is a static registry of Rust functions compiled into the binary; later it is a
-container image reference reached over a socket. The log's model is identical either way.
+source buffer, ClientVersion, and a fingerprint of the implementation. The `ExecutionProvider` (§17)
+resolves that ID to an *implementation*. In v1 that resolution is a static registry of Rust functions
+compiled into the binary; later it is a container image reference reached over a socket. The log's
+model is identical either way.
+
+The fingerprint does not weaken that separation, and the line it sits on is worth being exact about.
+What the log records is *that the code is this one and not that one*, which is a fact about the repo:
+the same on every machine, forkable, mergeable, and the thing a diff has to compare. What stays out is
+*where the code is* — a path, an image reference, a registry entry — which is a fact about one
+deployment and would tie the data model to a filesystem. Swapping a build in behind the log's back is
+therefore invisible on purpose, and the operation that exists for it is `borg derive --rebuild`.
 
 ### 9.3 Migrations
 
@@ -2288,7 +2336,7 @@ The payload is shaped so a shell script can produce it with one `jq -n`:
       { "name": "website",       "type": "String" },
       { "name": "founded",       "type": "Int", "up": "founded_up", "down": "founded_down" },
       { "name": "is_investible", "type": "Bool", "derived_by": "invest" } ] } ],
-  "producers":  [ { "name": "invest",     "source": "Company" } ],
+  "producers":  [ { "name": "invest",     "source": "Company", "fingerprint": "sha256:9f2c…" } ],
   "migrations": [ { "name": "founded_up" }, { "name": "founded_down" } ] }
 ```
 
@@ -2315,6 +2363,18 @@ change: the field is the thing that persists across pushes.
 
 A migration spec carries only a name. Which field it bridges, and in which direction, comes from the
 field naming it as `up` or `down` — one source of truth, so the two cannot disagree.
+
+**A producer or migration spec may also carry a `"fingerprint"`**, which is what makes the diff able
+to see a code change at all (§9.2). Everything else in this payload describes a *shape*, and editing a
+pipeline's body changes no shape — so without it an edited pipeline diffs as unchanged and its old
+output is never invalidated. The string is opaque and its only contract is that it changes when the
+code changes; nothing ever compares one producer's with another's.
+
+It is optional because a `jq -n` repo cannot reasonably digest itself: `borg repo push` falls back to
+hashing the executable it just ran, which is a strictly better answer than making this a feature of
+languages that ship an SDK. An SDK supplies its own only where it can cover *more* than that one file
+— which is a per-language question, and each SDK states what it reaches and what it does not rather
+than claiming a guarantee the other would not keep.
 
 **`ProducerCtx` is async from day one**, even though the v1 in-process implementation only ever
 returns ready futures. A socket-backed provider performs a round-trip per cell read, and retrofitting

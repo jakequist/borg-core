@@ -144,6 +144,11 @@ is better than one at first use. The `resolve` line is §4.4's envelope split.
    walks a directory of executables and never learns what any of them is written in; the only
    per-language fact in the whole store is a path in `borg.producers.json`.
 
+   *Since amended in exactly one place*: the implementation fingerprint (§4.6) is a hash of the code,
+   so two different programs must describe themselves differently there or it is not a hash of
+   anything. Scenario 240 strips that one field before diffing and asserts the two differ. Everything
+   else is still byte for byte.
+
    **Two things in the TS SDK turned out to be ergonomics wearing contract's clothes.** Neither had
    leaked into the protocol, so neither cost anything — but both read as contract in §4.1 and in the
    TS source, and they are not:
@@ -386,6 +391,53 @@ is better than one at first use. The `resolve` line is §4.4's envelope split.
 6. **Sugar** (unscheduled): sync-over-async pipelines, `transact` retry, ownership inference,
    `hasMany` (blocked on aggregations). Nothing in §4 is now unbuilt except the WebSocket listener,
    which §5 has always said lands with the browser client rather than with the transport trait.
+
+### 4.6 An SDK says what its code is, and the two SDKs say different amounts
+
+Both SDKs now put a **`fingerprint`** on every producer they describe: an opaque string whose only
+contract is that it changes when the code changes (SPEC §9.2, §17.4). It exists because
+`borg repo push` is a diff over *shapes* and a pipeline's body is not a shape — so before this, an
+edit to a pipeline invalidated nothing and the store served output from two builds at once
+(`examples/personal-crm/FRICTION.md` #17).
+
+**This is the first thing in the SDK surface that is deliberately unequal between the two languages**,
+and it is worth being precise about why, because "the two SDKs emit the same describe payload byte for
+byte" was until now a clean claim and is now a claim with an exception.
+
+- **TypeScript covers the entry module's bytes.** `process.argv[1]` is the file `borg` executed, and
+  that file is hashed. **Imports are not covered.** A pipeline that calls into `./scoring.ts` can be
+  rewritten entirely without moving its fingerprint. Node's ESM loader exposes no supported way to
+  enumerate a module graph from inside it — there is no `require.cache` for ESM — and building one
+  means a resolver or a loader hook, which is a dependency and a build step this SDK does not have.
+  Recorded as a hole, not as a coverage claim.
+- **Python covers the entry module plus every already-imported module beside it** — anything under
+  the entry file's directory, which for a repo is `pipelines/` and is the directory Python puts on
+  `sys.path` for a script. `sys.modules` already holds the graph by describe time, so this is a
+  filter over a dict and a few file reads.
+- **Python stops at the repo, on purpose.** Stdlib, installed packages and the SDK itself are
+  excluded. Hashing the environment would move a repo's fingerprint on an unrelated upgrade, and
+  every push after every install would recompute every source buffer — a mechanism that cries wolf is
+  one people route around. The hole this leaves is a pipeline whose logic lives in an installed
+  package.
+- **A repo that omits it is not opting out.** `borg repo push` hashes the executable it just ran,
+  which is what covers a `jq`-and-`bash` worker. An SDK supplies its own only where it covers *more*
+  — which is why TypeScript's answer is, by construction, the same information the fallback would
+  have produced. It is computed in the SDK anyway, because that is where growing the coverage will
+  happen and because an SDK that is silent about its own code is an SDK nobody can reason about.
+- **The two digests are not comparable and need not be.** Python folds several files and their
+  relative names into one hash; TypeScript hashes one file's bytes. Nothing anywhere compares one
+  producer's fingerprint with another's — the only comparison made is a producer's new fingerprint
+  against its own previous one — so agreeing would buy nothing and would have cost Python its module
+  graph.
+
+**`describe()` stays pure in both.** The fingerprint is a fact about a file, not about the DSL, so it
+is attached by `repo()` — already the impure half in both languages, the one that reads argv and opens
+sockets. The pure `describe(structs, pipelines)` that both test suites assert to the byte is
+unchanged, which is what keeps those assertions worth making.
+
+Scenario 240's byte-for-byte diff now strips the one field and asserts separately that the two
+fingerprints **differ** — two different programs describing themselves identically would mean the
+hash was not a hash of anything.
 
 ## 5. Open questions carried
 

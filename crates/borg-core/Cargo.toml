@@ -12,3 +12,9 @@ workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Def events are persisted as JSON by the SQLite backend, so "an event written before this field
+# existed still reads" is a claim about these types under `serde_json` specifically. Asserting it
+# needs a decoder here; nothing in the crate's own surface does.
+serde_json.workspace = true

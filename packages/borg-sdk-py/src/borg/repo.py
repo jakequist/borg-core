@@ -25,7 +25,9 @@ documented surface until the client contract freezes and the two SDKs can agree.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sys
 from typing import Any, Iterable, Sequence
 
@@ -179,6 +181,14 @@ class Repo:
         # — one is a push-time error the author sees immediately, the other a mid-round failure they
         # would see much later.
         self._description = describe(structs, defined, id)
+        # `describe` in `dsl.py` stays a pure function of the definitions, because that is what its
+        # own tests can assert to the byte. The fingerprint is the one part of the payload that is
+        # not a function of the DSL at all — it is a fact about files on disk — so it is attached
+        # here, in the module that is already the impure half.
+        mark = _fingerprint()
+        if mark is not None:
+            for spec in self._description["producers"]:
+                spec["fingerprint"] = mark
         # Producer id → pipeline. The engine invokes by id, and one module may implement several.
         self._by_id = {producer_id(p.name): p for p in defined}
 
@@ -218,6 +228,73 @@ def repo(
     here gets that copy verified at push time instead of quietly ignored.
     """
     return Repo(id=id, structs=structs, pipelines=pipelines)
+
+
+def _fingerprint(entry: str | None = None) -> str | None:
+    """
+    What this repo's code currently is, for ``borg repo push`` to diff against (§9.2).
+
+    ## What it covers
+
+    **The entry module, plus every already-imported module living beside it.** ``sys.argv[0]`` is the
+    file ``borg`` executed; its directory is a repo's ``pipelines/``, and that directory is exactly
+    the one Python puts on ``sys.path`` for a script — so a pipeline that imports a helper module
+    next to it gets that helper covered too. Editing either moves the fingerprint and invalidates
+    the producer's output.
+
+    The module graph is walked because in Python it is cheap: ``sys.modules`` already holds
+    everything the entry module imported by the time it describes itself, so this is a filter over a
+    dict and a handful of file reads, once per push. The TypeScript SDK cannot do the same — ESM
+    exposes no loaded-module registry — and says so.
+
+    ## What it does not cover, and why
+
+    **Anything outside that directory**: the standard library, installed packages, this SDK, a
+    helper reached through a ``sys.path`` entry somewhere else. That is deliberate rather than
+    incidental. Hashing the environment would make a repo's fingerprint move when an unrelated
+    package was upgraded, and every push after every ``pip install`` would recompute every source
+    buffer — a mechanism that cries wolf is one people learn to route around. The line is drawn at
+    "code this repo ships", and the hole left is a pipeline whose real logic lives in an installed
+    package, which stays invisible.
+
+    The relative path of each file is hashed alongside its bytes, so renaming a helper is a change
+    and moving the whole repo to another directory is not.
+
+    ``None`` when the entry module cannot be read, which puts the push back on its own fallback:
+    hashing the very same file. Nothing is lost by failing here.
+    """
+    entry = sys.argv[0] if entry is None else entry
+    if not entry:
+        return None
+    try:
+        resolved = os.path.realpath(entry)
+        root = os.path.dirname(resolved)
+        digest = hashlib.sha256()
+        # The entry itself is mandatory: failing to read it is what `None` is for. Its siblings are
+        # best effort — a module whose source has gone (a zipimport, a `__file__` pointing at a
+        # `.pyc`) contributes nothing rather than voiding the whole fingerprint.
+        paths = {resolved}
+        for module in list(sys.modules.values()):
+            path = getattr(module, "__file__", None)
+            if not path:
+                continue
+            beside = os.path.realpath(path)
+            if beside.startswith(root + os.sep):
+                paths.add(beside)
+        for path in sorted(paths):
+            try:
+                with open(path, "rb") as handle:
+                    blob = handle.read()
+            except OSError:
+                if path == resolved:
+                    return None
+                continue
+            digest.update(os.path.relpath(path, root).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(blob)
+    except OSError:
+        return None
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _payload(description: dict[str, Any]) -> str:

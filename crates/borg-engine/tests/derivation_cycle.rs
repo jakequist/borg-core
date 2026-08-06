@@ -100,6 +100,7 @@ impl Harness {
             source: BufferId::Object("Company".into()),
             version: LayerId(1),
             declaring_repo: RepoId(1),
+            fingerprint: None,
         });
         // The schema comes first, because nothing may be written until it does (SPEC.md §8).
         defs.push(BRANCH, schema()).await?;
@@ -270,6 +271,7 @@ async fn a_producer_reading_another_producers_output_is_triggered_by_it() -> Res
         source: BufferId::Object("Company".into()),
         version: LayerId(1),
         declaring_repo: RepoId(1),
+        fingerprint: None,
     });
 
     let acme = company(500);
@@ -393,6 +395,7 @@ async fn a_producer_that_does_not_own_a_field_is_the_one_poisoned() -> Result<()
         source: BufferId::Object("Company".into()),
         version: LayerId(1),
         declaring_repo: RepoId(2),
+        fingerprint: None,
     });
 
     let acme = company(400);

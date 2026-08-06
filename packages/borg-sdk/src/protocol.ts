@@ -49,10 +49,22 @@ export interface FieldSpec {
 export interface ProducerSpec {
   name: string;
   source: string;
+  /**
+   * What this producer's code currently is — opaque, and its only contract is that it changes when
+   * the code changes (§9.2).
+   *
+   * `borg repo push` compares it with the one in force and re-emits the producer's definition when
+   * they differ, which moves its ClientVersion and invalidates every value the old code wrote.
+   * Omitting it is not opting out: the push falls back to hashing the command file. This SDK fills
+   * it in — see `fingerprint` in `repo.ts` for exactly what it covers and what it does not.
+   */
+  fingerprint?: string;
 }
 
 export interface MigrationSpec {
   name: string;
+  /** See {@link ProducerSpec.fingerprint}. A migration is a producer (§9.1). */
+  fingerprint?: string;
 }
 
 /**

@@ -20,6 +20,8 @@ not the N+1), **#17** (two versions of a pipeline's output coexist in one store,
 `current`, and nothing can tell them apart), and **#6/#7** (a broken producer marks 140 innocent rows
 broken and leaves the one guilty row reading `current`).
 
+**#17 is fixed**, and #2 with it — see the *Fixed* notes on each. The rest stand as written.
+
 ---
 
 ## 1. A pipeline file must be executable, and nothing says so
@@ -67,6 +69,16 @@ recompiling the api on every boot, for nothing. So `dev.sh` carries its own chan
 every consumer, and every consumer will implement it slightly differently.
 
 **Severity** medium. The workaround is eight lines, and everyone will write it.
+
+**Fixed**, as a consequence of #17 rather than on its own account. `repo push` is a diff on both
+halves now: a definition the branch already holds emits no event, and a producer whose implementation
+fingerprint has not moved emits none either — so an unchanged repo lands no def layer and the command
+says `unchanged: 7 definitions already in force, nothing pushed`. `dev.sh`'s `cksum` stamp is deleted.
+Worth noting what the stamp was actually doing wrong, since it did work: it hashed file contents,
+which is what the fingerprint now does, but compared them against a file beside the store rather than
+against what the **store believes**. Keeping those two in step was the script's job — `--reset` had to
+remember to delete the stamp, and a push to a second branch would have needed a stamp per branch. The
+diff has the other side of the comparison already, and does not.
 
 ---
 
@@ -491,6 +503,54 @@ result `current`, is the one outcome that contradicts what the envelope is for.
 
 **Severity** high. It is the same class as invariant 8 and #6: derived data presented as fresh when
 something about its derivation has moved.
+
+**Fixed.** `describe` now carries an **implementation fingerprint** per producer — an opaque string
+whose only contract is that it changes when the code changes — and it travels in the `PushProducer`
+def event, because *which program this is* belongs to a producer's definition. A changed fingerprint
+therefore re-emits `PushProducer`, which lands a def layer, which moves the producer's ClientVersion,
+and a producer standing below its own ClientVersion is handed its whole source buffer as work. The
+measurement above now runs the other way: at step 2 A's `displayName` moves, at step 4 B's goes back
+with it, and B and C agree at every point. `scenarios/290-a-code-change-invalidates` is that sequence,
+asserted.
+
+Three things about the shape of the fix are worth recording. The entry above raised the second of them
+and was right to:
+
+- **Nothing in the invalidation machinery was broken.** Poisonings already expired against a
+  producer's ClientVersion, and `backfill` already existed for a producer newer than its data. The
+  gap was that the *diff* — a repo emits the shape it believes in, `repo push` compares — had no
+  surface on which a code edit was visible. It was deaf, not broken. Adding one field to the thing
+  being compared was the whole of it; the scheduler learned nothing new, and deliberately still does
+  not know what a fingerprint is.
+- **The `O(all entities)` worry was the right worry, and it is bounded by the diff.** Recomputing on
+  every push would be unusable, which is why the same change makes `repo push` idempotent (#2): the
+  cost is paid per *edit*, not per push. It is still `O(that producer's source buffer)` per edit, and
+  that is the honest price of the guarantee — a CRM with a million contacts pays for a fallback
+  string. Narrowing it further means per-invocation fingerprints of what each *read*, which is a
+  different mechanism.
+- **A code change is deliberately not a schema change.** No `MutateField`, no migration demanded, no
+  field def-version moved: the values are overwritten in place at the version they already had (§5.3
+  is untouched). A migration would be the wrong model — it bridges two shapes that coexist, and here
+  the old output is simply wrong.
+
+What each fingerprint covers is stated where it is computed, and the limits are real: the TypeScript
+SDK hashes the entry module's bytes only, because ESM exposes no way to walk a module graph from
+inside — a pipeline whose logic lives in an imported file can change without moving its fingerprint.
+The Python SDK covers the entry module plus every already-imported module beside it, and not the
+environment. Shell workers get the CLI's fallback, which hashes the command file. A producer that
+cannot be fingerprinted at all keeps the old behaviour, documented as such rather than silently.
+
+One migration effect, once: a store that predates this has no fingerprints, so the first push after
+it lands reads absent → present as changed and recomputes. The CLI says
+`implementation changed (first fingerprint), recomputing N producers` so that it is not mistaken for
+a bug.
+
+One unlooked-for consequence, which is an improvement and is now what `scenarios/210` asserts:
+**a bad deploy is discovered by the push that deployed it.** Pushing a pipeline that throws used to
+commit no data and therefore run nothing, so the failure surfaced on whichever write came next and
+was reported to whoever made it. Now the push runs the new build over the existing buffer, and the
+person who deployed it is the person who is told. Same for #6's blast radius — nothing about that
+changed — but the timing of the report is much better.
 
 ---
 

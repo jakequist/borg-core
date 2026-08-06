@@ -87,6 +87,11 @@ impl DefView {
         self.producers.values()
     }
 
+    /// One producer's definition as this view has it, which is what a push diffs against (§9.2).
+    pub fn producer(&self, id: ProducerId) -> Option<&ProducerDef> {
+        self.producers.get(&id)
+    }
+
     /// The declaration governing a cell, if the cell names a declared field.
     pub fn field(&self, cell: &CellRef) -> Option<&FieldDef> {
         let BufferId::ObjectProp(struct_name, field) = &cell.buffer else {

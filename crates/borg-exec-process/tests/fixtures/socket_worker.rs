@@ -30,6 +30,9 @@ fn main() {
             producers: vec![ProducerSpec {
                 name: "fixture".into(),
                 source: "Company".into(),
+                // A worker that says nothing about its own code, which is the ordinary case: `borg
+                // repo push` hashes the command file instead (SPEC.md §9.2).
+                fingerprint: None,
             }],
             transport: Transport::Socket,
             ..Description::default()

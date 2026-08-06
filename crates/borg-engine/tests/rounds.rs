@@ -140,6 +140,7 @@ impl Harness {
             source: BufferId::Object("Company".into()),
             version,
             declaring_repo: RepoId(1),
+            fingerprint: None,
         });
     }
 

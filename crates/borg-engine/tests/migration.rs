@@ -175,6 +175,7 @@ fn migration_def(id: ProducerId, direction: MigrationDirection) -> ProducerDef {
         source: BufferId::ObjectProp("Company".into(), "website".into()),
         version: LayerId(0),
         declaring_repo: RepoId(1),
+        fingerprint: None,
     }
 }
 
@@ -370,6 +371,7 @@ async fn a_pipeline_at_the_old_version_is_untouched_by_the_migration() -> Result
         source: BufferId::Object("Company".into()),
         version: v_from.0,
         declaring_repo: RepoId(1),
+        fingerprint: None,
     });
 
     let acme = company(300);

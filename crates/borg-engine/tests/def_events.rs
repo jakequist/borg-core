@@ -442,3 +442,99 @@ async fn a_def_mutation_records_a_migration_step() -> Result<()> {
     assert_eq!(hops.len(), 1, "one def-mutation, one hop");
     Ok(())
 }
+
+/// A producer's *implementation* travels in its definition, and the fold carries it. SPEC.md §9.2.
+///
+/// The fold deliberately has no opinion about whether the implementation moved: it stamps the
+/// ClientVersion and stores what it was handed. Deciding whether to emit a `PushProducer` at all is
+/// `borg repo push`'s diff (`producer_change` in `borg-cli`), because that is the only place that
+/// can see both what the repo says now and what the branch already believes.
+mod the_implementation_fingerprint {
+    use super::*;
+    use borg_core::{BufferId, ProducerDef, ProducerKind};
+
+    const SCORE: ProducerId = ProducerId(7);
+
+    fn push_producer(fingerprint: Option<&str>) -> DefEvent {
+        DefEvent::PushProducer(ProducerDef {
+            id: SCORE,
+            kind: ProducerKind::Pipeline,
+            source: BufferId::Object("Company".into()),
+            // A placeholder: the fold stamps the layer this lands on (SPEC.md §9.2).
+            version: LayerId(0),
+            declaring_repo: SALES,
+            fingerprint: fingerprint.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn it_survives_the_fold_and_is_what_the_next_push_diffs_against() -> Result<()> {
+        let h = Harness::new();
+        let main = h.branches.create_root(None).await?;
+        h.push(main, vec![push_producer(Some("sha256:one"))])
+            .await?;
+
+        let path = h.branches.read_path(main, None)?;
+        let view = h.defs.view(&path).await?;
+        assert_eq!(
+            view.producer(SCORE).and_then(|def| def.fingerprint.clone()),
+            Some("sha256:one".to_string()),
+            "what the repo said its code was is readable back out of the definitions in force"
+        );
+        Ok(())
+    }
+
+    /// A ClientVersion is stamped by the fold, so re-landing the definition is what moves it — and
+    /// moving it is what hands the producer its source buffer back (SPEC.md §9.2).
+    #[tokio::test]
+    async fn re_pushing_it_moves_the_producers_client_version() -> Result<()> {
+        let h = Harness::new();
+        let main = h.branches.create_root(None).await?;
+        let first = h
+            .push(main, vec![push_producer(Some("sha256:one"))])
+            .await?;
+        let second = h
+            .push(main, vec![push_producer(Some("sha256:two"))])
+            .await?;
+        assert_ne!(first, second);
+
+        let path = h.branches.read_path(main, None)?;
+        let view = h.defs.view(&path).await?;
+        let def = view.producer(SCORE).expect("the producer is defined");
+        assert_eq!(
+            def.version, second,
+            "its ClientVersion is the layer it was last pushed at"
+        );
+        assert_eq!(def.fingerprint.as_deref(), Some("sha256:two"));
+        Ok(())
+    }
+
+    /// A producer re-pushed on a fork picks up the fork's layer id, like every other def event —
+    /// which is what keeps a code change local to the branch it was deployed on.
+    #[tokio::test]
+    async fn a_fork_that_redeploys_moves_only_its_own_client_version() -> Result<()> {
+        let h = Harness::new();
+        let main = h.branches.create_root(None).await?;
+        let at = h
+            .push(main, vec![push_producer(Some("sha256:one"))])
+            .await?;
+        let fork = h.branches.fork(main, at, None).await?;
+        let redeployed = h
+            .push(fork, vec![push_producer(Some("sha256:two"))])
+            .await?;
+
+        let on_fork = h.defs.view(&h.branches.read_path(fork, None)?).await?;
+        let on_main = h.defs.view(&h.branches.read_path(main, None)?).await?;
+        assert_eq!(
+            on_fork.producer(SCORE).map(|def| def.version),
+            Some(redeployed)
+        );
+        assert_eq!(on_main.producer(SCORE).map(|def| def.version), Some(at));
+        assert_eq!(
+            on_main.producer(SCORE).and_then(|d| d.fingerprint.clone()),
+            Some("sha256:one".to_string()),
+            "main is still running the build it was pushed"
+        );
+        Ok(())
+    }
+}

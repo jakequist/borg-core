@@ -95,6 +95,26 @@ pub struct ProducerDef {
     /// ignore it entirely (see [`ProducerKind::Migration`]).
     pub version: LayerId,
     pub declaring_repo: RepoId,
+    /// **A fingerprint of the implementation this definition was pushed with** (SPEC.md §9.2).
+    ///
+    /// Opaque. Its only contract is that it changes when the code changes, which is what makes
+    /// "this exact program" part of a producer's *definition* rather than a fact about a machine —
+    /// and therefore what puts a code edit into the def diff, where the only other kind of change a
+    /// repo can make already lives. §9.2 promises that pushing new pipeline source moves the
+    /// producer's ClientVersion; without this the diff compares name, source and writes, none of
+    /// which an edit to a body touches, so nothing is emitted and the promise is quietly unkept.
+    ///
+    /// **A fingerprint change is not a schema change.** It re-lands this producer and nothing else:
+    /// no field moves version, no migration is demanded. What it invalidates is the producer's own
+    /// prior output, through the ClientVersion the fold stamps above.
+    ///
+    /// `None` means *this implementation cannot be fingerprinted*, and is a documented status quo
+    /// rather than an error: a code change to such a producer invalidates nothing, exactly as it
+    /// did before fingerprints existed. Old events carry no field at all, which `serde(default)`
+    /// reads as the same thing — and the first push after that reads absent → present as a change
+    /// and recomputes once, which is correct: nothing knows what code produced the old values.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// Pipelines and migrations are the same mechanism with different triggers (SPEC.md §9.1).
@@ -185,5 +205,55 @@ impl DefEvent {
             | DefEvent::DeleteField { repo, .. } => Some(*repo),
             DefEvent::PushProducer(def) => Some(def.declaring_repo),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A def event is a persisted format.** The SQLite backend stores them as JSON, so a store
+    /// written before [`ProducerDef::fingerprint`] existed holds `PushProducer` rows with no such
+    /// key — and a decoder that refused them would make this change undeployable over any store
+    /// that already exists.
+    #[test]
+    fn a_push_producer_written_before_fingerprints_still_reads() {
+        let old = r#"{"PushProducer":{
+            "id":7,
+            "kind":"Pipeline",
+            "source":{"Object":"Company"},
+            "version":3,
+            "declaring_repo":1
+        }}"#;
+        let DefEvent::PushProducer(def) =
+            serde_json::from_str(old).expect("an old def event still reads")
+        else {
+            panic!("the event is a PushProducer");
+        };
+        assert_eq!(def.id.0, 7);
+        assert_eq!(def.version.0, 3);
+        assert_eq!(
+            def.fingerprint, None,
+            "absent means `never invalidate on a code change`, which is exactly what was true \
+             before the field existed — so an old store keeps behaving as it did until its repo is \
+             pushed again"
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_survives_the_round_trip() {
+        let event = DefEvent::PushProducer(ProducerDef {
+            id: ProducerId(7),
+            kind: ProducerKind::Pipeline,
+            source: BufferId::Object("Company".into()),
+            version: LayerId(3),
+            declaring_repo: RepoId(1),
+            fingerprint: Some("sha256:abc".into()),
+        });
+        let encoded = serde_json::to_string(&event).expect("encodes");
+        let DefEvent::PushProducer(def) = serde_json::from_str(&encoded).expect("decodes") else {
+            panic!("the event is a PushProducer");
+        };
+        assert_eq!(def.fingerprint.as_deref(), Some("sha256:abc"));
     }
 }

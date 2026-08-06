@@ -6,10 +6,15 @@
  * statements have to agree in both directions.
  */
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe as suite, expect, test } from "vitest";
 import { borg } from "../src/index.js";
 import { BorgDefinitionError, describe } from "../src/dsl.js";
 import { producerId } from "../src/protocol.js";
+import { fingerprint } from "../src/repo.js";
 
 const investing = () => {
   const Company = borg.struct("Company", {
@@ -145,5 +150,64 @@ suite("the cross-checks, in both directions", () => {
   test("borg.repo refuses at definition time, not at the first invocation", () => {
     const Company = borg.struct("Company", { score: borg.int().derived() });
     expect(() => borg.repo({ structs: [Company], pipelines: [] })).toThrow(BorgDefinitionError);
+  });
+});
+
+/**
+ * §9.2's *pushing new pipeline source moves the producer's ClientVersion* needs something that moves
+ * when the source does. The diff compares name, source buffer and writes, and an edited body touches
+ * none of them — so without this a code change is invisible to the push and the old output goes on
+ * being served labelled `current`.
+ */
+suite("the implementation fingerprint", () => {
+  const scratch = (body: string): string => {
+    const path = join(mkdtempSync(join(tmpdir(), "borg-fingerprint-")), "pipeline.ts");
+    writeFileSync(path, body);
+    return path;
+  };
+
+  test("it changes when the entry module's bytes change", () => {
+    const before = scratch("// one\n");
+    const after = scratch("// two\n");
+    expect(fingerprint(before)).not.toEqual(fingerprint(after));
+  });
+
+  test("it does not change when the code does not", () => {
+    const once = scratch("// same\n");
+    const again = scratch("// same\n");
+    // Two files, one program. Content and not path, so a repo checked out somewhere else is not a
+    // repo whose code changed.
+    expect(fingerprint(once)).toEqual(fingerprint(again));
+    expect(fingerprint(once)).toEqual(fingerprint(once));
+  });
+
+  test("it says what produced it", () => {
+    expect(fingerprint(scratch("x"))).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  /**
+   * The push falls back to hashing the command file, so an unreadable entry loses nothing — and
+   * refusing to describe over it would make an SDK repo un-pushable for a reason that does not
+   * matter.
+   */
+  test("an entry module that cannot be read yields no fingerprint at all", () => {
+    expect(fingerprint(join(tmpdir(), "borg-no-such-file-ever"))).toBeUndefined();
+  });
+
+  test("every producer a repo describes carries it", () => {
+    const { Company, invest } = investing();
+    const described = borg.repo({ structs: [Company], pipelines: [invest] }).describe();
+    expect(described.producers[0]!.fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  /**
+   * `describe` is a pure function of the definitions and stays one: the fingerprint is a fact about
+   * a file, so it is attached by `repo()`, which is already the half that reads argv.
+   */
+  test("the pure describe payload carries none, because it is not a fact about the DSL", () => {
+    const { Company, invest } = investing();
+    expect(describe({ structs: [Company], pipelines: [invest] }).producers[0]).not.toHaveProperty(
+      "fingerprint",
+    );
   });
 });

@@ -164,9 +164,27 @@ mkdir -p "$WORK/repo-ts/node_modules" "$WORK/repo-mixed/node_modules"
 ln -s "$SDK_TS" "$WORK/repo-ts/node_modules/borg-sdk"
 ln -s "$SDK_TS" "$WORK/repo-mixed/node_modules/borg-sdk"
 
-assert_eq "$("$WORK/repo/pipelines/is_investible.py" describe)" \
-    "$("$WORK/repo-ts/pipelines/is_investible.ts" describe)" \
+# The one field that cannot be equal, and must not be. A producer's implementation fingerprint is a
+# hash of the code (§9.2), and these are two different programs in two different languages — two
+# repos describing the same *definitions* while shipping different implementations is exactly the
+# case it exists to tell apart. Everything else has to match to the byte, and the field is dropped
+# from both sides rather than from the claim.
+without_fingerprints() { sed 's/,"fingerprint":"sha256:[0-9a-f]*"//g'; }
+
+assert_eq "$("$WORK/repo/pipelines/is_investible.py" describe | without_fingerprints)" \
+    "$("$WORK/repo-ts/pipelines/is_investible.ts" describe | without_fingerprints)" \
     "the Python and TypeScript SDKs describe the same repo byte for byte"
+
+py_mark="$("$WORK/repo/pipelines/is_investible.py" describe)"
+ts_mark="$("$WORK/repo-ts/pipelines/is_investible.ts" describe)"
+assert_contains "$py_mark" '"fingerprint":"sha256:' \
+    "the Python SDK states what its implementation currently is"
+assert_contains "$ts_mark" '"fingerprint":"sha256:' \
+    "and so does the TypeScript one"
+if [ "$py_mark" = "$ts_mark" ]; then
+    fail "two different programs described themselves identically — the fingerprint is not a hash of anything"
+fi
+pass "and the two differ, because they are two different programs"
 
 # ── One repo, two languages, one round ─────────────────────────────────────────────────────────────
 

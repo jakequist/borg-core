@@ -951,7 +951,8 @@ impl DerivationEngine {
         live.is_empty() || live.contains(&ClientVersion(role.output.0))
     }
 
-    /// The whole of a producer's source buffer, as work, for a producer that has never run here.
+    /// The whole of a producer's source buffer, as work, for a producer that has never run here **at
+    /// this ClientVersion**.
     ///
     /// A committed layer is the changeset (§9.6), which answers "what moved" perfectly and "what was
     /// already there" not at all. That gap opens the moment a producer is *newer than the data*:
@@ -977,7 +978,23 @@ impl DerivationEngine {
         def: &ProducerDef,
         defs: &DefView,
     ) -> Result<Vec<Invocation>> {
-        if self.frontier.watermark(branch, def.id) != LayerId(0) {
+        // **Two ways of never having run here, and the second is what a code change looks like.**
+        //
+        // A watermark of zero is a producer that has incorporated nothing — a fresh definition, a
+        // fork, a rewind. The other case is a producer standing *below its own ClientVersion*: its
+        // definition was pushed again at a def-layer it has not yet incorporated, so every value it
+        // has already written was produced by a different program (§9.2). A watermark claims
+        // "replay the world at W and you get exactly this" (§10.1), and after a re-push that claim
+        // is false for output computed by the code that has just been replaced — the fork replays
+        // with *today's* implementation and disagrees. Handing the producer its whole source buffer
+        // is what makes §9.2's *invalidates all of its prior output* true rather than asserted, and
+        // it is the same statement `revive` and `recompute` make by rewinding.
+        //
+        // Which producers reach this at all is the diff's business, not the engine's: `borg repo
+        // push` re-emits `PushProducer` only when the implementation fingerprint moved, so an
+        // unchanged repo pushed twice never moves a ClientVersion and never lands here.
+        let watermark = self.frontier.watermark(branch, def.id);
+        if watermark != LayerId(0) && watermark.0 >= def.version.0 {
             return Ok(Vec::new());
         }
         let role = defs.migration_role(def);

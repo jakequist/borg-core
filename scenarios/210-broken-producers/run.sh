@@ -18,15 +18,21 @@ borg set 'Company#1.headcount' 40 >/dev/null
 assert_eq "$(borg get 'Company#1.risk' --value)" "low" "the working build derived its field"
 assert_field "$(borg get 'Company#1.risk')" "state" "current" "and the cell is current"
 
-# A bad deploy of the same producer: same name, same id, same schema, throwing code. A def push
-# commits no data and so runs nothing, which is why the write below is what invokes it.
-borg repo push "$HERE/repo-broken" >/dev/null
-broke="$(borg set 'Company#1.headcount' 5 2>&1 >/dev/null)"
+# A bad deploy of the same producer: same name, same id, same schema, throwing code.
+#
+# **The push is what runs it.** A producer's implementation is part of its definition (§9.2), so a
+# changed fingerprint re-emits `PushProducer`, moves the producer's ClientVersion, and hands it its
+# whole source buffer as work — which means a bad build is discovered by the deploy that introduced
+# it rather than by whichever unlucky write came next.
+broke="$(borg repo push "$HERE/repo-broken" 2>&1 >/dev/null)"
 [ "$(attempts)" -gt 0 ] || fail "the new build ran at least once before it was judged broken"
 pass "the new build ran before it was judged broken"
 assert_contains "$broke" "score is now broken" \
-    "the write that discovered the failure is the one that reports it"
+    "the push that deployed the broken build is the one that reports it"
 assert_contains "$broke" "score exploded" "and says what the producer said"
+
+# The write that follows finds the producer already judged broken, and is not what discovered it.
+borg set 'Company#1.headcount' 5 >/dev/null
 
 # **The claim §14 makes, read back from a process that never saw the failure.**
 broken="$(borg get 'Company#1.risk')"

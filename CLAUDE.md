@@ -173,6 +173,20 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   cheap, but `Registry::open` replays the log on every CLI invocation, so the `O(log)` open grows
   with it. The transactional-model draft flagged this; the fan-out benchmark cannot see it, because
   it drives the engine rather than the CLI.
+- **A producer's implementation fingerprint does not cover what it imports.** §9.2's "pushing new
+  pipeline source moves the producer's ClientVersion" is implemented by hashing the code and putting
+  the digest in `PushProducer`, and what "the code" reaches is per language: the TypeScript SDK hashes
+  the entry module's bytes only, because ESM exposes no loaded-module registry; the Python SDK adds
+  every already-imported module beside the entry file and stops at the repo, because hashing the
+  environment would recompute everything after an unrelated `pip install`; a shell worker gets `borg
+  repo push`'s fallback, which hashes the command file. So a pipeline whose logic lives in an imported
+  module can change without invalidating anything. `borg derive --rebuild` owes nothing to
+  fingerprints and is the answer meanwhile. A producer that can be fingerprinted by neither route is
+  *documented* to invalidate on nothing — see `producer_change` in `crates/borg-cli/src/main.rs`.
+- **Swapping a build in behind the log's back is invisible, deliberately.** The log records *which*
+  program a producer is, never *where* it is (§9.2) — so editing `borg.producers.json` to point at
+  different code changes no definition and triggers no recompute. `scenarios/100-watermark-truth`
+  depends on that: it is how the sweep manufactures a value its own watermark no longer reproduces.
 - **A producer that has never succeeded has no cell to call `broken`.** §14's state is a label on a
   stored record (§10.4), and a pipeline that threw on its first run wrote none, so its output reads
   as simply absent. Enumerating the cells a producer *might* have written is not a set anything can

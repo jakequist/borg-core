@@ -172,6 +172,7 @@ impl Harness {
             source: BufferId::ObjectProp("Company".into(), "website".into()),
             version: LayerId(0),
             declaring_repo: RepoId(1),
+            fingerprint: None,
         });
     }
 }
