@@ -14,6 +14,9 @@
  * scenario 030 exists to demonstrate. Tracking ships in no SDK, ever.
  */
 
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+
 import { connect, type Connection } from "./connection.js";
 import { producerId, type Description, type ToWorker } from "./protocol.js";
 import {
@@ -45,7 +48,15 @@ export interface Repo {
  * failure they would see much later.
  */
 export function repo(config: RepoConfig): Repo {
+  // `describe` in `dsl.ts` stays a pure function of the definitions, because that is what its own
+  // tests can assert to the byte. The fingerprint is the one part of the payload that is not a
+  // function of the DSL at all — it is a fact about the file on disk — so it is attached here,
+  // where this module is already the impure half that reads argv and opens sockets.
   const description = describe(config);
+  const mark = fingerprint();
+  if (mark !== undefined) {
+    for (const spec of description.producers) spec.fingerprint = mark;
+  }
   // Producer id → pipeline. The engine invokes by id, and one module may implement several.
   const byId = new Map<string, PipelineDef>();
   for (const p of config.pipelines) byId.set(producerId(p.name), p);
@@ -60,6 +71,40 @@ export function repo(config: RepoConfig): Repo {
       await serve(byId);
     },
   };
+}
+
+/**
+ * What this repo's code currently is, for `borg repo push` to diff against (§9.2).
+ *
+ * ## What it covers
+ *
+ * **The entry module's bytes, and nothing else.** `process.argv[1]` is the file `borg` executed,
+ * which is the pipeline module itself — so editing a pipeline body, a helper function beside it, or
+ * anything else in that one file moves the fingerprint and invalidates the producer's output.
+ *
+ * ## What it does not cover, and why
+ *
+ * **Imports.** A pipeline that calls into `./scoring.ts`, or into a package, can have its behaviour
+ * changed entirely without this file's bytes moving — and the fingerprint will not notice. That is a
+ * real hole and it is recorded rather than papered over: Node's ESM loader exposes no supported way
+ * to enumerate a module's graph from inside it (there is no `require.cache` for ESM, and building
+ * one means writing a resolver or a loader hook, which is a dependency and a build step this SDK
+ * does not have). The Python SDK *can* reach one directory further and does, which is why the two
+ * SDKs state their coverage separately instead of claiming a shared guarantee neither would keep.
+ *
+ * Until that changes, a repo whose real logic lives in imported modules should touch the entry file
+ * when it deploys — or run `borg derive --rebuild`, which owes nothing to fingerprints at all.
+ *
+ * `undefined` when the entry module cannot be read, which puts the push back on its own fallback:
+ * hashing the very same file. Nothing is lost by failing here.
+ */
+export function fingerprint(entry = process.argv[1]): string | undefined {
+  if (entry === undefined) return undefined;
+  try {
+    return `sha256:${createHash("sha256").update(readFileSync(entry)).digest("hex")}`;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The worker loop: handshake, then invocations until the engine says stop. */

@@ -100,6 +100,7 @@ impl Harness {
             source: BufferId::Object("Company".into()),
             version: LayerId(1),
             declaring_repo: RepoId(1),
+            fingerprint: None,
         });
 
         // Nothing may be written until it is declared (SPEC.md §8), and `is_investible` names the

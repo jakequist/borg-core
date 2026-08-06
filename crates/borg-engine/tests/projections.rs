@@ -69,6 +69,7 @@ fn declare(field: &str, ty: ValueType, ownership: Ownership) -> DefEvent {
 
 fn producer(id: ProducerId) -> DefEvent {
     DefEvent::PushProducer(borg_core::ProducerDef {
+        fingerprint: None,
         id,
         kind: borg_core::ProducerKind::Pipeline,
         source: borg_core::BufferId::Object("Company".into()),

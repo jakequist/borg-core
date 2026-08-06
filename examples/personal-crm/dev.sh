@@ -107,25 +107,27 @@ fi
 
 # ── 2. The schema — while nothing is serving ──────────────────────────────────────────────────────
 #
-# `borg repo push` is accepted every time it is run and emits a **new def layer every time**, even
-# when the definitions are identical. That is correct for an event log and wrong for a dev loop: a
-# script that pushed unconditionally would walk the branch's def-version up by one on every boot,
-# and regenerate the client on every boot with it. So the push is gated on the repo's contents
-# having actually changed. See FRICTION.md — `repo push` has no "only if it moved" of its own.
-repo_stamp() {
-    find "$HERE/repo" -type f \( -name '*.ts' -o -name '*.toml' \) -exec cksum {} + | sort | cksum
-}
-STAMP="$DATA/.repo-pushed"
-if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$(repo_stamp)" ]; then
-    say "pushing the repo (schema + the display_name pipeline)"
-    # The pipeline is invoked as a program, so it has to be executable. A repo checked out without
-    # the mode bit fails here with `Permission denied` and no other clue.
-    chmod +x "$HERE"/repo/pipelines/*.ts
-    "$BORG" --store "$STORE" repo push "$HERE/repo" || die "repo push failed"
-    repo_stamp >"$STAMP"
-else
-    say "schema unchanged, not pushing (def-version $("$BORG" --store "$STORE" def version))"
-fi
+# Pushed unconditionally, every boot. This used to be gated behind a `cksum` stamp of `repo/`,
+# because `repo push` emitted a new def layer every time it ran and a dev script that pushed on every
+# boot would walk the branch's def-version up by one each time — and regenerate the client with it.
+#
+# `repo push` is a diff now, on both halves. Definitions the branch already holds emit nothing, and a
+# producer whose implementation fingerprint has not moved emits nothing either (SPEC.md §9.2), so an
+# unchanged repo pushed twice lands no layer at all. The stamp was a worse version of that check
+# living outside the tool: it hashed file contents, which is what the fingerprint does, but compared
+# them with a file beside the store rather than with what the store *believes*. Keeping the two in
+# step was this script's job — `--reset` had to remember to delete the stamp, and pushing to another
+# branch would have needed a stamp per branch.
+#
+# The other half is why deleting it is a fix and not a tidy-up: when the pipeline body *has* changed,
+# the push now recomputes every value that pipeline owns. The stamp used to decide whether to push;
+# nothing decided whether to invalidate, and the answer was always "no" (FRICTION.md #17).
+say "pushing the repo (schema + the display_name pipeline)"
+# The pipeline is invoked as a program, so it has to be executable. A repo checked out without the
+# mode bit fails here with `Permission denied` and no other clue.
+chmod +x "$HERE"/repo/pipelines/*.ts
+"$BORG" --store "$STORE" repo push "$HERE/repo" || die "repo push failed"
+say "def-version $("$BORG" --store "$STORE" def version)"
 
 # ── 3. The server ─────────────────────────────────────────────────────────────────────────────────
 

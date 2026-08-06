@@ -91,6 +91,16 @@ multiplied to. The fix drew the seam first: the rebuilt indexes are `Projection`
 is *bring each to head*, and a process that stays up is already there. `borg serve` holds one deriving
 registry, per-read cost is flat at 0.3–0.6 ms from L451 to L4001, and the two lifecycles are held to
 the same answers by a rebuild-and-diff harness rather than by argument.
+**And changing a pipeline's code invalidates what it wrote.** §9.2 promised this from the beginning
+and it never once happened: `describe` describes shapes, `repo push` is a diff over shapes, and an
+edit to a pipeline body changes no shape — so nothing was emitted, the producer's ClientVersion never
+moved, and one field ended up holding output from two different programs, every value labelled
+`current`. A repo now states an **implementation fingerprint** per producer, carried in the
+`PushProducer` event because *which program this is* belongs to a producer's definition, and the
+existing machinery does the rest. The same change makes `repo push` idempotent, which is not a bonus
+but the precondition: recomputing a source buffer on every push would be worse than not recomputing
+at all. `290-a-code-change-invalidates` is `examples/personal-crm`'s FRICTION #17, measured again and
+the other way round.
 
 Act 1 is the modern ORM.
 
@@ -404,6 +414,54 @@ schema evolution meet, rather than two mechanisms sitting beside each other.
 
 The migrations are named on the *field* (`up`, `down`) rather than beside the change, because the
 field is what persists across pushes and the change does not.
+
+#### A producer's implementation is part of what the diff compares
+
+The decision above has a hole in it that took an application to find, and `examples/personal-crm`'s
+FRICTION #17 is the measurement: *a repo emits the shape it believes in* is exactly right, and **a
+pipeline's code is not part of its shape.** Editing a body changes no field, no name, no `writes`, no
+source buffer — so the diff found nothing to emit, no def layer landed, the producer's ClientVersion
+stayed where it was, and §9.2's *invalidates all of its prior output* never fired. The store then
+held one field written by two different programs, both labelled `current`, with `state`, `origin` and
+`by` identical. That is a watermark lie by S1's own standard — fork at `reflects`, recompute with
+today's code, and the two disagree — reached by a route S1 cannot sweep, because S1 replays with
+whatever code is deployed *now*.
+
+The fix is one opaque string per producer whose only contract is that it changes when the code
+changes. Four choices in it are worth keeping written down:
+
+**It travels in `PushProducer`, not beside the command on disk.** The producer-implementation table
+(§9.2) is where "which file is this" lives, and putting the fingerprint there was the obvious
+alternative — it is where the pusher computes it, and it needs no event. It is wrong for the same
+reason the table is right: that table is a fact about one machine, and this has to be forkable and
+mergeable, because *is this the code the branch believes in* is a question with a different answer on
+a different branch. It also has to be in the def fold, because the fold is where the diff already
+lives. Putting it in the event costs nothing the definition was not already paying.
+
+**The engine learns nothing.** `backfill` compares a producer's watermark with its own ClientVersion
+and hands over the whole source buffer when it is behind — the same path a producer newer than its
+data already took. Nothing in the scheduler knows what a fingerprint is, and it must not: the moment
+"a code change" is a concept in derivation rather than a fact about a definition, every question about
+it becomes a scheduler question.
+
+**An unchanged push must emit nothing, or the guarantee is unusable.** Recomputing is
+`O(the producer's source buffer)`, and `repo push` is a deploy command people run in a loop. Paying
+that per edit is the price of the guarantee; paying it per push is a mechanism people disable. So the
+same change made the diff complete — repeated `DeclareField`s are dropped too, which the fold already
+treated as no-ops — and `repo push` became idempotent, closing FRICTION #2 as a side effect and
+deleting the `cksum` stamp the CRM's `dev.sh` had grown.
+
+**Absent is a documented answer, not a gap.** The pusher hashes the command file when `describe`
+supplies nothing, which is what covers a `bash`-and-`jq` worker without asking it to compute a digest
+— an SDK-only mechanism would have made this a feature of languages with SDKs, which is the opposite
+of what the worker protocol is for. An SDK supplies its own only where it covers *more*: Python walks
+the modules beside the entry file, TypeScript cannot (ESM has no loaded-module registry) and says so
+rather than implying a guarantee it does not keep. A producer neither route can fingerprint behaves
+exactly as everything did before, written down rather than discovered.
+
+What this deliberately does not do: **it is not a schema change.** No `MutateField`, no migration
+demanded, no field def-version moved. A migration bridges two shapes that coexist and both remain
+readable; here the old output is simply wrong, and the right thing to do with it is overwrite it.
 
 #### A migration definition records a direction, not a version pair
 

@@ -304,6 +304,10 @@ pub struct FieldSpec {
 pub struct MigrationSpec {
     /// Stable across pushes, and hashed to a `ProducerId` exactly as a pipeline's name is.
     pub name: String,
+    /// See [`ProducerSpec::fingerprint`]. A migration is a producer (SPEC.md §9.1) and its code
+    /// changes the same way.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl MigrationSpec {
@@ -319,6 +323,21 @@ pub struct ProducerSpec {
     pub name: String,
     /// The struct this producer maps over — its `ObjectBuffer` (SPEC.md §4.2).
     pub source: String,
+    /// **What this producer's code currently is**, as an opaque string that changes when the code
+    /// changes (SPEC.md §9.2).
+    ///
+    /// Nothing interprets it: `borg repo push` compares it with the one in force and re-emits the
+    /// producer's definition when the two differ. That is the whole mechanism, and it is here rather
+    /// than beside the command on disk because *which program this is* belongs to the producer's
+    /// definition — a fact about the repo, forkable and mergeable — while *where the program lives*
+    /// is a fact about one machine and stays in the sidecar (§9.2).
+    ///
+    /// A repo that omits it is not opting out: `borg repo push` falls back to hashing the command
+    /// file, which is what gives a `jq`-and-`bash` repo coverage without asking it to compute a
+    /// digest. An SDK supplies its own only where it can cover **more** than the one file — see the
+    /// two SDKs, which state exactly what each reaches.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl ProducerSpec {
@@ -336,6 +355,32 @@ impl ProducerSpec {
 /// A free function as well as a method because a `derived_by` names a producer by name, and
 /// resolving it must produce the *same* id the producer's own definition gets — one hash, one
 /// place, no chance of the field pointing at an owner that does not exist.
+/// The fingerprint of some bytes of implementation. SPEC.md §9.2.
+///
+/// `sha256:<hex>`, tagged rather than bare so that the string says what produced it. Both SDKs emit
+/// the same form, which is what makes "these two came from the same kind of thing" checkable by eye
+/// rather than by folklore.
+///
+/// **The tag is not a promise that two producers of it agree.** This function hashes the bytes it is
+/// given and nothing else; the Python SDK folds several files and their names into one digest, so
+/// its answer for a one-file repo is deliberately *not* this function's. Nothing compares
+/// fingerprints across producers or across sources — the only comparison anyone makes is one
+/// producer's new fingerprint against its own previous one — so agreement would buy nothing and
+/// pretending to it would cost the Python SDK its module graph. The one visible consequence is that
+/// a repo which stops supplying its own fingerprint recomputes once as the fallback takes over,
+/// which is the same one-time cost as arriving with no fingerprint at all.
+///
+/// SHA-256 because it is already in the workspace for content addressing, and because a collision
+/// here is a code change that invalidates nothing — silent, and exactly the failure fingerprints
+/// exist to remove. Worth more than the microseconds a weaker hash saves on one file read per push.
+pub fn fingerprint(bytes: &[u8]) -> String {
+    let mut out = String::from("sha256:");
+    for byte in borg_core::content::hash(bytes) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 pub fn producer_id(name: &str) -> u64 {
     // FNV-1a. Small, stable, and dependency-free; nothing here needs cryptographic strength.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -590,6 +635,7 @@ mod tests {
         let spec = |name: &str| ProducerSpec {
             name: name.into(),
             source: "Company".into(),
+            fingerprint: None,
         };
         assert_eq!(spec("invest").id(), spec("invest").id());
         assert_ne!(spec("invest").id(), spec("score").id());

@@ -174,6 +174,7 @@ impl Harness {
             source: BufferId::Object("Company".into()),
             version: LayerId(1),
             declaring_repo: RepoId(1),
+            fingerprint: None,
         });
 
         let branch = branches.create_root(Some("main".into())).await.unwrap();

@@ -50,8 +50,16 @@ Then: <http://localhost:5173>.
    the one command that connects to a served store instead of being turned away by it;
 6. the api, then vite.
 
-It is re-runnable. The repo push is skipped when the repo's files have not changed, because an
-unchanged `repo push` still emits a new def layer (FRICTION #2).
+It is re-runnable, and step 3 pushes unconditionally. `repo push` is a diff over both halves of what
+a repo describes — definitions the branch already holds emit nothing, and a producer whose
+implementation fingerprint has not moved emits nothing either (§9.2) — so pushing an unchanged repo
+lands no def layer and says `unchanged: 7 definitions already in force, nothing pushed`. This script
+used to carry its own `cksum` stamp to avoid pushing; both that and the FRICTION entries behind it
+(#2, #17) are gone.
+
+The other side of the same change: when you *do* edit `repo/pipelines/display_name.ts`, re-running
+this script recomputes every `displayName` in the store under the new code. Before, it recomputed
+none of them and served both builds' output side by side, each labelled `current`.
 
 ## Layout
 

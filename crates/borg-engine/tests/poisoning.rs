@@ -65,6 +65,7 @@ fn score_def() -> DefEvent {
         // pushing it again a new ClientVersion (SPEC.md §9.2).
         version: LayerId(0),
         declaring_repo: RepoId(1),
+        fingerprint: None,
     })
 }
 

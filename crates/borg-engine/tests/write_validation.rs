@@ -152,6 +152,7 @@ impl Harness {
             source: BufferId::Object("Company".into()),
             version: LayerId(1),
             declaring_repo: REPO,
+            fingerprint: None,
         });
         self.engine.catch_up(self.branch).await?;
         // A producer failure poisons the producer rather than the branch (SPEC.md §14), so the

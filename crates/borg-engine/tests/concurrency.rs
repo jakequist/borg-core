@@ -128,6 +128,7 @@ impl Harness {
             source,
             version: LayerId(1),
             declaring_repo: RepoId(1),
+            fingerprint: None,
         });
     }
 
@@ -483,6 +484,7 @@ async fn a_migration_pair_running_together_does_not_overwrite_its_own_input() ->
                 source: BufferId::ObjectProp("Company".into(), "website".into()),
                 version: LayerId(0),
                 declaring_repo: RepoId(1),
+                fingerprint: None,
             });
         }
 

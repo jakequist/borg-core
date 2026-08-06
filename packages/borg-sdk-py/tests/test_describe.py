@@ -10,11 +10,16 @@ including the literal JSON: two SDKs describing the same repo have to describe i
 engine is being handed two dialects of one contract.
 """
 
+import importlib
 import json
+import os
+import shutil
+import sys
+import tempfile
 import unittest
 
 import borg
-from borg.repo import _payload
+from borg.repo import _fingerprint, _payload
 
 
 def investing():
@@ -211,6 +216,99 @@ class DescribeMode(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             repo.main(["describe"])
         self.assertEqual(json.loads(out.getvalue()), repo.describe())
+
+
+class TheImplementationFingerprint(unittest.TestCase):
+    """
+    §9.2's *pushing new pipeline source moves the producer's ClientVersion* needs something that
+    moves when the source does. The diff compares name, source buffer and writes, and an edited body
+    touches none of them — so without this a code change is invisible to the push and the old output
+    goes on being served labelled ``current``.
+    """
+
+    def scratch(self, *files):
+        """A directory of modules, the first of which is the entry. Returns its path."""
+        root = tempfile.mkdtemp(prefix="borg-fingerprint-")
+        entry = None
+        for name, body in files:
+            path = os.path.join(root, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            entry = entry or path
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        return entry
+
+    def test_it_changes_when_the_entry_module_changes(self):
+        before = self.scratch(("pipeline.py", "# one\n"))
+        after = self.scratch(("pipeline.py", "# two\n"))
+        self.assertNotEqual(_fingerprint(before), _fingerprint(after))
+
+    def test_it_does_not_change_when_the_code_does_not(self):
+        # Two directories, one program. Content and relative name, never absolute path, so a repo
+        # checked out somewhere else is not a repo whose code changed.
+        once = self.scratch(("pipeline.py", "# same\n"))
+        again = self.scratch(("pipeline.py", "# same\n"))
+        self.assertEqual(_fingerprint(once), _fingerprint(again))
+        self.assertEqual(_fingerprint(once), _fingerprint(once))
+
+    def test_it_covers_an_imported_module_sitting_beside_the_entry(self):
+        """
+        The half the TypeScript SDK cannot reach. A helper module next to the pipeline is code this
+        repo ships, and editing it changes what the pipeline computes.
+        """
+        entry = self.scratch(("pipeline.py", "import helper\n"), ("helper.py", "VALUE = 1\n"))
+        root = os.path.dirname(entry)
+        sys.path.insert(0, root)
+        try:
+            importlib.invalidate_caches()
+            helper = importlib.import_module("helper")
+            before = _fingerprint(entry)
+            with open(os.path.join(root, "helper.py"), "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 2\n")
+            self.assertNotEqual(before, _fingerprint(entry))
+        finally:
+            sys.path.remove(root)
+            sys.modules.pop("helper", None)
+            del helper
+
+    def test_it_says_what_produced_it(self):
+        self.assertRegex(_fingerprint(self.scratch(("p.py", "x"))), r"^sha256:[0-9a-f]{64}$")
+
+    def test_an_entry_module_that_cannot_be_read_yields_no_fingerprint_at_all(self):
+        # `borg repo push` falls back to hashing the command file, so nothing is lost — and refusing
+        # to describe over this would make an SDK repo un-pushable for a reason that does not matter.
+        self.assertIsNone(_fingerprint(os.path.join(tempfile.gettempdir(), "borg-no-such-file")))
+
+    def test_every_producer_a_repo_describes_carries_it(self):
+        # `sys.argv[0]` is what the engine executed, and under `python -m unittest` it is not a file
+        # at all — so the entry module is staged rather than assumed. This is the only test here that
+        # exercises the default, and standing it up is what makes the default worth trusting.
+        Company, invest = investing()
+        entry = self.scratch(("pipeline.py", "# a repo\n"))
+        argv0, sys.argv[0] = sys.argv[0], entry
+        try:
+            described = borg.repo(structs=[Company], pipelines=[invest]).describe()
+        finally:
+            sys.argv[0] = argv0
+        self.assertRegex(described["producers"][0]["fingerprint"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_a_repo_whose_entry_is_not_a_file_describes_itself_without_one(self):
+        # `borg repo push` hashes the command file in that case, so this is a fallback rather than a
+        # loss — and describing has to keep working, or an SDK repo becomes un-pushable over a hash.
+        Company, invest = investing()
+        argv0 = sys.argv[0]
+        sys.argv[0] = os.path.join(tempfile.gettempdir(), "borg-no-such-file")
+        try:
+            described = borg.repo(structs=[Company], pipelines=[invest]).describe()
+        finally:
+            sys.argv[0] = argv0
+        self.assertNotIn("fingerprint", described["producers"][0])
+
+    def test_the_pure_describe_payload_carries_none(self):
+        # `describe` is a pure function of the definitions and stays one: the fingerprint is a fact
+        # about files, so it is attached by `repo()`, which is already the impure half.
+        Company, invest = investing()
+        self.assertNotIn("fingerprint", borg.describe([Company], [invest])["producers"][0])
 
 
 if __name__ == "__main__":

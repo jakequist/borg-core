@@ -1,0 +1,4 @@
+# The CRM's pipeline, reduced to the one thing FRICTION #17 measured.
+[repo]
+id = 1
+name = "contacts"
