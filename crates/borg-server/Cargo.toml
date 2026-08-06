@@ -1,0 +1,25 @@
+[package]
+name = "borg-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "borg-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+borg-core.workspace = true
+borg-engine.workspace = true
+borg-host.workspace = true
+borg-protocol.workspace = true
+# `signal` is what lets the server release its advisory locks when it is stopped, rather than
+# leaving one behind on every ordinary shutdown and relying on the next process to notice it is
+# stale. `time` bounds the waits `start` and `stop` do on a socket coming up or going away.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+serde.workspace = true
+serde_json.workspace = true

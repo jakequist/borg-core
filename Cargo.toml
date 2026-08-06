@@ -9,7 +9,9 @@ members = [
     "crates/borg-exec-process",
     "crates/borg-exec-native",
     "crates/borg-engine",
+    "crates/borg-host",
     "crates/borg-cli",
+    "crates/borg-server",
 ]
 
 [workspace.package]
@@ -27,6 +29,7 @@ borg-exec = { path = "crates/borg-exec" }
 borg-exec-process = { path = "crates/borg-exec-process" }
 borg-exec-native = { path = "crates/borg-exec-native" }
 borg-engine = { path = "crates/borg-engine" }
+borg-host = { path = "crates/borg-host" }
 
 async-trait = "0.1"
 # "rc" enables Arc<str> — field and struct names are Arc-shared because they repeat across

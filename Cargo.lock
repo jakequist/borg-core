@@ -40,11 +40,8 @@ version = "0.1.0"
 dependencies = [
  "borg-core",
  "borg-engine",
- "borg-exec-native",
- "borg-exec-process",
+ "borg-host",
  "borg-protocol",
- "borg-storage",
- "borg-storage-sqlite",
  "serde",
  "serde_json",
  "tokio",
@@ -104,6 +101,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "borg-host"
+version = "0.1.0"
+dependencies = [
+ "borg-core",
+ "borg-engine",
+ "borg-exec-native",
+ "borg-exec-process",
+ "borg-protocol",
+ "borg-storage",
+ "borg-storage-sqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "borg-protocol"
 version = "0.1.0"
 dependencies = [
@@ -112,6 +125,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "borg-server"
+version = "0.1.0"
+dependencies = [
+ "borg-core",
+ "borg-engine",
+ "borg-host",
+ "borg-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

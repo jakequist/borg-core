@@ -1,4 +1,4 @@
-//! The wire contract between a **client** and `borg serve`. SDK-DRAFT.md §2.5, §3.
+//! The wire contract between a **client** and `borg-server`. SDK-DRAFT.md §2.5, §3.
 //!
 //! The worker protocol in [`crate`] is `ProducerCtx` over a pipe. This is the other direction: the
 //! *client* surface — transactions, reads with provenance, and the handful of queries a generated
@@ -43,6 +43,18 @@
 //! named by its id on every message**, because transactions bind to the store and not to the socket
 //! (§12.2, SDK-DRAFT §2.5) — a client that drops its connection and comes back can carry on, and one
 //! that never comes back is the idle reaper's problem (§12.3).
+//!
+//! ## The connection names a registry; the messages do not
+//!
+//! A server hosts a **directory of registries** on one socket and the registry is the unit of
+//! tenancy (§17.6), so [`ClientHello::registry`] settles *which store* once and no message repeats
+//! it. That is the opposite of the transaction rule above and for the opposite reason: a transaction
+//! outlives its connection and so cannot be implied by one, while a registry is what the connection
+//! is *to* — routing it per message would make one socket two stores' worth of state and put a
+//! tenancy decision on every line a shell client writes.
+//!
+//! The one exception is [`Request::RepoPush`], which may name another, because a deploy client
+//! pushing to three registries should not need three connections to do it.
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +82,30 @@ pub struct ClientHello {
     /// The codec chosen from the ones the server offered.
     #[serde(default = "default_codec")]
     pub codec: String,
+    /// **Which registry on this server the connection is for.** SPEC.md §17.6.
+    ///
+    /// A server hosts a directory of registries on one socket, and the registry is the unit of
+    /// tenancy — so *which store* is a property of the connection, settled once, rather than a field
+    /// repeated on every message. This is the field a multi-tenant deployment routes on and it is
+    /// deliberately the same field a laptop leaves out.
+    ///
+    /// **Absent means the server's sole registry, when it has exactly one.** That is what keeps a
+    /// one-registry server the thing a local developer already expects — start it, connect, name
+    /// nothing. It must not survive a second registry: with two hosted, any answer would be a coin
+    /// toss over somebody's data, so the server refuses and names the options instead.
+    #[serde(default)]
+    pub registry: Option<String>,
+    /// **Reserved for authentication. Nothing checks it.** SPEC.md §17.6.
+    ///
+    /// Its existence is the point rather than its behaviour. A local server has no one to
+    /// authenticate — the socket's file permissions are the boundary — and the hosted platform this
+    /// is the local instance of has nothing else it could be. Adding the field once auth exists would
+    /// mean a wire change at exactly the moment there is a deployment that cannot take one, so the
+    /// shape is settled now and left empty; a client that sends nothing today sends nothing valid
+    /// tomorrow, and one that sends a credential to a server that ignores it is not misled, because
+    /// it was refused nothing.
+    #[serde(default)]
+    pub credential: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -203,7 +239,7 @@ pub enum Request {
     },
     /// **The whole def view of a branch — what codegen reads** (SPEC.md §15, SDK-DRAFT §4.4).
     ///
-    /// The one message added after `borg serve` shipped, and it was added rather than composed
+    /// The one message added after the server shipped, and it was added rather than composed
     /// because neither half of it could be. [`Request::DefShow`] answers about a struct you can
     /// already name, and codegen's entire job is to not know the names in advance — there was no
     /// enumeration on the socket at all. And the ClientVersion a generated module has to stamp
@@ -214,6 +250,46 @@ pub enum Request {
     DefView {
         #[serde(default)]
         branch: Option<String>,
+    },
+    /// **Push a repo into a registry, executed by the server.** SPEC.md §9.2, §17.6.
+    ///
+    /// The one message that is not a lifted read or write, and the one that retires *"pushing a
+    /// schema to a served store means stopping the server"*. A push moves definitions, which travel
+    /// the log, and implementations, which are a sidecar beside the store — so a second process
+    /// doing it would be the second writer the advisory lock exists to refuse. The way out is not to
+    /// let the client write; it is to have the **server** do the push.
+    ///
+    /// **`path` is a path on the server's disk, and that is part of the contract rather than an
+    /// implementation detail.** For a local server it is the directory the developer is editing,
+    /// which is exactly what they mean. For a remote one it means nothing, and the answer there is
+    /// an uploaded artifact rather than a path — so `path` is optional and this message is expected
+    /// to grow a sibling field carrying the bytes. That is a field, not a shape: a client that sends
+    /// `path` today keeps working against a server that also accepts artifacts.
+    ///
+    /// `registry` overrides the connection's, for a deploy client that pushes to several without
+    /// reconnecting. Absent means the one the handshake settled.
+    RepoPush {
+        #[serde(default)]
+        registry: Option<String>,
+        #[serde(default)]
+        branch: Option<String>,
+        /// A directory **on the server**. See above.
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// What this server hosts. SPEC.md §17.6.
+    ///
+    /// The one message that needs no registry, which is what makes it answerable by a client that
+    /// has not settled one — `borg-server status` asks exactly this, and so does anyone who has just
+    /// been told their handshake was ambiguous.
+    Registries {},
+    /// Make a registry on this server. SPEC.md §17.6.
+    ///
+    /// Creating one is a server operation because a directory appearing under a running server's
+    /// data dir is a store it has not locked, is not hosting and will not route to. It is also the
+    /// only shape that could work against a server whose filesystem the caller cannot reach.
+    RegistryCreate {
+        name: String,
     },
 }
 
@@ -273,6 +349,21 @@ pub enum Response {
     /// they were read at.
     Defs(SchemaDef),
     Lineage(Lineage),
+    /// What a [`Request::RepoPush`] turned out to be.
+    ///
+    /// `layer` is absent when the push landed nothing, which is the ordinary case in a dev loop and
+    /// not a failure: a repo describing exactly what is already in force has nothing to say (§9.2).
+    /// `report` is the same lines `borg repo push` prints, so the two front ends say the same words
+    /// about the same push.
+    Pushed {
+        #[serde(default)]
+        layer: Option<String>,
+        report: Vec<String>,
+    },
+    /// The answer to [`Request::Registries`]: what this server hosts, and which of them it has
+    /// opened. `open` is lazy opening made visible — a registry nobody has used has not had its log
+    /// replayed, and a server that claimed otherwise would be hiding its own boot cost.
+    Registries(Vec<RegistryInfo>),
     /// Anything that went wrong and is not a conflict: an unparsable cell, a write the definitions
     /// reject, a transaction that expired. The message is the one the CLI would have printed, which
     /// includes §12.3's promise that a reaped transaction says *expired after N idle* and never
@@ -305,6 +396,15 @@ pub struct Envelope {
     pub fresh_as_of: String,
     /// The producer that wrote it, for derived data.
     pub by: Option<String>,
+}
+
+/// One registry a server hosts. SPEC.md §17.6.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegistryInfo {
+    /// What the handshake's `registry` names.
+    pub name: String,
+    /// Whether the server has opened it yet. See [`Response::Registries`].
+    pub open: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -443,6 +543,15 @@ mod tests {
                 struct_name: "Company".into(),
             },
             Request::DefView { branch: None },
+            Request::RepoPush {
+                registry: Some("crm".into()),
+                branch: None,
+                path: Some("/srv/crm/repo".into()),
+            },
+            Request::Registries {},
+            Request::RegistryCreate {
+                name: "analytics".into(),
+            },
         ]
     }
 
@@ -503,6 +612,14 @@ mod tests {
                     landed_at: "L120".into(),
                 }],
             }),
+            Response::Pushed {
+                layer: Some("L12".into()),
+                report: vec!["display_name -> P123 (implementation changed)".into()],
+            },
+            Response::Registries(vec![RegistryInfo {
+                name: "crm".into(),
+                open: true,
+            }]),
             Response::Error {
                 message: "transaction tx-9 expired after 2 minutes idle".into(),
             },
@@ -672,11 +789,83 @@ mod tests {
         };
         assert!(branch.is_none() && freshness.is_none() && !settled);
 
-        // An un-generated client has no ClientVersion to state, and must not have to invent one.
+        // An un-generated client has no ClientVersion to state, and must not have to invent one —
+        // and a client on a one-registry server has no registry to name and no credential to hold.
         let hello: ClientHello = serde_json::from_str("{}").unwrap();
         assert_eq!(hello.version, VERSION);
         assert_eq!(hello.codec, "json");
         assert!(hello.client_version.is_none());
+        assert!(hello.registry.is_none());
+        assert!(hello.credential.is_none());
+    }
+
+    /// **The handshake routes, and it has room for a credential before there is one to check.**
+    /// SPEC.md §17.6. Both fields are asserted here rather than only where they are used, because
+    /// the whole argument for `credential` existing now is that the wire shape must not have to move
+    /// when auth arrives — and a field nothing serialises is a field that will be forgotten.
+    #[test]
+    fn the_handshake_can_name_a_registry_and_carry_a_credential() {
+        let raw = r#"{"registry":"crm","credential":"tok","codec":"msgpack"}"#;
+        let hello: ClientHello = serde_json::from_str(raw).unwrap();
+        assert_eq!(hello.registry.as_deref(), Some("crm"));
+        assert_eq!(hello.credential.as_deref(), Some("tok"));
+        assert_eq!(hello.codec, "msgpack");
+
+        let round = serde_json::to_string(&hello).unwrap();
+        assert!(round.contains(r#""registry":"crm""#), "{round}");
+        assert!(round.contains(r#""credential":"tok""#), "{round}");
+    }
+
+    /// A push is a *server-side* path today and an artifact one day, so the field is optional and
+    /// the message is the thing that stays. A client that sends `path` must go on working against a
+    /// server that has learned to accept bytes as well — which is what makes this a field rather
+    /// than a shape (see [`Request::RepoPush`]).
+    #[test]
+    fn a_repo_push_names_a_path_on_the_server_and_leaves_room_for_what_replaces_it() {
+        let one = |message: &Request| {
+            let mut buffer = Vec::new();
+            write_message(&mut buffer, Codec::Json, message).unwrap();
+            String::from_utf8(buffer).unwrap().trim().to_string()
+        };
+        assert_eq!(
+            one(&Request::RepoPush {
+                registry: None,
+                branch: None,
+                path: Some("/srv/repo".into())
+            }),
+            r#"{"repo_push":{"registry":null,"branch":null,"path":"/srv/repo"}}"#
+        );
+        // Everything optional, so a future arm can arrive without any of these moving.
+        let bare: Request = serde_json::from_str(r#"{"repo_push":{}}"#).unwrap();
+        let Request::RepoPush {
+            registry,
+            branch,
+            path,
+        } = bare
+        else {
+            panic!("parsed as the wrong request")
+        };
+        assert!(registry.is_none() && branch.is_none() && path.is_none());
+    }
+
+    /// Asking what a server hosts is the one question that needs no registry — which is what lets a
+    /// client that has just been told its handshake was ambiguous find out what to name.
+    #[test]
+    fn asking_what_a_server_hosts_needs_no_registry() {
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, Codec::Json, &Request::Registries {}).unwrap();
+        assert_eq!(
+            String::from_utf8(buffer).unwrap().trim(),
+            r#"{"registries":{}}"#
+        );
+
+        let answer = serde_json::to_value(Response::Registries(vec![RegistryInfo {
+            name: "crm".into(),
+            open: false,
+        }]))
+        .unwrap();
+        assert_eq!(answer["registries"][0]["name"], "crm");
+        assert_eq!(answer["registries"][0]["open"], false);
     }
 
     /// A layer id is text, and it is the same text `borg get` prints — see the module header for why

@@ -36,7 +36,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
-/// The **client** wire contract — `borg serve` and the SDKs — over this same framing.
+/// The **client** wire contract — `borg-server` and the SDKs — over this same framing.
 ///
 /// A separate module rather than more variants here, because the two protocols answer to different
 /// people: this one is `ProducerCtx` over a pipe and is spoken by code the engine invoked, that one

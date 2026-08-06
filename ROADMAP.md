@@ -85,10 +85,10 @@ leaves is now a property of the schedule, and nothing can ask.
 
 **And the first application found the cost nobody had multiplied.** `examples/personal-crm` is the
 instrument and `FRICTION.md` is the reading; #9 measured a read costing 18 ms at branch head L441 and
-53 ms at L1391 — a cost tracking the log rather than the request, because `borg serve` opened the
+53 ms at L1391 — a cost tracking the log rather than the request, because the server opened the
 store per request and each open replayed the log. Both halves were documented; nothing said what they
 multiplied to. The fix drew the seam first: the rebuilt indexes are `Projection`s of the log, opening
-is *bring each to head*, and a process that stays up is already there. `borg serve` holds one deriving
+is *bring each to head*, and a process that stays up is already there. The server holds one deriving
 registry, per-read cost is flat at 0.3–0.6 ms from L451 to L4001, and the two lifecycles are held to
 the same answers by a rebuild-and-diff harness rather than by argument.
 **And changing a pipeline's code invalidates what it wrote.** §9.2 promised this from the beginning
@@ -101,6 +101,16 @@ existing machinery does the rest. The same change makes `repo push` idempotent, 
 but the precondition: recomputing a source buffer on every push would be worse than not recomputing
 at all. `290-a-code-change-invalidates` is `examples/personal-crm`'s FRICTION #17, measured again and
 the other way round.
+
+**And serving is a server.** `borg-server` is a binary of its own, hosting a **directory of
+registries** — every store under a data dir, addressable by name, one socket for all of them because
+the handshake routes. The registry is the unit of tenancy, which makes this the local instance of a
+multi-tenant platform rather than a smaller different thing; what the platform adds is a credential
+that means something, and the field for it is already on the wire. Registries open lazily and lock
+eagerly, `start | stop | status | logs` is the operating surface, and the flaw the first application
+was built around is gone: a **schema can be pushed into a running server**, because the server
+performs the push and the fingerprint work made a push cost what the change costs. `borg` keeps its
+embedded mode and loses `serve`.
 
 Act 1 is the modern ORM.
 
@@ -121,8 +131,11 @@ enumerating it is what would make merge asymptotically free; the model now permi
 one forbade it. It needs read-path compaction to pay for itself, so what landed is the honest
 version: `n` membership rows and `n` index entries per merged layer instead of `n` full records.
 
-**Concurrent requests in `borg serve`.** The server holds one registry now, so the per-request replay
-is gone, but requests are still serialised through one store-wide gate. Relaxing it is a separate
+**Concurrent requests within one registry.** The server holds one registry per hosted store now, so
+the per-request replay is gone, but requests are still serialised through one gate per registry. (The
+gate stopped being *server*-wide when a server started hosting several registries — see *A server
+hosts a directory of registries* — which is a different change: it lets two tenants proceed at once
+and nothing about one tenant's requests.) Relaxing it is a separate
 change and needs a soak of its own: the engine's internals are `Arc`/`Mutex` and were soaked at
 parallelism 16 in the concurrency milestone, but that proves the engine tolerates concurrent *tasks*,
 not that two client operations may interleave mid-flight. What has to be established first is the
@@ -277,6 +290,22 @@ milestone I closed.
 `scenarios/190-a-fork-of-a-fork-migrates`. Nothing was wrong: a migration on a fork-of-a-fork carries
 values it inherited from both ancestors, neither ancestor moves, and merging inward moves exactly one
 branch per step.
+
+### Tenancy
+
+**S17 — one server, two registries, addressed independently.** Two clients name two registries over
+one socket; a write to one is invisible to the other, a *repo push* into one leaves the other's
+definitions byte-identical, and `status` names both. *Failing means the tenancy seam is decoration
+and the platform needs a different server rather than this one with a name in a handshake.* —
+`scenarios/300-a-server-hosts-registries`, and `crates/borg-server/src/serve.rs`.
+
+**S18 — a schema pushed into a running server takes effect in it.** Both halves: the definitions,
+which the held registry must answer from without being reopened, and the *code*, which the worker
+pool must be running rather than what it was built with at boot. *Failing means either a second
+`Registry` over one store — which the single-process assumption forbids — or a producer silently
+executing the program the log no longer describes, which is the FRICTION #17 failure arriving by a
+different route.* — `scenarios/250-serve` and `crates/borg-server/src/serve.rs`. The second half is
+the one that needs a live check: it was verified to fail with the pool reload removed.
 
 ### Determinism
 
@@ -1197,6 +1226,188 @@ Not covered: a producer that has never succeeded writes no cells, so there is no
 label. `broken` is a label on a stored record (§10.4), and enumerating the cells a producer *might*
 have written is not a set anything can produce.
 
+### The server
+
+#### A server is a binary of its own
+
+`borg serve` is gone. Serving is `borg-server`, a separate crate and a separate binary; `borg` keeps
+its embedded mode — direct operation on a store nobody is serving — because that is what a scenario,
+a fixture, a build step and `borg init` all want and will want forever.
+
+Three reasons, and the third is the one that decided it:
+
+- **Opposite lifecycles.** Everything the CLI is — open, do one thing, exit — is what a server must
+  not do. Every piece of state that made `borg serve` awkward to write (a held registry, a worker
+  pool, an advisory lock, a signal handler) is state a process-per-command client has no reason to
+  have, and a binary that is both teaches neither shape clearly.
+- **They will be deployed apart.** The server runs in a container, under systemd, and on
+  platform.borg-hq.com; the CLI is what a developer installs. Shipping the second everywhere the
+  first goes is a bigger artifact for no gain.
+- **Merging later is trivial and splitting later is surgery.** psql/postgres and
+  redis-cli/redis-server are the precedent. If this turns out to be wrong, one `[[bin]]` fixes it.
+
+What is *not* split is the code. `crates/borg-host` holds everything either binary does to a store —
+opening one, holding one, the operations, the sidecars, the advisory lock, `repo push` — and both
+front ends render its results their own way. The rule `ops` already enforced between `main.rs` and
+the old `serve.rs` is now enforced across a crate boundary: **an operation returns what happened;
+the caller renders it.** The extraction was a move rather than a fork, so `borg`'s embedded mode and
+`borg-server` cannot drift into two answers about what a transaction is.
+
+#### A server hosts a directory of registries, and the registry is the unit of tenancy
+
+`borg-server start --data-dir ~/.borg` hosts every store under it, addressable by the name of its
+directory. Not one store per server: one *process* for a machine's registries.
+
+**Why the registry and not the branch.** A branch is a fork of one history — it shares definitions,
+the transaction table and the PID counter with what it forked from — so two applications that must
+not see each other's schema need two registries. Everything a registry owns is already
+registry-shaped: the log, the sidecars, the advisory lock. Making it the tenant therefore costs
+nothing new and makes the multi-tenant case the same code as the single one, which is the whole
+reason this was worth doing before there is a platform to do it for.
+
+**Lazily opened, eagerly locked.** These are opposite and deliberately not done together. Opening a
+registry brings its projections to head, which for a fresh set is a replay of its log, so a server
+that opened everything at boot would pay every registry's history to answer a request about one of
+them — and a data directory is exactly the shape that accumulates registries nobody has touched this
+week. Taking the advisory lock is a file write, and not taking it leaves a window in which `borg
+set` may walk into a store the server is about to hold. Cheap to take, expensive to be without.
+
+**The gate became per registry.** `borg serve` held one store-wide, which was right when there was
+one store. What the gate protects is the read-modify-write on files beside *a store* and that
+store's sequencer, so two clients on two registries share none of it and serialising them would be a
+limit nothing asks for. Within one registry nothing changed: requests are still answered one at a
+time, which is the serialisation process-per-command gave the CLI for free.
+
+**Creating a registry is a server operation.** A directory appearing under a running server's data
+dir is a store it has not locked, is not hosting and will not route to — so `registry_create` is a
+protocol message and `borg-server create` uses it whenever a server is up. It also creates one
+directly when nothing is running, because a data directory has to be fillable before there is a
+server to fill it. Both, and the pair is the point.
+
+#### The handshake names a registry, and carries a credential nothing checks
+
+`ClientHello` gains `registry` and `credential`, both `Option` with serde defaults.
+
+**Routing belongs to the connection, not to the message.** The registry is what a connection is
+*to*, so it is settled once; repeating it per message would put a tenancy decision on every line a
+shell client writes. That is the opposite of the rule for transactions, and for the opposite reason:
+a transaction outlives its connection and therefore cannot be implied by one. The single exception
+is `repo_push`, which may name another registry, so that a deploy client pushing to three does not
+need three connections.
+
+**Absent is the sole registry at n=1 and an error at n≥2.** The convenience is what keeps a local
+developer's experience exactly as it was — start a server, connect, name nothing. It must not
+survive a second registry, because "the obvious one" stops being obvious and any answer would be a
+coin toss over somebody's data. The error names the options rather than merely refusing, and
+`registries` — the one message that needs no registry — is what lets a client that guessed wrong
+find out what to say.
+
+*Where the routing error is delivered* took a decision. The obvious place is the handshake, and it
+is the wrong one: the server does not acknowledge an accepted hello, because it has nothing to say,
+so a client is not reading at that point and one that were could not tell a refusal from an answer
+(`CLAUDE.md` records that gap). So the failure is remembered and handed to the first request that
+needs a registry, which is every request except `registries`. Same sentence, delivered on a channel
+the client is definitely reading.
+
+**`credential` is reserved and its existence is the point.** A local server has no one to
+authenticate — the socket's file permissions are the boundary — and nothing reads the field. Adding
+it once authentication exists would mean moving the wire at exactly the moment there is a deployment
+that cannot take a wire change. It costs one `Option<String>` now.
+
+#### `start | stop | status | logs`, backgrounding by default
+
+**`start` backgrounds unless told otherwise**, because that is what a person at a terminal wants:
+run it, get the prompt back, have the thing be up. That means a pidfile and a log file beside the
+registries, since a backgrounded process with neither cannot be stopped or debugged.
+`--foreground` is what systemd, docker and a scenario want: stay in the foreground, log to stdout,
+daemonize nothing — a supervisor's whole job is to be the parent process.
+
+**Backgrounding is a re-exec, not a fork.** `fork` without `exec` is a minefield in a process with a
+tokio runtime, and re-exec means the backgrounded server is an ordinary `borg-server start
+--foreground` — the same code path a supervisor runs, so there is no second lifecycle that exists
+only in the background case. The child goes into a process group of its own (`process_group`, which
+is safe) rather than a session of its own (`setsid`, which would need `libc` and an `unsafe` block
+this workspace forbids).
+
+**`start` waits until the server answers**, because a socket file exists a moment before anything is
+listening on it and a `start` that returned with only a pid would make every caller write that loop
+— which every scenario and `dev.sh` previously did.
+
+**`stop` is `SIGTERM`, not a protocol message.** A `shutdown` request on §17.5 would be a wire on
+which anyone who can connect can stop the server, which is exactly the shape that must not exist on
+the day `credential` starts meaning something. A signal is the operating system's own authorisation
+model. It is sent by running `kill`, because sending one from Rust means `libc` and an `unsafe`
+block; that is a dependency-and-invariant trade taken deliberately on a path a person runs by hand.
+
+`stop` waits for the **process**, not for the socket, and that distinction is a race somebody has to
+lose: a server stops accepting the moment its listener drops and *then* stops its workers and
+releases its locks, so a `stop` that returned when the socket went quiet would hand control back
+with the advisory locks still held. It cost a scenario failure under load to find.
+
+**Every failure says how to start one.** `status`, `stop` and `logs` against nothing are the
+commonest confusion there is, and "no server is running" alone sends somebody to read `--help`.
+
+#### One well-known socket for the whole server
+
+`$XDG_RUNTIME_DIR/borg.sock` when that directory exists, `<data-dir>/borg.sock` otherwise — which
+with the default data dir is `~/.borg/borg.sock`. The runtime dir is where a per-user socket belongs:
+user-private, on tmpfs, cleaned at logout, so a crashed server leaves nothing behind across a reboot.
+The fallback is beside the data it serves, which is the only other place a client can find without
+being told.
+
+**One socket, not one per registry.** The handshake routes, so a socket per registry would be a
+second routing mechanism doing the same job worse — and the moment the transport is a TCP port or a
+WebSocket rather than a file, a path per tenant is not a thing that exists. Two servers on two data
+dirs with one `$XDG_RUNTIME_DIR` therefore want the same address and the second is refused because
+something is already listening, which is the right failure for a well-known address; `--socket`
+is how you say otherwise.
+
+#### The server executes the push
+
+`repo_push {registry, branch, path}` — the *server* runs the describe/push against a path on **its**
+disk. This retires *"pushing a schema to a served store means stopping the server"*, which was the
+flaw `examples/personal-crm/dev.sh` was built around: it pushes before it serves, and changing the
+schema means restarting the whole script.
+
+**Why the server and not the client.** A push moves two things. Definitions travel the log; they
+must land through the registry the server is holding open, or a second `Registry` over one store
+breaks the single-process assumption. Implementations — which file each producer is — are a sidecar
+(§9.2), and a client cannot write it because it is not the machine the code runs on. Both point the
+same way: the process that already owns the store is the only one that can do this.
+
+**The precondition was not the protocol.** It was the implementation fingerprint. Before it, `repo
+push` recomputed every producer's source buffer whether or not anything had moved, so a push against
+a live server was not merely unbuilt but unsafe to want. Idempotent and code-change-aware, a push
+now costs exactly what the change costs, which is what makes it a thing a dev loop may do against a
+running server.
+
+**How the held registry sees it**, which is the question this had to answer:
+
+- **Definitions** go through `ops::open`, which answers the held registry when there is one. The
+  projections are maintained on the way in like any other commit, so the instance that answered the
+  last read is the instance that has the new defs. Nothing is re-opened and no log is replayed.
+- **The worker pool** is the half the log cannot carry. It was built at boot from the producer table
+  the push has just rewritten, so `Held::reload_producers` re-registers every producer and **discards
+  every idle worker** — the pool is keyed on the command's *path*, and the common case for an edited
+  pipeline is the same path with different bytes, so a surviving pool would hand the next invocation
+  a process still running the old program. That is precisely the mislabelled output the fingerprint
+  work exists to prevent, arriving through the back door.
+- **Order matters and is asserted.** The reload happens *before* the catch-up, because the catch-up
+  is what runs the new definitions. `crates/borg-server/src/serve.rs`'s live-push test fails without
+  it, which was checked by removing it.
+- **The gate** is what makes "discard every idle worker" safe: the caller holds the registry's gate
+  for the whole push, so no invocation is in flight.
+- **Poisonings** need nothing. §14's recovery is a producer's ClientVersion moving, which the def
+  layer this push landed already did, and the poison table this process holds is keyed on that
+  version — so a fixed producer's record retires itself, without the restart it used to need.
+
+**Local-only, and the payload says so.** `path` is a path on the server; for a remote server that
+means nothing, and the answer there is an uploaded artifact. So `path` is optional and the message is
+expected to grow a sibling field rather than be replaced — a client that sends `path` today keeps
+working against a server that also accepts bytes. What this does **not** do is pre-empt
+`ExecutionProvider`'s container future (§17.3): a container reference is a different way for the
+*server* to find code, which is the same sentence with a different noun.
+
 ### Performance, tooling and tests
 
 #### The rebuilt indexes are `Projection`s, and a server holds one registry
@@ -1232,14 +1443,15 @@ not. Without it, a divergence is invisible: everything rebuilt from zero answers
 served store could quietly answer something else while every existing test passed. It is what makes
 future hacks behind this seam safe to try, and it found something on the first run — see below.
 
-**Then the fix.** `borg serve` holds one deriving `Registry` for its lifetime and every request shares
-it. The blocker was never the socket: `ops::tx_commit` dropped its registry so `auto_derive` could
+**Then the fix.** The server holds one deriving `Registry` per registry for its lifetime and every
+request against that registry shares it. The blocker was never the socket: `ops::tx_commit` dropped its registry so `auto_derive` could
 open another one *with* an executor, and two live registries over one store are what the
 single-process assumption forbids. The long-lived registry carries the executor, so both use the same
 instance and the dance is gone. What makes it *safe* is the advisory lock — serve is the only writer,
-the CLI is refused by name, and `repo push` requires a stop — so every mutation flows through the
-instance maintaining the projections. The lock was built to be honest about a single-process
-assumption; it turns out to be the precondition for the cache.
+the CLI is refused by name, and `repo push` is now performed by the server itself (*The server
+executes the push*) — so every mutation flows through the instance maintaining the projections. The
+lock was built to be honest about a single-process assumption; it turns out to be the precondition
+for the cache.
 
 The measurement, `examples/personal-crm/FRICTION.md` #9, reproduced with `examples/personal-crm/bench.sh`
 against both binaries on one machine:

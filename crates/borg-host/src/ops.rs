@@ -1,10 +1,11 @@
 //! The command layer: what `borg` does, with nothing about how it was asked or how it is shown.
 //!
-//! This used to be the middle of `main.rs`, and it was lifted out for `borg serve` (SDK-DRAFT.md
-//! §2.6). The rule the split enforces is worth stating, because it is the whole reason serve is
-//! small: **an operation returns what happened; the caller renders it.** `main.rs` renders it as
-//! lines of text, `serve.rs` renders it as a [`borg_protocol::client::Response`], and neither of
-//! them contains a second implementation of a transaction.
+//! This used to be the middle of `borg`'s `main.rs`, and it was lifted out for the server
+//! (SDK-DRAFT.md §2.6). The rule the split enforces is worth stating, because it is the whole reason
+//! the serve loop is small: **an operation returns what happened; the caller renders it.** `borg`'s
+//! `main.rs` renders it as lines of text, `borg-server`'s `serve.rs` renders it as a
+//! [`borg_protocol::client::Response`], and neither of them contains a second implementation of a
+//! transaction.
 //!
 //! Every function here is one the CLI already had. Nothing was invented for the socket — if the
 //! socket had needed an operation the CLI does not have, that would have been a finding about the
@@ -26,8 +27,8 @@
 use crate::sidecar::{self, Sidecar};
 use borg_core::{
     BorgError, BranchId, CellAt, CellRef, ClientVersion, Freshness, FreshnessRequirement, LayerId,
-    MergeMode, ObjectDef, ObjectTypeName, Origin, ProducerId, Resolved, Result, Transaction, Value,
-    Writer, parse,
+    MergeMode, ObjectDef, ObjectTypeName, Origin, Ownership, ProducerId, Resolved, Result,
+    Transaction, Value, ValueType, Writer, parse,
 };
 use borg_engine::{Poisoning, Registry};
 use borg_exec_native::NativeExecutor;
@@ -55,7 +56,7 @@ pub const SERVER_ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(1);
 
 /// What every operation needs to know, however it was asked.
 ///
-/// The CLI fills this from argv; `borg serve` fills it from the message it is answering, which is
+/// The CLI fills this from argv; `borg-server` fills it from the message it is answering, which is
 /// exactly why it is a struct and not a pile of arguments — a request that names a branch and a
 /// freshness is naming the same two things `--branch` and `--freshness` do.
 #[derive(Clone, Debug)]
@@ -71,7 +72,7 @@ pub struct Ops {
     pub settled: bool,
     /// The registry this process holds open for its whole life, if it is a process that holds one.
     ///
-    /// **`None` is the CLI and `Some` is `borg serve`**, and it is on `Ops` rather than threaded
+    /// **`None` is the CLI and `Some` is `borg-server`**, and it is on `Ops` rather than threaded
     /// through every operation for a reason worth stating: not one function below changes shape.
     /// [`open`] answers "the registry to work through" either way, so an operation cannot tell which
     /// lifecycle it is running in — which is exactly the property that makes a held registry a
@@ -80,7 +81,7 @@ pub struct Ops {
 }
 
 impl Ops {
-    /// The same store, asked a different question. `borg serve` builds one `Ops` per connection and
+    /// The same store, asked a different question. `borg-server` builds one `Ops` per connection and
     /// then varies branch and freshness per message, which is what this is for.
     pub fn on(&self, branch: Option<String>) -> Self {
         Self {
@@ -100,11 +101,11 @@ impl Ops {
 /// *request* paid it per read, and that multiplication is `examples/personal-crm/FRICTION.md` #9:
 /// 18.4 ms per read at L441 rising to 53.0 ms at L1391, on a request whose size never changed.
 ///
-/// **Safe because the advisory lock already made serve the only writer.** `borg serve` takes the
-/// lock and every other `borg` invocation against that store is refused by name (`crate::serve`), so
-/// every mutation of this store flows through this instance — which is precisely the precondition a
-/// cache needs. The lock was built for honesty about the single-process assumption; holding a
-/// registry is what that honesty buys.
+/// **Safe because the advisory lock already made the server the only writer.** `borg-server` takes
+/// the lock on every store it hosts and every other `borg` invocation against one of them is refused
+/// by name (`crate::serving`), so every mutation of this store flows through this instance — which
+/// is precisely the precondition a cache needs. The lock was built for honesty about the
+/// single-process assumption; holding a registry is what that honesty buys.
 ///
 /// The executor is here rather than rebuilt per derivation because it is the other half of the same
 /// lifecycle: `tx_commit` used to drop its registry so that `auto_derive` could open another one
@@ -114,29 +115,75 @@ impl Ops {
 pub struct Held {
     registry: Registry,
     workers: Arc<borg_exec_process::ProcessExecutor>,
-    /// The producer table as it stood when the executor was built. See [`Held::producers_moved`].
-    registered: Vec<String>,
+    /// The producer table as the executor last saw it. Behind a lock because a `repo push` through
+    /// this server moves it while the server is up — see [`Held::reload_producers`].
+    registered: std::sync::Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for Held {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Held({} producers)", self.registered.len())
+        write!(
+            f,
+            "Held({} producers)",
+            self.registered.lock().unwrap().len()
+        )
     }
 }
 
 impl Held {
-    /// Whether the producer sidecar has moved under a running server.
+    /// The registry this process holds open. Read-only: everything that *mutates* it goes through
+    /// an `ops::` function, so that a held lifecycle and a per-command one cannot diverge.
+    #[must_use]
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// Whether the producer sidecar has moved without this instance being told.
     ///
-    /// **It cannot, and this is the assertion that says so.** `borg repo push` writes
-    /// `producers.json` and reads a directory off this machine's disk, so it is not on the socket
-    /// (SDK-DRAFT §4.3) and is refused outright while a store is served — pushing a schema means
-    /// stopping the server (`CLAUDE.md`). That refusal is what makes registration-at-boot sound: the
-    /// executor is built once from a table nothing can edit while it is in use. If that ever stops
-    /// being true, the symptom would be a producer silently running the wrong binary, which is the
-    /// worst possible way to find out — so it is checked rather than assumed, on the derivation path
-    /// where a small file read is already lost in the noise.
+    /// **The lock says it cannot, and this is the assertion that says so.** Only two things write
+    /// `producers.json`: a `borg repo push` in another process — refused by the advisory lock while
+    /// this store is served (`crate::serving`) — and a `repo_push` through this server, which calls
+    /// [`Held::reload_producers`] and moves the snapshot with it. Anything else is a bug whose
+    /// symptom would be a producer silently running the wrong binary, which is the worst possible
+    /// way to find out. So it is checked rather than assumed, on the derivation path where a small
+    /// file read is already lost in the noise.
     fn producers_moved(&self, args: &Ops) -> bool {
-        current_registrations(&load_impls(args)) != self.registered
+        *self.registered.lock().unwrap() != current_registrations(&load_impls(args))
+    }
+
+    /// Adopt a producer table that has just moved. SPEC.md §9.2, §17.6.
+    ///
+    /// **This is the half of a live `repo push` that the log cannot carry.** A push moves two
+    /// things: definitions, which travel the log and therefore arrive through the held `Registry`
+    /// like any other commit, and *implementations* — which file each producer is — which are a
+    /// sidecar because a path is a fact about one machine. The worker pool was built from that
+    /// sidecar at boot, so after a push it is pointing at the table as it used to be.
+    ///
+    /// Two things are done and the second is the one that is easy to miss:
+    ///
+    /// * **Re-register**, so a producer this push introduced can be run at all and one whose command
+    ///   moved is run from its new path.
+    /// * **Discard every idle worker.** The pool is keyed on the command's path, and the common case
+    ///   for an edited pipeline is *the same path with different bytes* — so a pool that survived
+    ///   would hand the next invocation a process still running the old program, which is precisely
+    ///   the failure the fingerprint work exists to make impossible. Idle is all there is to discard:
+    ///   the caller holds this registry's gate for the whole push, so no invocation is in flight.
+    ///
+    /// Deliberately **not** here: anything about poisonings. §14's recovery is a producer's
+    /// ClientVersion moving, which the def layer this push landed already did, and the poison table
+    /// this process holds is keyed on that version — so a fixed producer's record retires itself.
+    pub async fn reload_producers(&self, args: &Ops) {
+        let impls = load_impls(args);
+        for producer in &impls.producers {
+            self.workers.register(borg_exec_process::Registration {
+                producer: producer.id,
+                command: producer.command.clone(),
+                source: producer.source.clone(),
+                transport: producer.transport,
+            });
+        }
+        self.workers.shutdown().await;
+        *self.registered.lock().unwrap() = current_registrations(&impls);
     }
 
     /// Stop the worker pool. Called when the server stops, and only then.
@@ -201,7 +248,7 @@ pub async fn hold(args: &Ops) -> Result<Arc<Held>> {
     Ok(Arc::new(Held {
         registry,
         workers,
-        registered: current_registrations(&impls),
+        registered: std::sync::Mutex::new(current_registrations(&impls)),
     }))
 }
 
@@ -298,6 +345,30 @@ pub async fn client_version(
     }
     let path = registry.branches.read_path(branch, None)?;
     Ok(ClientVersion(registry.defs.head(&path)))
+}
+
+/// Create a store: the file, and the root branch every address is relative to.
+///
+/// One implementation, two callers, and they are further apart than they look: `borg init` makes a
+/// store for a person to work on directly, and `borg-server create` makes one for a server to host
+/// (`crate::host`). A second implementation would be a second answer to *what a fresh store is*, and
+/// the first thing to diverge would be the root branch's name — which every `--branch main` in every
+/// scenario depends on.
+pub async fn init(args: &Ops) -> Result<BranchId> {
+    if args.store.exists() {
+        return Err(BorgError::Storage(format!(
+            "{} already exists",
+            args.store.display()
+        )));
+    }
+    if let Some(parent) = args.store.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| BorgError::Storage(format!("{}: {err}", parent.display())))?;
+    }
+    let registry = open(args).await?;
+    registry.branches.create_root(Some("main".into())).await
 }
 
 // --- Reads --------------------------------------------------------------------------------------
@@ -616,9 +687,8 @@ pub fn spell_duration(seconds: u64) -> String {
 ///
 /// **No daemon.** This runs when a process opens the store, which is the same place the indexes are
 /// already rebuilt from the log — so an idle store sweeps nothing, because nothing is growing, and a
-/// busy one sweeps constantly for free. For the CLI "a process opens the store" is `run()`; for
-/// `borg serve` it is every request, since serve opens the store per request for the same reason the
-/// CLI does (see `crate::serve`).
+/// busy one sweeps constantly for free. For the CLI "a process opens the store" is `run()`; for the
+/// server it is every request, because that is when a request takes the store.
 ///
 /// A reaped transaction's *state* is dropped, which is what makes it unusable: nothing can be
 /// written through it and its layers can never merge. Its branch row is left where it is, because
@@ -966,8 +1036,8 @@ pub async fn tx_commit(args: &Ops, tx: &str) -> Result<LayerId> {
     let landed = landing(&registry, &state, &replayed);
     // **Dropped here, and it used to be load-bearing.** `auto_derive` opens a registry *with* an
     // executor, and two live `Registry` instances over one store are what the single-process
-    // assumption forbids — so this drop was what made the next line legal, and it is why `borg serve`
-    // could not hold a store open (`CLAUDE.md`, `crate::serve`). A held registry carries the executor
+    // assumption forbids — so this drop was what made the next line legal, and it is why a server
+    // could not hold a store open (`CLAUDE.md`). A held registry carries the executor
     // itself, so the drop is a no-op there and `auto_derive` reuses the same instance. Kept because
     // the CLI still opens one per command and still has to put it down before opening the next.
     drop(registry);
@@ -1187,8 +1257,8 @@ pub fn derive_parallelism() -> usize {
 /// chase it, and it does so before exiting. A worker pool with its own scheduler is a strictly better
 /// shape and needs a server to live in — which is the point at which this call becomes a signal
 /// rather than a call, with nothing above it changing, because §9.6 already says scheduling policy
-/// cannot affect correctness. `borg serve` is not yet that server: it calls this, exactly as the CLI
-/// does, so that a socket commit and a `borg tx commit` derive identically.
+/// cannot affect correctness. `borg-server` is not yet that server either: it calls this, exactly as
+/// the CLI does, so that a socket commit and a `borg tx commit` derive identically.
 pub async fn auto_derive(args: &Ops, branch: BranchId) -> Result<()> {
     if paused_branches(args).contains(&branch.0) {
         return Ok(());
@@ -1199,13 +1269,14 @@ pub async fn auto_derive(args: &Ops, branch: BranchId) -> Result<()> {
         return Ok(());
     }
     if let Some(held) = &args.held {
-        // See `Held::producers_moved`: `repo push` is refused while a store is served, so the table
-        // the executor was built from cannot have moved. Said out loud because the failure mode of a
-        // wrong assumption here is a producer running stale code and nothing looking wrong.
+        // See `Held::producers_moved`. A push through this server calls `reload_producers` and moves
+        // the snapshot with the table; a push from anywhere else is refused by the advisory lock. So
+        // this can only fire on a bug, and the failure mode of that bug is a producer running stale
+        // code with nothing looking wrong, which is the worst possible way to find out.
         if held.producers_moved(args) {
             eprintln!(
-                "warning: the producer table changed under a running server — the worker pool was \
-                 built at boot and is now stale. Stop the server and start it again."
+                "warning: the producer table moved without the worker pool being told — the pool is \
+                 now running whatever code it was built from. Stop the server and start it again."
             );
         }
     }
@@ -1442,6 +1513,34 @@ pub fn freshness(mode: &str) -> Option<FreshnessRequirement> {
         "validated" => Some(FreshnessRequirement::Validated),
         "current" => Some(FreshnessRequirement::Current),
         _ => None,
+    }
+}
+
+/// A declared type, as a `def push` file and a `describe` payload both spell it. SPEC.md §5.1.
+///
+/// Anything unrecognised names a struct — `Employee`, `Employee[]` — because a reference's type
+/// *is* the name of what it points at, and a closed list would make declaring a new struct a change
+/// to this function.
+#[must_use]
+pub fn value_type(name: &str) -> ValueType {
+    match name {
+        "Int" => ValueType::Int,
+        "Bool" => ValueType::Bool,
+        "Double" => ValueType::Double,
+        "String" => ValueType::String,
+        "Binary" => ValueType::Binary,
+        "BigInt" => ValueType::BigInt,
+        "Any" => ValueType::Any,
+        other => ValueType::Object(other.into()),
+    }
+}
+
+/// A field is source data unless a producer is named as its writer (SPEC.md §8).
+#[must_use]
+pub const fn ownership(producer: Option<ProducerId>) -> Ownership {
+    match producer {
+        Some(producer) => Ownership::Derived(producer),
+        None => Ownership::Source,
     }
 }
 

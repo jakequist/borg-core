@@ -445,7 +445,13 @@ pub struct Registration {
 
 pub struct ProcessExecutor {
     /// Producer id → everything needed to run it.
-    commands: HashMap<u64, Registration>,
+    ///
+    /// **Behind a lock because a registration outlives the moment it was made.** A CLI builds this
+    /// once and exits; a server holds one executor for its life, and a `repo push` through that
+    /// server introduces producers and moves commands under it (SPEC.md §17.6). Registering through
+    /// `&self` is what lets the pool be corrected in place instead of the whole registry being
+    /// dropped and its log replayed to pick up a new pipeline.
+    commands: Mutex<HashMap<u64, Registration>>,
     /// One pool per command.
     pools: Mutex<HashMap<PathBuf, Arc<Pool>>>,
     pool_size: usize,
@@ -459,7 +465,7 @@ impl ProcessExecutor {
     /// addresses, which is what workers are actually handed, carry their own branch and ignore it.
     pub fn new(branch: BranchId) -> Self {
         Self {
-            commands: HashMap::new(),
+            commands: Mutex::new(HashMap::new()),
             pools: Mutex::new(HashMap::new()),
             pool_size: default_pool_size(),
             connect_timeout: CONNECT_TIMEOUT,
@@ -482,8 +488,16 @@ impl ProcessExecutor {
         self
     }
 
-    pub fn register(&mut self, registration: Registration) {
-        self.commands.insert(registration.producer, registration);
+    /// Teach the executor about one producer's implementation, replacing whatever it knew.
+    ///
+    /// `&self` rather than `&mut self`: see [`ProcessExecutor::commands`]. A caller that changes a
+    /// command's *file* while keeping its path must also call [`shutdown`](Self::shutdown), because
+    /// the pools are keyed on the path and the idle processes in them are running the old bytes.
+    pub fn register(&self, registration: Registration) {
+        self.commands
+            .lock()
+            .unwrap()
+            .insert(registration.producer, registration);
     }
 
     fn pool(&self, command: &Path) -> Arc<Pool> {
@@ -519,12 +533,18 @@ impl ExecutionProvider for ProcessExecutor {
         input: Pid,
         ctx: &mut dyn ProducerCtx,
     ) -> Result<()> {
-        let known = self.commands.get(&producer.id.0).cloned().ok_or_else(|| {
-            exec(format!(
-                "no implementation registered for {:?}",
-                producer.id
-            ))
-        })?;
+        let known = self
+            .commands
+            .lock()
+            .unwrap()
+            .get(&producer.id.0)
+            .cloned()
+            .ok_or_else(|| {
+                exec(format!(
+                    "no implementation registered for {:?}",
+                    producer.id
+                ))
+            })?;
         let Registration {
             command, source, ..
         } = &known;
@@ -612,7 +632,7 @@ pub fn from_registrations(
     branch: BranchId,
     registrations: impl IntoIterator<Item = Registration>,
 ) -> ProcessExecutor {
-    let mut executor = ProcessExecutor::new(branch);
+    let executor = ProcessExecutor::new(branch);
     for registration in registrations {
         executor.register(registration);
     }

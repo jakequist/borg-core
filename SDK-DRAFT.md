@@ -237,15 +237,16 @@ is better than one at first use. The `resolve` line is §4.4's envelope split.
    **Scenario 250**: two concurrent SDK clients, S2's conflict through the socket; a client killed
    mid-transaction reaped by the idle timeout.
 
-   **Server half built.** `borg_protocol::client`, `borg serve --socket`, and `scenarios/250-serve`
-   (two clients driving the protocol directly, no SDK). Three corrections to the sketch above, all
-   recorded in `SPEC.md` §17.5 and `crates/borg-cli/src/serve.rs`:
+   **Server half built.** `borg_protocol::client`, the serve loop, and `scenarios/250-serve` (two
+   clients driving the protocol directly, no SDK). It shipped as `borg serve --socket` and is now
+   `borg-server` (§2.6, SPEC.md §17.6). Three corrections to the sketch above, all recorded in
+   `SPEC.md` §17.5 and `crates/borg-server/src/serve.rs`:
 
    - *Not* per-connection transaction binding — **per-store**. The transaction table is already a
      sidecar (§12.2), so a handle outlives its socket for free, and that is the stronger property:
      binding to the connection would make a dropped socket destroy work rather than abandon it,
      which is the opposite of what §2.5's browser story needs.
-   - The serve loop being thin required extracting the CLI's command layer (`borg-cli/src/ops.rs`)
+   - The serve loop being thin required extracting the CLI's command layer (now `borg-host::ops`)
      out of `main.rs`, so that `main.rs` is argv-and-printing and `serve.rs` is protocol-and-message
      over the same functions. Two things did not lift and are findings about the CLI, not about
      serve: the `--tx` / `$BORG_TX` / only-one-open defaults are shell affordances a socket client
@@ -261,15 +262,26 @@ is better than one at first use. The `resolve` line is §4.4's envelope split.
    the client build settled is in §4.4, because everything interesting about it turned out to be a
    codegen question wearing a client's clothes.
 
-   **`def push` and `repo push` are not on the socket, and that leaves a gap worth naming.** Both
-   read from a *filesystem* — a JSON file, a directory of pipeline scripts — and `repo push` writes
-   the resolution table saying where that code lives (§9.2). A client naming paths on the server's
-   disk is not a client operation, it is a deployment one. But the advisory lock means the CLI
-   cannot do it either while the store is served, so today **pushing a schema to a served store
-   means stopping the server**. That is acceptable for a local dev server and is not acceptable for
-   anything else; the answer is a deploy path that ships code rather than names it, which is the
-   same question as `ExecutionProvider`'s container future (§17.3) and should not be pre-empted by
-   adding a `def_push` message that only works when the client and the server share a disk.
+   ~~**`def push` and `repo push` are not on the socket, and that leaves a gap worth naming.**~~
+   **Answered by `repo_push`** (SPEC.md §17.6). The gap was real and the reasoning above was half
+   right: a client naming paths on the server's disk is indeed a deployment operation and not a
+   client one, and the advisory lock meant the CLI could not do it either, so **pushing a schema to
+   a served store meant stopping the server**.
+
+   What the original entry got wrong is what should therefore be *on* the socket. It reasoned as if
+   the only candidate were a `def_push` the *client* performs, which would need the two to share a
+   disk — so it deferred to a deploy path that ships code. The message that landed is the other
+   shape: the **server** performs the push, against a path on its own filesystem, and the client
+   asks for it. That is local-only and says so, the payload is extensible so that the artifact form
+   is a further field rather than a second message, and nothing about it pre-empts
+   `ExecutionProvider`'s container future (§17.3) — a container reference is a different way for the
+   *server* to find code, which is the same sentence with a different noun.
+
+   The precondition was not the protocol. It was §9.2's implementation fingerprint: a `repo push`
+   that recomputed every source buffer whether or not anything had moved is not a thing anyone could
+   run against a live server, so this was not merely unbuilt before that landed — it was not safe to
+   want. `def push` is still not on the socket, and is the smaller case: it reads one JSON file that
+   a repo would emit anyway.
 4. **Codegen** — `borg generate --lang ts -o ...` emitting typed structs + `createBorgContext` with
    the ClientVersion stamp; `--watch`. **Built.** `crates/borg-cli/src/generate.rs`, **scenario 260**
    (generate, compile, run — including a deliberately wrong program that must *fail* to compile) and
@@ -460,7 +472,7 @@ hash was not a hash of anything.
   should not be pointed at. Paging is not a parameter that can be bolted on: a cursor over a scan
   that re-runs at head is a different consistency story, and it belongs with the query layer or with
   streaming reads (`CLAUDE.md`, things left undone) rather than in front of them.
-- WebSocket server: in `borg serve` from day one or when the browser client lands? (Lean: the
+- WebSocket server: in `borg-server` from day one or when the browser client lands? (Lean: the
   transport trait supports it from day one; the actual HTTP listener lands with the browser work.)
 - **How far does the CLI-over-socket wedge go?** `borg generate` now connects to the socket rather
   than being refused by it (§4.4), which is the first instance of §2.6's eventual shape. It was safe
@@ -470,6 +482,15 @@ hash was not a hash of anything.
   and §4.3 already records that they cannot. So the honest boundary may be "reads connect, writes are
   refused", which is a strange thing to have to explain, or the answer may be that the whole CLI
   becomes a client and the shell affordances become client-side state. Not decided.
+
+  **`repo_push` moved the boundary without settling the question**, and it is worth being precise
+  about which way. It is not the CLI connecting: `borg repo push` still opens the store directly and
+  is still refused while it is served. It is a *client* asking the server to perform a deployment
+  operation — so it says nothing about `--tx`, and the wedge is exactly where it was. What it does
+  remove is the strongest argument for widening the wedge quickly, which was that a served store was
+  unusable in a dev loop. `borg-server` also gives the refused commands somewhere to point: the
+  refusal names the socket and the registry, so what a connecting CLI would need is a connection
+  string and not a discovery mechanism.
 - ~~Codegen for list/ref fields: how a `Ref` renders in a typed client.~~ **Answered by the build**:
   a branded string, `Ref<"Employee">`, which is the PID at runtime and the target struct to the
   compiler. Not a handle and not the pipeline SDK's `Ref` object — §4.4 has the reasoning. What is

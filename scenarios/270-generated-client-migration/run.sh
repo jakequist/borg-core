@@ -31,28 +31,26 @@ build_sdk
 source "$HERE/../lib.sh"
 setup
 
+DATA="$WORK/data"
 SOCK="$WORK/borg.sock"
 PROGRAM="$WORK/program"
+server() { "$BORG_SERVER_BIN" --data-dir "$DATA" --socket "$SOCK" "$@"; }
+
+# One registry under a data directory — what a server hosts (§17.6). Being the only one, it is what
+# a client naming no registry gets, so the generated clients below say nothing about it.
+server create main >/dev/null
+STORE="$DATA/main/borg.db"
 
 start_serve() {
-    "$BORG_BIN" --store "$WORK/borg.db" serve --socket "$SOCK" >>"$WORK/serve.log" 2>&1 &
-    SERVE_PID=$!
-    for _ in $(seq 100); do
-        if python3 -c '
-import socket, sys
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try: s.connect(sys.argv[1])
-except OSError: sys.exit(1)
-' "$SOCK" 2>/dev/null; then return 0; fi
-        sleep 0.1
-    done
-    echo "server never came up:" >&2; cat "$WORK/serve.log" >&2; exit 1
+    if ! server start >>"$WORK/start.out" 2>&1; then
+        echo "server never came up:" >&2
+        cat "$WORK/start.out" >&2
+        cat "$DATA/borg-server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
 }
 
-stop_serve() {
-    kill "$SERVE_PID" 2>/dev/null || true
-    wait "$SERVE_PID" 2>/dev/null || true
-}
+stop_serve() { server stop >/dev/null; }
 
 out() { sed -n "s/^$2=//p" <<<"$1" | head -1; }
 client() { (cd "$PROGRAM" && node "$@"); }

@@ -104,7 +104,7 @@ async fn distinct_workers(pool_size: usize, invocations: u64, at_once: bool) -> 
     let log = dir.join("pids");
     let command = worker(&dir, &log);
 
-    let mut executor = ProcessExecutor::new(BRANCH).with_pool_size(pool_size);
+    let executor = ProcessExecutor::new(BRANCH).with_pool_size(pool_size);
     executor.register(Registration {
         producer: PRODUCER.0,
         command,

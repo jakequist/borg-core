@@ -1,0 +1,24 @@
+[package]
+name = "borg-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+borg-core.workspace = true
+borg-engine.workspace = true
+# The provider *trait*, not just the SQLite implementation: reading the branch table on its own is
+# how a deriving command finds the allocation branch without replaying the whole log to get it
+# (SPEC.md §17.1 — the branch table is the structure of the log, not a projection of it).
+borg-storage.workspace = true
+borg-storage-sqlite.workspace = true
+borg-exec-native.workspace = true
+borg-exec-process.workspace = true
+borg-protocol.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+serde.workspace = true
+serde_json.workspace = true

@@ -16,17 +16,13 @@ workspace = true
 [dependencies]
 borg-core.workspace = true
 borg-engine.workspace = true
-# The provider *trait*, not just the SQLite implementation: reading the branch table on its own is
-# how a deriving command finds the allocation branch without replaying the whole log to get it
-# (SPEC.md §17.1 — the branch table is the structure of the log, not a projection of it).
-borg-storage.workspace = true
-borg-storage-sqlite.workspace = true
-borg-exec-native.workspace = true
-borg-exec-process.workspace = true
+# What both binaries do to a store: opening one, the operations on it, the sidecars beside it. The
+# CLI is a *client* of this and so is `borg-server`; nothing about a command lives in this crate.
+borg-host.workspace = true
+# `borg generate` speaks §17.5 to a served store rather than being refused by it, which is the one
+# place the CLI is a protocol client (SDK-DRAFT §2.6).
 borg-protocol.workspace = true
-# `time` is what bounds `borg frontier reaches`: a wait with no deadline is a hang. `signal` is what
-# lets `borg serve` release its advisory lock when it is stopped, rather than leaving one behind on
-# every ordinary shutdown and relying on the next process to notice it is stale.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+# `time` is what bounds `borg frontier reaches`: a wait with no deadline is a hang.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 serde.workspace = true
 serde_json.workspace = true

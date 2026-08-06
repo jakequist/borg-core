@@ -6,7 +6,7 @@
 //! * **rebuilt from zero** — a fresh set folded over the whole log, which is what a
 //!   process-per-command CLI does on every invocation;
 //! * **maintained live** — the set a long-lived process keeps up to date as layers commit through
-//!   it, which is what lets `borg serve` hold one registry open instead of replaying the log per
+//!   it, which is what lets a server hold one registry open instead of replaying the log per
 //!   request (`examples/personal-crm/FRICTION.md` #9).
 //!
 //! **If those two ever disagree, the second one is a lie**, and it is a lie no correctness test
@@ -227,7 +227,7 @@ struct Rebuilt {
     index: Arc<MemoryDependencyIndex>,
     frontier: Arc<FrontierTracker>,
     set: Projections,
-    /// How many layers the fold had to read. The number `borg serve` used to pay per request.
+    /// How many layers the fold had to read. The number a server used to pay per request.
     folded: usize,
 }
 

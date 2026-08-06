@@ -39,7 +39,8 @@ else
 fi
 
 step "scenarios"
-cargo build -p borg-cli
+# Both binaries: the client the scenarios drive, and the server two of them start (SPEC.md §17.6).
+cargo build -p borg-cli -p borg-server
 bash scenarios/run-all.sh
 
 printf '\n\033[1;32mall checks passed\033[0m\n'

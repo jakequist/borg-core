@@ -2441,14 +2441,16 @@ leaving it alone is what keeps a repo of shell pipelines a single `jq -n`.
 ### 17.5 The client protocol
 
 §17.4 is the engine talking to code it invoked. This is the reverse: **a client's transaction surface
-over a socket instead of over argv**, which is what an SDK speaks and what `borg serve` answers.
+over a socket instead of over argv**, which is what an SDK speaks and what `borg-server` answers.
 
 It reuses §17.4's framing whole — same codecs, same per-codec framing, same **single-key object**
 rule — because the two protocols differ in who is asking and not in how a message is carried. The
 operations are the ones the CLI already has: `tx_begin`, `tx_get`, `tx_set`, `tx_create`,
-`tx_commit`, `tx_abort`, `get`, `list`, `explain`, `branch_list`, `branch_head`, `def_show`. That is
-a constraint rather than a coincidence: the CLI is the testbed for what a client is like to use, so a
-protocol needing an operation the CLI lacks would be evidence about the CLI.
+`tx_commit`, `tx_abort`, `get`, `list`, `explain`, `branch_list`, `branch_head`, `def_show`,
+`repo_push`. That is a constraint rather than a coincidence: the CLI is the testbed for what a client
+is like to use, so a protocol needing an operation the CLI lacks would be evidence about the CLI. The
+two that are not lifted subcommands are `registries` and `registry_create`, and they are not about a
+store at all — they are about the server hosting it (§17.6).
 
 Two operations arrived with the first real application rather than with the CLI, and both are on the
 CLI too, because the rule above holds in that direction as well: an operation a client needs is one
@@ -2492,20 +2494,28 @@ like any other silence. This is what makes a browser tab closing an ordinary eve
 rejected" is not something a client can act on; "the cell you read moved, and here it is" is the
 input to deciding whether to retry (§13).
 
+One message is a **write the client does not perform**. `repo_push` names a repo and the *server*
+runs the push against it: the definitions land through the registry the server is holding open, and
+the producer implementations it resolves are the server's, because a push reads code off a
+filesystem and the filesystem it reads is the one the code will run on. §17.6 has the rest, including
+why this is local-only today and what the remote form is.
+
 The handshake carries the client's **ClientVersion** — the def-layer its generated code was built
 from (§5.4) — so that old generated clients keep reading through `down` migrations, and so the engine
 can eventually name which live clients a def push would break (§5.5). Absent means the branch's
-current def-version, which is what an un-generated client honestly is.
+current def-version, which is what an un-generated client honestly is. It also carries the
+**registry** the connection is for and a **credential** (§17.6).
 
 **One process serves a store.** The transaction table, the producer table and the pause flags are
 files beside the store, and the sequencer is in-process; none of that is multi-process safe, and it
-was not before a server existed either. `borg serve` therefore takes an advisory lock and every other
-invocation against that store is refused and told the socket to speak to. The lock's liveness test is
-the socket itself — a record whose socket does not answer is stale and is cleared — because a lock
-that can outlive its holder is worse than no lock. This is v1 honesty and not the destination: the
-destination is the CLI connecting to the socket rather than being turned away by it.
+was not before a server existed either. A server therefore takes an advisory lock on every store it
+hosts and every other invocation against one of them is refused and told the socket to speak to. The
+lock's liveness test is the socket itself — a record whose socket does not answer is stale and is
+cleared — because a lock that can outlive its holder is worse than no lock. This is v1 honesty and
+not the destination: the destination is the CLI connecting to the socket rather than being turned
+away by it.
 
-**A server opens the store once and holds it**, and the lock above is what makes that sound rather
+**A server opens a store once and holds it**, and the lock above is what makes that sound rather
 than merely convenient. A registry's indexes are projections of the log (§17.1); holding them across
 requests is safe exactly when every mutation of the store flows through the instance maintaining
 them, which is what "one process serves a store" already guarantees. Holding the registry also means
@@ -2515,9 +2525,72 @@ opened one per operation could never chase a write without dropping the registry
 through. Opening per request instead costs an `O(log)` replay *per read*, which is the multiplication
 that made the first application on this system unusable at a hundred and forty objects.
 
-Requests are still answered one at a time, store-wide. That is a separate decision from the one
+Requests are still answered one at a time, **per registry**. That is a separate decision from the one
 above: process-per-command gave a client serialisation for free, a server has to choose it, and
-choosing it is what keeps a served store no less correct than an unserved one.
+choosing it is what keeps a served store no less correct than an unserved one. It is per registry
+rather than per server because what it protects — the files beside a store, and that store's
+sequencer — is per store; two clients on two registries share none of it.
+
+### 17.6 A server hosts a directory of registries
+
+§17.5 is what a client says. This is what answers it: **one process, one socket, many registries**,
+where a registry is a store and everything beside it. `borg-server start --data-dir <dir>` hosts
+every store under `<dir>`, addressable by the name of its directory.
+
+This is the local instance of a hosted platform rather than a smaller different thing. What a
+multi-tenant deployment adds is a credential that means something and a place other than a directory
+to keep the registries; what it does not add is a routing concept, a second protocol, or a second
+server.
+
+**The registry is the unit of tenancy.** Not the connection, not the branch, and not the process. A
+branch is a fork of one history and shares its definitions, its transaction table and its PID
+counter with what it forked from (§7, §12.2), so two applications that must not see each other's
+schema need two registries and not two branches. Everything a registry owns is already
+registry-shaped — the log, the sidecars, the advisory lock — which is what makes the multi-tenant
+case the same code as the single one.
+
+**The handshake routes; the messages do not.** `ClientHello` carries `registry`, settled once per
+connection. Absent means the server's sole registry *when it has exactly one* — which is what keeps a
+one-registry server the thing a local developer already expects, with no name anywhere — and is an
+error naming the options when it hosts more than one, because at n≥2 any default would be a guess
+over somebody else's data. The one message that may name another registry is `repo_push`, so that a
+deploy client pushing to several does not need a connection each; and the one message that needs no
+registry at all is `registries`, which is what lets a client that guessed wrong discover what to
+name.
+
+`ClientHello` also carries a **`credential`**, and nothing checks it. Its existence is the point: a
+local server has no one to authenticate, since the socket's file permissions are the boundary, but
+adding the field once authentication exists would mean moving the wire at exactly the moment there
+is a deployment that cannot take a wire change.
+
+**Registries open lazily and lock eagerly.** Opening one brings its projections to head, which for a
+fresh set is a replay of its log (§17.1), so a server that opened everything at boot would pay every
+registry's history to answer a request about one of them. Taking the advisory lock costs a file
+write, and not taking it leaves a window in which another process may walk into a store this server
+is about to hold. They are not symmetric and are not done at the same time.
+
+**Creating a registry is a server operation.** A directory appearing under a running server's data
+directory is a store it has not locked, is not hosting and will not route to, so `registry_create`
+is on the protocol and `borg-server create` uses it whenever a server is up. It also creates one
+directly when no server is running, because a data directory has to be fillable before there is a
+server to fill it.
+
+**`repo_push` is a write the server performs.** A repo is a directory of code, and pushing it moves
+two things: definitions, which travel the log, and implementations, which are a sidecar recording
+which file each producer is (§9.2). A client cannot do the second — it is not the machine the code
+runs on — and a second *process* doing either is the second writer the advisory lock refuses. So the
+server does it: the definitions land through the registry it is holding open, and the worker pool it
+built from the old table is reloaded before the branch is caught up, since the catch-up is what runs
+the new code. This is what retires *"pushing a schema to a served store means stopping the server"*,
+and it is only safe because a push is idempotent and code-change-aware (§9.2): a push that
+recomputed every source buffer whether or not anything moved would be a thing nobody could run
+against a live server.
+
+The `path` in a `repo_push` is a path **on the server**, and that is part of the contract rather than
+an implementation detail. For a local server it is the directory the developer is editing, which is
+exactly what they mean. For a remote one it means nothing, and the answer there is an uploaded
+artifact — a further field on the same message, not a different message, which is why `path` is
+optional and why the payload is expected to grow rather than to be replaced.
 
 ---
 
@@ -2556,11 +2629,12 @@ choosing it is what keeps a served store no less correct than an unserved one.
 - `Set`, `Map`
 - Aggregation pipelines
 - Mid-list insertion
-- ~~**All generated SDKs** (§15) — they arrive with the network layer~~ — and they did: `borg serve`
+- ~~**All generated SDKs** (§15) — they arrive with the network layer~~ — and they did: `borg-server`
   (§17.5) is that layer, and `borg generate --lang ts` is the generator. TypeScript only; Python,
   Rust and Go remain out.
-- ~~Network / server layer — v1 is a library exercised by Rust tests~~ — §17.5. A **local** unix
-  socket, with one process serving a store; actual distribution is still out.
+- ~~Network / server layer — v1 is a library exercised by Rust tests~~ — §17.5, §17.6. A **local**
+  unix socket, one process serving a directory of registries; actual distribution is still out, and
+  so is anything the `credential` in the handshake would be checked against.
 - A query layer. `list` (§17.5) answers ids of one struct at head and nothing else: no filter, no
   ordering, no paging, no projection, no join, and no way to guard one — see §9.6 for the boundary
   and why it is where it is.

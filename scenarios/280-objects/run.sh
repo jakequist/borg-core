@@ -23,7 +23,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../lib.sh"
 setup
 
+DATA="$WORK/data"
 SOCK="$WORK/borg.sock"
+
+# The half of this scenario that goes over the socket needs a *server*, and a server hosts a data
+# directory of registries (§17.6). One registry, so nothing below names it.
+"$BORG_SERVER_BIN" --data-dir "$DATA" --socket "$SOCK" create main >/dev/null
+STORE="$DATA/main/borg.db"
 # The same eighty-line client `250-serve` uses: a socket and `json`, no SDK. Shared rather than
 # copied, because a second copy is a second thing to keep in step with the protocol.
 client() { python3 "$HERE/../250-serve/client.py" "$SOCK" "$@"; }
@@ -82,7 +88,7 @@ assert_eq "$(borg get "Contact:$grace.name" --value)" "Grace" \
 # says where the fact lives: beside the store, with the pause flags and the transaction table, moved
 # on *before* the write it names so that a crash burns an id rather than handing one out twice.
 assert_eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["next"])' \
-    "$WORK/borg.allocations.json")" "4" \
+    "${STORE%.db}.allocations.json")" "4" \
     "the next id to issue is written down beside the store, so a new process resumes rather than restarting"
 
 # --- A hand-authored object, beside the allocated ones --------------------------------------------
@@ -135,23 +141,20 @@ assert_contains "$(borg list Contact)" "$ada" "while everything else is untouche
 assert_rejected "Wombat" "listing a struct nobody declared is refused rather than answered with nothing" \
     -- borg list Wombat
 assert_rejected "Wombat" "and so is creating one — a creation is a write, checked like any other" \
-    -- sh -c "tx=\$($BORG_BIN --store '$WORK/borg.db' tx begin); $BORG_BIN --store '$WORK/borg.db' tx create Wombat --tx \"\$tx\""
+    -- sh -c "tx=\$($BORG_BIN --store '$STORE' tx begin); $BORG_BIN --store '$STORE' tx create Wombat --tx \"\$tx\""
 
 # --- The same two things over the socket ----------------------------------------------------------
 
+server() { "$BORG_SERVER_BIN" --data-dir "$DATA" --socket "$SOCK" "$@"; }
 start_serve() {
-    "$BORG_BIN" --store "$WORK/borg.db" serve --socket "$SOCK" >"$WORK/serve.log" 2>&1 &
-    SERVE_PID=$!
-    for _ in $(seq 100); do
-        if client '{"branch_list":{}}' >/dev/null 2>&1; then return 0; fi
-        sleep 0.1
-    done
-    echo "server never came up:" >&2; cat "$WORK/serve.log" >&2; exit 1
+    if ! server start >"$WORK/start.out" 2>&1; then
+        echo "server never came up:" >&2
+        cat "$WORK/start.out" >&2
+        cat "$DATA/borg-server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
 }
-stop_serve() {
-    kill "$SERVE_PID" 2>/dev/null || true
-    wait "$SERVE_PID" 2>/dev/null || true
-}
+stop_serve() { server stop >/dev/null; }
 start_serve
 
 # *Failing means the SDK has to reach for the CLI to create an object, which it cannot: while a

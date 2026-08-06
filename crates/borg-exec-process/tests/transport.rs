@@ -87,7 +87,7 @@ fn producer() -> ProducerRef {
 }
 
 fn executor(command: &Path, transport: Transport) -> ProcessExecutor {
-    let mut executor = ProcessExecutor::new(BRANCH).with_pool_size(1);
+    let executor = ProcessExecutor::new(BRANCH).with_pool_size(1);
     executor.register(Registration {
         producer: PRODUCER.0,
         command: command.to_path_buf(),

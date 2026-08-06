@@ -16,7 +16,7 @@
 //! their server up — and the fix would be to stop the server, regenerate, and start it again.
 //!
 //! This is the first place the CLI *connects to* the socket instead of being turned away by it,
-//! which SDK-DRAFT §2.6 names as the feature that eventually supersedes `borg serve` altogether. It
+//! which SDK-DRAFT §2.6 names as the remote-connection future. It
 //! is scoped to this one command on purpose: `generate` only reads, so it needs none of the answers
 //! the general case needs about transactions, `$BORG_TX`, or which process owns a write.
 //!
@@ -31,9 +31,10 @@
 //! head moves on every data write, and a generated module changes only when a *def* layer lands
 //! (§5.3). Watching head would rewrite the file on every `borg set`.
 
-use crate::ops::{self, Ops};
-use crate::serve;
 use borg_core::{BorgError, Result};
+use borg_host::ops::{self, Ops};
+use borg_host::render::struct_def;
+use borg_host::serving;
 use borg_protocol::client::{ClientHello, Request, Response, SchemaDef, StructDef};
 use borg_protocol::{Codec, ServerHello};
 use std::io::BufReader;
@@ -134,20 +135,26 @@ fn write(out: &Path, source: &str) -> Result<PathBuf> {
 
 /// The schema, and a phrase saying how it was obtained. See the module header.
 async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, String)> {
+    // The store's own lock record says both halves of what a connection needs: where the server is
+    // listening, and **what it calls this store** — one socket serves a directory of registries and
+    // the handshake is what routes (§17.6), so a generator that knew only the address would be
+    // asking an arbitrary registry for its schema.
+    let served = serving::served_on(&args.store);
     let socket = options
         .socket
         .clone()
-        .or_else(|| serve::served_on(&args.store).map(|(socket, _)| socket));
+        .or_else(|| served.as_ref().map(|served| served.socket.clone()));
     match socket {
         Some(socket) => {
-            let schema = over_socket(&socket, args.branch.as_deref())?;
+            let registry = served.and_then(|served| served.registry);
+            let schema = over_socket(&socket, registry.as_deref(), args.branch.as_deref())?;
             Ok((schema, format!("through {}", socket.display())))
         }
         None => {
             let (version, structs) = ops::def_view(args).await?;
             let schema = SchemaDef {
                 version: version.to_string(),
-                structs: structs.iter().map(serve::struct_def).collect(),
+                structs: structs.iter().map(struct_def).collect(),
             };
             Ok((schema, "directly".to_string()))
         }
@@ -157,7 +164,7 @@ async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, Strin
 /// The first Rust client of §17.5, and it is deliberately small: connect, hello, one request, one
 /// response. If this needed a client library, the protocol would have the hidden complexity
 /// `scenarios/250-serve` exists to disprove.
-fn over_socket(socket: &Path, branch: Option<&str>) -> Result<SchemaDef> {
+fn over_socket(socket: &Path, registry: Option<&str>, branch: Option<&str>) -> Result<SchemaDef> {
     let refused = |what: &str, err: &dyn std::fmt::Display| {
         BorgError::Storage(format!("{}: {what}: {err}", socket.display()))
     };
@@ -177,6 +184,12 @@ fn over_socket(socket: &Path, branch: Option<&str>) -> Result<SchemaDef> {
         version: borg_protocol::client::VERSION,
         client_version: None,
         codec: "json".to_string(),
+        // From the store's lock record, so that a server hosting several registries is asked about
+        // *this* one. Absent where the record predates named registries, which the server reads as
+        // "the sole registry" — the same default a hand-written client takes (§17.6).
+        registry: registry.map(str::to_string),
+        // Nothing to present, and nothing checks it yet (§17.6).
+        credential: None,
     };
     borg_protocol::write_message(&mut writer, Codec::Json, &hello)
         .map_err(|err| refused("cannot greet", &err))?;

@@ -15,7 +15,7 @@
 //!   process-per-command CLI does, and it is the honest cost of a process that exits between
 //!   commands: `O(log)` per invocation.
 //! * **Maintained live.** A projection that has been fed by the process doing the writing is already
-//!   at head, so the same call reads nothing. This is what lets `borg serve` hold one registry for
+//!   at head, so the same call reads nothing. This is what lets a server hold one registry for
 //!   its lifetime instead of paying the replay per request (`examples/personal-crm/FRICTION.md` #9).
 //!
 //! Both lifecycles must reach the same state — that is the whole claim — and

@@ -21,7 +21,7 @@ test:
 
 # End-to-end scenarios, driven through the real binary.
 scenarios:
-    cargo build -p borg-cli
+    cargo build -p borg-cli -p borg-server
     bash scenarios/run-all.sh
 
 # Fan-out measurement. Not a correctness check; see SPEC.md §16.3.

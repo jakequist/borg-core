@@ -1,5 +1,5 @@
 /**
- * The client SDK, against a real `borg serve`.
+ * The client SDK, against a real `borg-server`.
  *
  * Not a stand-in engine. The worker tests in `worker.test.ts` fake the engine because what they
  * assert is *the conversation* — which cells crossed the wire, in what order — and a real engine
@@ -8,9 +8,13 @@
  * that is a property of the SDK at all; it is the engine's, reached through the SDK, and a fake
  * server would let every one of these pass while the real thing was broken.
  *
- * So: the real binary, a real store, a real socket. If the binary is not built, the suite skips
- * loudly — `check.sh` builds it in an earlier step, and a developer running vitest alone should be
+ * So: the real binaries, a real store, a real socket. If either is not built, the suite skips
+ * loudly — `check.sh` builds them in an earlier step, and a developer running vitest alone should be
  * told what to build rather than watch nine tests fail on ENOENT.
+ *
+ * The store is a **registry under a data directory**, because that is what a server hosts (SPEC.md
+ * §17.6). There is exactly one here, which is the case a client names no registry for — so nothing
+ * in the SDK below has to say which store it means.
  */
 
 import { afterAll, beforeAll, describe as suite, expect, test } from "vitest";
@@ -37,7 +41,11 @@ const BORG =
   process.env["BORG_BIN"] ??
   resolvePath(fileURLToPath(new URL("../../../target/debug/borg", import.meta.url)));
 
-const available = existsSync(BORG);
+const BORG_SERVER =
+  process.env["BORG_SERVER_BIN"] ??
+  resolvePath(fileURLToPath(new URL("../../../target/debug/borg-server", import.meta.url)));
+
+const available = existsSync(BORG) && existsSync(BORG_SERVER);
 if (!available) {
   console.warn(
     `⚠ skipping the client SDK suite: no borg binary at ${BORG}. ` +
@@ -104,7 +112,10 @@ beforeAll(async () => {
   if (!available) return;
   dir = mkdtempSync(join(tmpdir(), "borg-client-"));
   socket = join(dir, "borg.sock");
-  const store = join(dir, "borg.db");
+  // One registry under a data directory — what `borg-server` hosts. `main` is the only one, so the
+  // handshake below names none and gets it.
+  const data = join(dir, "data");
+  const store = join(data, "main", "borg.db");
   const borg = (...args: string[]): void => {
     execFileSync(BORG, ["--store", store, ...args], { stdio: "pipe" });
   };
@@ -126,7 +137,13 @@ beforeAll(async () => {
   );
   borg("def", "push", schema);
 
-  server = spawn(BORG, ["--store", store, "serve", "--socket", socket], { stdio: "pipe" });
+  // `--foreground`, because this test *is* the supervisor: it holds the child and kills it in
+  // `afterAll`, which is exactly what backgrounding would take away from it.
+  server = spawn(
+    BORG_SERVER,
+    ["start", "--foreground", "--data-dir", data, "--socket", socket],
+    { stdio: "pipe" },
+  );
   await untilListening(socket);
 }, 60_000);
 
@@ -142,7 +159,7 @@ async function context(clientVersion?: string): Promise<BorgContext> {
     : createBorgContext({ socket, clientVersion });
 }
 
-suite.skipIf(!available)("the client SDK, over borg serve", () => {
+suite.skipIf(!available)("the client SDK, over borg-server", () => {
   test("connects, handshakes, and can be asked about the store", async () => {
     const bc = await context();
     const branches = await bc.branches();
@@ -447,7 +464,7 @@ suite.skipIf(!available)("the client SDK, over borg serve", () => {
    * the server never acknowledges an accepted one — it has nothing to say — so a client cannot know
    * it was accepted except by asking something. Ask too fast and the write lands on a socket the
    * peer has already closed, which is an EPIPE that discards the very answer it was racing. That is
-   * a property of `borg serve`'s refusal path and is recorded in SDK-DRAFT §4.4 as a gap rather
+   * a property of the server's refusal path and is recorded in SDK-DRAFT §4.4 as a gap rather
    * than papered over here: the fix is a lingering close on the server, not a retry in the SDK.
    */
   test("a client version that is not a layer id is refused by name", async () => {

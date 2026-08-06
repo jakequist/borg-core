@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `borg serve`: the same client surface, over a socket instead of over argv. SDK-DRAFT.md §2.5, §2.6.
+# `borg-server`: the same client surface, over a socket instead of over argv. SPEC.md §17.5, §17.6.
 #
 # Two clients speak the protocol directly — `client.py` is a socket and `json`, no SDK — and the
 # claims are the ones an SDK will rest on:
@@ -10,13 +10,25 @@
 #     abandoned a transaction rather than destroyed one — and the idle reaper collects it (§12.3);
 #   * the §10.4 envelope that comes back over the socket is the envelope `borg get` prints, field
 #     for field, because it is the same read rendered twice;
-#   * one process serves a store, and everyone else is turned away by name.
+#   * one process serves a store, and everyone else is turned away by name;
+#   * **a schema can be pushed into a server that is running**, which is the sentence this scenario
+#     used to have to work around.
+#
+# The server is `borg-server` and hosts a *data directory of registries*; this one holds exactly
+# one, which is the case where a client names no registry at all and gets it (§17.6).
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../lib.sh"
 setup
 
+DATA="$WORK/data"
 SOCK="$WORK/borg.sock"
+server() { "$BORG_SERVER_BIN" --data-dir "$DATA" --socket "$SOCK" "$@"; }
 client() { python3 "$HERE/client.py" "$SOCK" "$@"; }
+
+# One registry, made before anything is serving — which is the other half of `create` existing:
+# a data directory has to be fillable before there is a server to fill it.
+server create main >/dev/null
+STORE="$DATA/main/borg.db"
 
 # One field of one JSON response, without needing `jq` to agree with us about numbers.
 jval() {
@@ -29,28 +41,24 @@ print("" if value is None else value)
 ' "$1" "$2"
 }
 
-# Start the server and wait until it actually answers. A socket file exists a moment before anything
-# is listening on it, and a scenario that races that is a scenario that fails one run in forty.
+# `borg-server start` backgrounds and **waits until the server answers** before it returns, which is
+# the whole reason a scenario no longer needs its own retry loop: a socket file exists a moment
+# before anything is listening on it, and every caller used to have to know that.
 start_serve() {
-    # The binary directly, not the `borg` helper function: a background *function* is a subshell, and
-    # `$!` would then name the subshell rather than the server — so the `kill` below would leave a
-    # live server holding the lock. Worth the two extra words.
-    "$BORG_BIN" --store "$WORK/borg.db" serve --socket "$SOCK" >"$WORK/serve.log" 2>&1 &
-    SERVE_PID=$!
-    for _ in $(seq 100); do
-        if client '{"branch_list":{}}' >/dev/null 2>&1; then return 0; fi
-        sleep 0.1
-    done
-    echo "server never came up:" >&2; cat "$WORK/serve.log" >&2; exit 1
+    if ! server start >"$WORK/start.out" 2>&1; then
+        echo "server never came up:" >&2
+        cat "$WORK/start.out" >&2
+        cat "$DATA/borg-server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
 }
 
-# A `kill` is a `SIGTERM`, which the server handles: it stops accepting, releases the advisory lock
-# and unlinks the socket. Nothing here waits for a file to disappear, because if it did not, the CLI
-# assertions after each stop would be asserting the stale-lock fallback instead.
+# `borg-server stop` sends SIGTERM and waits for the socket to go quiet, so nothing after this line
+# is racing a shutdown. If it did not, the CLI assertions after each stop would be asserting the
+# stale-lock fallback instead of a clean release.
 stop_serve() {
-    kill "$SERVE_PID" 2>/dev/null || true
-    wait "$SERVE_PID" 2>/dev/null || true
-    [ -e "$WORK/borg.serving.json" ] && fail "the server left its lock behind on a clean shutdown"
+    server stop >/dev/null
+    [ -e "$DATA/main/borg.serving.json" ] && fail "the server left its lock behind on a clean shutdown"
     return 0
 }
 
@@ -186,6 +194,41 @@ assert_contains "$(printf '%s' "$recovered" | head -1)" '"error"' \
     "and what comes back names what could not be read"
 assert_contains "$(printf '%s' "$recovered" | tail -1)" '"branches"' \
     "and the good message behind the bad ones is answered normally"
+
+# --- Pushing a schema into a server that is running ----------------------------------------------------
+
+# *Failing means the dev loop is back to "stop the server, push, start the server" — and, worse,
+# that a running server can be left executing code the log no longer describes.*
+#
+# `repo push` reads a **directory** off a filesystem, so a second process doing it while a store is
+# served would be the second writer the advisory lock exists to refuse — and it still is:
+assert_rejected "$SOCK" "a served store still refuses a repo push from another process" \
+    -- borg repo push "$HERE"/../030-shell-pipeline/repo
+
+# The answer is not to let the client write. It is for the **server** to run the push, against a
+# path on its own disk (§17.6). Local-only semantics, said out loud: this path means nothing to a
+# server on another machine, and the remote form is an uploaded artifact.
+cp -r "$HERE"/../030-shell-pipeline/repo "$WORK/repo"
+unchanged="$(client "{\"repo_push\":{\"path\":\"$WORK/repo\"}}")"
+assert_contains "$unchanged" "unchanged" \
+    "pushing a repo the branch already believes emits nothing — which is what makes this affordable"
+
+# Now the code changes and nothing else does: no field moves, no producer is added, and the only
+# thing that can notice is the implementation fingerprint (§9.2). `is_investible` was true at a
+# threshold of 7 and this company scores 8.
+sed -i 's/-ge 7/-ge 9/' "$WORK/repo/pipelines/is_investible.sh"
+pushed="$(client "{\"repo_push\":{\"path\":\"$WORK/repo\"}}")"
+assert_contains "$pushed" "implementation changed" \
+    "an edited pipeline body is a change, and the server says so"
+
+assert_eq "$(jval "$(client '{"get":{"cell":"Company#1.is_investible"}}')" cell.value)" "false" \
+    "…and the running server recomputed with the new code, without being restarted"
+
+# The other half, and the one a stale worker pool would break: the server's pool was built from the
+# producer table as it stood at boot, and the pool is keyed on the command's *path* — which did not
+# move. A server that kept its idle workers would have answered from the old program.
+assert_contains "$(client '{"explain":{"cell":"Company#1.is_investible"}}')" "headcount" \
+    "and the value still reports the inputs it was computed from"
 
 # --- The envelope over the socket is the envelope borg prints ------------------------------------------
 

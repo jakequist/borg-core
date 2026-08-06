@@ -6,16 +6,39 @@
 set -euo pipefail
 
 BORG_BIN="${BORG_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/borg}"
+# The server is a separate binary — a process that stays up and a process that exits after one
+# command are opposite lifecycles, not two modes of one thing (SPEC.md §17.6). Scenarios that need
+# one build it the same way they build the client.
+BORG_SERVER_BIN="${BORG_SERVER_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/borg-server}"
 # Scenarios capture their own directory before `setup` moves to a scratch store.
 
 setup() {
     WORK="$(mktemp -d)"
     trap 'rm -rf "$WORK"' EXIT
     cd "$WORK"
+    # Which store `borg` operates on. A variable rather than a constant because a scenario that
+    # drives a *server* wants a registry under a data directory instead — see 250 and 300.
+    STORE="$WORK/borg.db"
     borg init >/dev/null
 }
 
-borg() { "$BORG_BIN" --store "${WORK:-.}/borg.db" "$@"; }
+borg() { "$BORG_BIN" --store "${STORE:-${WORK:-.}/borg.db}" "$@"; }
+
+# Wait until something is answering on a unix socket.
+#
+# A socket file exists a moment before anything is listening on it, and a scenario that races that
+# is a scenario that fails one run in forty. `borg-server start` already waits before it returns;
+# this is for the `--foreground` case, where the caller is the supervisor.
+wait_for_socket() {
+    local socket="$1" attempt
+    for attempt in $(seq 200); do
+        if "$BORG_SERVER_BIN" --data-dir "${2:-$WORK/data}" --socket "$socket" status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
 
 fail() { echo "  ✗ $*" >&2; exit 1; }
 pass() { echo "  ✓ $*"; }

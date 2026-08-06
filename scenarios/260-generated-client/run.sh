@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generated types, compiled, and then run against a real `borg serve`. SDK-DRAFT.md §3, §4.4.
+# Generated types, compiled, and then run against a real `borg-server`. SDK-DRAFT.md §3, §4.4.
 #
 # 250 proved the client protocol needs no client library. This proves what a client library is
 # *for*: the same store, reached through a module `borg generate` emitted, where the schema is a
@@ -26,31 +26,29 @@ build_sdk
 source "$HERE/../lib.sh"
 setup
 
+DATA="$WORK/data"
 SOCK="$WORK/borg.sock"
 PROGRAM="$WORK/program"
+server() { "$BORG_SERVER_BIN" --data-dir "$DATA" --socket "$SOCK" "$@"; }
 
-# Start the server and wait until it actually answers — a socket file exists a moment before
-# anything is listening on it (see 250 for the full reasoning, including why `$!` needs the binary
-# rather than the `borg` helper function).
+# The store this scenario drives is a registry under a data directory, because that is what a server
+# hosts (§17.6). There is exactly one, so nothing below has to name it — the generated client's
+# handshake says no registry and gets it.
+server create main >/dev/null
+STORE="$DATA/main/borg.db"
+
+# `borg-server start` waits until the server answers before it returns, so a scenario no longer
+# needs its own retry loop against a socket file that exists a moment before anything is listening.
 start_serve() {
-    "$BORG_BIN" --store "$WORK/borg.db" serve --socket "$SOCK" >"$WORK/serve.log" 2>&1 &
-    SERVE_PID=$!
-    for _ in $(seq 100); do
-        if python3 -c '
-import socket, sys
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-try: s.connect(sys.argv[1])
-except OSError: sys.exit(1)
-' "$SOCK" 2>/dev/null; then return 0; fi
-        sleep 0.1
-    done
-    echo "server never came up:" >&2; cat "$WORK/serve.log" >&2; exit 1
+    if ! server start >"$WORK/start.out" 2>&1; then
+        echo "server never came up:" >&2
+        cat "$WORK/start.out" >&2
+        cat "$DATA/borg-server.log" >&2 2>/dev/null || true
+        exit 1
+    fi
 }
 
-stop_serve() {
-    kill "$SERVE_PID" 2>/dev/null || true
-    wait "$SERVE_PID" 2>/dev/null || true
-}
+stop_serve() { server stop >/dev/null; }
 
 # One `key=value` line out of the client program's output.
 out() { sed -n "s/^$2=//p" <<<"$1" | head -1; }

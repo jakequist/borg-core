@@ -6,7 +6,11 @@ workable, the client protocol has no hidden client-library complexity. There is 
 here, no transaction object, no retry policy. There is a handshake, and then one request per line
 with one response per line.
 
-    client.py SOCKET [--client-version L7] REQUEST...
+    client.py SOCKET [--registry NAME] [--client-version L7] REQUEST...
+
+`--registry` is the name of the registry on the server this connection is for (§17.6). A server
+hosting exactly one lets a client leave it out, which is what every other scenario does; a server
+hosting two does not, and says so.
 
 Every request is sent on **one connection**, in order, and every response is printed as one line of
 compact JSON. `%TX%` in a request is replaced by the handle from the last `tx` response, which is
@@ -32,8 +36,12 @@ def main(argv):
 
     path, argv = argv[0], argv[1:]
     client_version = None
-    if argv[:1] == ["--client-version"]:
-        client_version = argv[1]
+    registry = None
+    while argv[:1] in (["--client-version"], ["--registry"]):
+        if argv[0] == "--client-version":
+            client_version = argv[1]
+        else:
+            registry = argv[1]
         argv = argv[2:]
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -49,6 +57,10 @@ def main(argv):
         # The def-layer this client's code was generated from (SPEC.md §5.4). A client with no
         # generated code — this one — says nothing and is read as "the schema as it stands".
         reply["client_version"] = client_version
+    if registry is not None:
+        # Which registry on this server the connection is for (SPEC.md §17.6). Said once, in the
+        # handshake, and never again — no message repeats it.
+        reply["registry"] = registry
     send(stream, reply)
 
     tx = None
