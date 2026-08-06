@@ -35,7 +35,22 @@ use borg_storage_sqlite::SqliteStorage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// The allocator the `Company#1` shorthand names. SPEC.md §3.1.
+///
+/// Zero, and it belongs to **hand-authored ids**: `Company#1` means counter 1 under this allocator on
+/// the root branch, so a scenario, a fixture or a person at a terminal picks their own counters here
+/// and nothing else may.
 pub const ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(0);
+
+/// The allocator [`tx_create`] hands out ids under. SPEC.md §3.1, §17.5.
+///
+/// **Not `0`**, and that is the whole of why server-side allocation needs no coordination with the
+/// people typing `Contact#5` into a shell. A PID is `(branch, allocator, counter)` so that any
+/// number of allocating authorities can issue ids without agreeing on anything; two of them exist
+/// here — a human choosing counters by hand, and this — and giving them separate allocator ids makes
+/// their ids disjoint *by construction* rather than by a convention somebody has to remember. It is
+/// the same property a second node would rely on, arriving one node early.
+pub const SERVER_ALLOCATOR: borg_core::AllocatorId = borg_core::AllocatorId(1);
 
 /// What every operation needs to know, however it was asked.
 ///
@@ -215,6 +230,48 @@ pub async fn get(args: &Ops, cell: &str) -> Result<Read> {
         workers.shutdown().await;
     }
     read_of(&registry, cell, resolved?).await
+}
+
+/// Every object of one struct, by PID. SPEC.md §9.6, §17.5.
+///
+/// **The enumeration §9.6 spent v1 declining to expose.** The store always held it — a struct's
+/// existence buffer *is* the set of its instances (§4.2), and the scheduler has always scanned it to
+/// discover entities — and what changed is that an application which cannot ask *"which contacts are
+/// there"* cannot be written. The exclusion was about not shipping a query language by accident, and
+/// that reason survives: this is one buffer scan, not a query.
+///
+/// **Read-only, at head, and outside any transaction.** There is no `tx list`, and the omission is
+/// the point rather than a gap: a guard is a question the touch index can answer about *a cell*
+/// (§12.4), and "the set of Contacts" is not a cell. Guarding an enumeration means guarding the
+/// absence of every object that does not exist yet — the absence-guard problem (§12.1) generalised
+/// from one cell to a whole buffer — and the only honest implementation would conflict every
+/// creation with every enumeration. So a listing buys no protection at commit, exactly as a `borg
+/// get` outside a transaction does not, and SDK-DRAFT §5 carries the question rather than this
+/// carrying a half-answer.
+///
+/// **Ids only.** Reading a field of each is one round trip per object, which is the N+1 every ORM
+/// has; it is a finding waiting for a query layer and not an argument for widening the reply — see
+/// [`borg_protocol::client::Request::List`].
+///
+/// The struct must be declared **at this caller's ClientVersion**, so a name nobody declared is an
+/// error rather than an empty list: an empty list is what a typo would look like, and this is a
+/// question about a struct, which is the kind of question `def show` already refuses by name.
+pub async fn list(args: &Ops, struct_name: &str) -> Result<Vec<borg_core::Pid>> {
+    let registry = open(args).await?;
+    let branch = branch_of(&registry, args.branch.as_deref())?;
+    let path = registry.branches.read_path(branch, None)?;
+    let name: ObjectTypeName = struct_name.into();
+    let version = client_version(&registry, args, branch).await?;
+    if registry
+        .defs
+        .view_at(&path, version.0)
+        .await?
+        .object(&name)
+        .is_none()
+    {
+        return Err(BorgError::Storage(format!("no struct named `{name}`")));
+    }
+    registry.object_ids(branch, &name).await
 }
 
 /// Where a value came from. SPEC.md §11. `None` where nothing is stored.
@@ -608,6 +665,119 @@ pub async fn tx_set(args: &Ops, tx: &str, cell: &str, value: &str) -> Result<Lay
     let layer = session.commit().await?;
     save_transactions(args, &table)?;
     Ok(layer)
+}
+
+/// The PID counters this store has issued, beside the store.
+///
+/// **Why a sidecar and not the store.** A layer sequencer resumes from the log because the log
+/// already answers *"the highest layer"* in one read — `InProcessSequencer::resuming_after` is
+/// exactly that, and it is the pattern this wanted to copy. There is no equivalent one-read answer
+/// for a PID: a counter is `(branch, allocator)`-scoped and therefore spans every struct at once, so
+/// deriving it from the store means scanning *every* object buffer, and doing that per create turns
+/// creating `n` objects into `O(n²)`. That is the one thing a create must not be. So the counter is
+/// written down, with the pause flags and the transaction table, for the same reason they are
+/// (`crate::sidecar`): operational state that changes nothing about what is true.
+///
+/// **It is saved before the write it names, never after**, which decides which way a crash goes
+/// wrong. Persist first and a process that dies mid-create burns a counter — nothing notices, ids
+/// are not required to be dense. Persist afterwards and it would hand the same id out twice, which
+/// is the one outcome the whole `(branch, allocator, counter)` scheme exists to prevent.
+///
+/// What this does *not* survive is somebody deleting the file: ids would restart, and a fresh
+/// `Contact` could then land on the address of an old one. Every sidecar loses something —
+/// `producers.json` loses where code lives, `derivation.json` loses poisonings — but this is the
+/// only one that loses something a store cannot recreate by being told again, and it is recorded in
+/// `CLAUDE.md` as such rather than defended against with a scan nobody can afford.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Allocations {
+    /// The next counter [`SERVER_ALLOCATOR`] will issue. Monotonic and never reused.
+    pub next: u64,
+}
+
+impl Default for Allocations {
+    fn default() -> Self {
+        // From 1, so that the first id a store issues reads as the first one rather than as the
+        // zeroth — these appear in error messages and in scenarios.
+        Self { next: 1 }
+    }
+}
+
+impl Sidecar for Allocations {
+    const EXTENSION: &'static str = "allocations.json";
+}
+
+pub fn load_allocations(args: &Ops) -> Allocations {
+    sidecar::load(&args.store)
+}
+
+pub fn save_allocations(args: &Ops, table: &Allocations) -> Result<()> {
+    sidecar::save(&args.store, table)
+}
+
+/// Take the next PID for an object of any struct on this store. See [`Allocations`].
+///
+/// The **allocation branch** — the root — and not the branch being written, for the reason
+/// [`allocation_branch`] gives: a PID records where an object was allocated, and a transaction
+/// branch is a mechanism rather than a place. Recording one would put an ephemeral, reaped-adjacent
+/// branch id inside a permanent identity, and buy nothing: uniqueness here comes from the allocator
+/// and the counter.
+fn allocate(args: &Ops, branch: BranchId) -> Result<borg_core::Pid> {
+    let mut table = load_allocations(args);
+    let counter = table.next;
+    table.next += 1;
+    save_allocations(args, &table)?;
+    Ok(borg_core::Pid::Allocated {
+        kind: borg_core::PidKind::Object,
+        branch,
+        allocator: SERVER_ALLOCATOR,
+        counter,
+    })
+}
+
+/// Allocate an object and write its existence cell, in one step. SPEC.md §3.1, §8, §17.5.
+///
+/// One step because the two halves are useless apart. An id nothing wrote is not an object — nothing
+/// enumerates it, no producer maps over it, and a client holding it cannot tell it from one it
+/// invented — and an existence cell needs an id to be written at. Splitting them would also make the
+/// allocation itself an event a client could lose by disconnecting between the two calls.
+///
+/// **Validated like any other write**, because it *is* one: it goes through the same
+/// `WriteSession`, so a struct nobody declared is refused by name (§8.0), and the write is isolated
+/// on the transaction's branch until it merges. The id is taken before the write is checked, so a
+/// refused creation burns a counter — the same harmless outcome a crash between the two has, and the
+/// alternative is a second copy of the declaration check outside the one door that owns it.
+///
+/// **It reads nothing.** `WriteSession::imply_existence` probes an existence cell before implying
+/// one, and that probe is what stops two transactions concluding an object is absent and both
+/// creating it — but an *explicit* existence write skips the probe, because there is nothing to
+/// conclude: the id is fresh, so nobody else can hold it. The consequence is the one worth asserting
+/// (see the tests): two transactions each creating an object never conflict, since they wrote
+/// different cells and neither observed the other's.
+pub async fn tx_create(args: &Ops, tx: &str, struct_name: &str) -> Result<borg_core::Pid> {
+    let mut table = load_transactions(args);
+    let index = transaction_index(&table, tx)?;
+    let registry = open(args).await?;
+    let branch = table.open[index].state.branch;
+
+    let pid = allocate(args, allocation_branch(&registry)?)?;
+    let cell = CellRef::existence(struct_name.into(), pid);
+
+    let version = client_version(&registry, args, branch).await?;
+    let mut session = registry
+        .begin_write(branch, version, Writer::Client)
+        .await?;
+    if let Err(rejection) = session.set(&cell, Value::Bool(true)).await {
+        session.abort().await?;
+        return Err(rejection);
+    }
+    let open = &mut table.open[index];
+    absorb(&mut open.state, &session);
+    open.touched = now();
+
+    session.commit().await?;
+    save_transactions(args, &table)?;
+    Ok(pid)
 }
 
 /// Merge, guarded by everything the transaction read. SPEC.md §12, §13.
@@ -1054,5 +1224,258 @@ pub fn freshness(mode: &str) -> Option<FreshnessRequirement> {
         "validated" => Some(FreshnessRequirement::Validated),
         "current" => Some(FreshnessRequirement::Current),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use borg_core::Pid;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "borg-ops-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A store with one struct declared, driven through the same ops the CLI calls.
+    async fn store_with_contacts(dir: &Path) -> Ops {
+        let args = Ops {
+            store: dir.join("borg.db"),
+            branch: None,
+            version: None,
+            freshness: FreshnessRequirement::Validated,
+            settled: false,
+        };
+        let registry = open(&args).await.unwrap();
+        registry
+            .branches
+            .create_root(Some("main".into()))
+            .await
+            .unwrap();
+        let branch = branch_of(&registry, None).unwrap();
+        registry
+            .defs
+            .push(
+                branch,
+                vec![borg_core::DefEvent::DeclareField {
+                    struct_name: "Contact".into(),
+                    field: "name".into(),
+                    ty: borg_core::ValueType::String,
+                    repo: borg_core::RepoId(1),
+                    ownership: borg_core::Ownership::Source,
+                }],
+            )
+            .await
+            .unwrap();
+        args
+    }
+
+    /// One transaction that creates an object and commits, answering the id it was given.
+    async fn create_one(args: &Ops) -> Pid {
+        let tx = tx_begin(args).await.unwrap();
+        let pid = tx_create(args, &tx, "Contact").await.unwrap();
+        tx_commit(args, &tx).await.unwrap();
+        pid
+    }
+
+    fn ids(pids: &[Pid]) -> Vec<String> {
+        pids.iter().map(ToString::to_string).collect()
+    }
+
+    /// The whole of primitive one: an object that was created is one of the objects.
+    #[tokio::test]
+    async fn a_created_object_is_listed_and_an_uncommitted_one_is_not() {
+        let dir = temp_dir("list");
+        let args = store_with_contacts(&dir).await;
+        assert!(
+            list(&args, "Contact").await.unwrap().is_empty(),
+            "a struct nobody has instantiated has no objects"
+        );
+
+        let pid = create_one(&args).await;
+        assert_eq!(ids(&list(&args, "Contact").await.unwrap()), ids(&[pid]));
+
+        // Isolation, seen from the enumeration: a create that has not merged is on a branch nobody
+        // else can read, so listing the parent cannot see it (§7.2, §12).
+        let open = tx_begin(&args).await.unwrap();
+        tx_create(&args, &open, "Contact").await.unwrap();
+        assert_eq!(
+            ids(&list(&args, "Contact").await.unwrap()),
+            ids(&[pid]),
+            "an uncommitted creation is not yet one of the objects"
+        );
+        tx_abort(&args, &open).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A deleted object is not one of the objects (§8.1). The scan answers the tombstone like any
+    /// other record; deciding what it means is the enumeration's job.
+    #[tokio::test]
+    async fn a_tombstoned_object_is_skipped() {
+        let dir = temp_dir("tombstone");
+        let args = store_with_contacts(&dir).await;
+        let first = create_one(&args).await;
+        let second = create_one(&args).await;
+
+        let tx = tx_begin(&args).await.unwrap();
+        tx_set(&args, &tx, &format!("Contact:{first}"), "~")
+            .await
+            .unwrap();
+        tx_commit(&args, &tx).await.unwrap();
+
+        assert_eq!(
+            ids(&list(&args, "Contact").await.unwrap()),
+            ids(&[second]),
+            "the deleted contact is gone from the listing, and the other one is not"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Writing a property implies existence (§8), so an object created the old way — by writing one
+    /// of its fields at a hand-written id — is listed beside the ones the server allocated. This is
+    /// what makes `list` an enumeration of the *store* rather than of what `tx create` did.
+    #[tokio::test]
+    async fn a_hand_authored_object_is_listed_beside_a_server_allocated_one() {
+        let dir = temp_dir("mixed");
+        let args = store_with_contacts(&dir).await;
+        let allocated = create_one(&args).await;
+
+        let tx = tx_begin(&args).await.unwrap();
+        tx_set(&args, &tx, "Contact#5.name", "Ada").await.unwrap();
+        tx_commit(&args, &tx).await.unwrap();
+
+        let listed = list(&args, "Contact").await.unwrap();
+        assert_eq!(listed.len(), 2, "both objects, however they were made");
+        assert!(ids(&listed).contains(&allocated.to_string()));
+        // `Contact#5` is counter 5 under allocator 0 on the root branch — a different allocator
+        // from the one the server issues under, which is the point.
+        let hand = listed
+            .iter()
+            .find(|pid| **pid != allocated)
+            .expect("the hand-authored contact");
+        let (Pid::Allocated { allocator, .. }, Pid::Allocated { counter, .. }) = (hand, hand)
+        else {
+            panic!("an object's pid is allocated, not content-addressed")
+        };
+        assert_eq!(*allocator, ALLOCATOR);
+        assert_eq!(*counter, 5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **Allocator separation, stated as the collision it prevents.** The server's ids are issued
+    /// under [`SERVER_ALLOCATOR`], so counter 1 issued here and the `Contact#1` somebody types are
+    /// two different objects — which is what makes `tx create` safe to run against a store full of
+    /// hand-written fixtures without either side knowing about the other (§3.1).
+    #[tokio::test]
+    async fn server_allocated_ids_cannot_collide_with_hand_written_ones() {
+        let dir = temp_dir("allocator");
+        let args = store_with_contacts(&dir).await;
+        let pid = create_one(&args).await;
+
+        let Pid::Allocated {
+            allocator, counter, ..
+        } = pid
+        else {
+            panic!("an object's pid is allocated")
+        };
+        assert_eq!(allocator, SERVER_ALLOCATOR);
+        assert_ne!(SERVER_ALLOCATOR, ALLOCATOR, "…and never the shorthand's");
+        assert_eq!(counter, 1, "the first id a store issues");
+
+        // The same counter under the shorthand's allocator is a different object, and the store
+        // holds both at once.
+        let tx = tx_begin(&args).await.unwrap();
+        tx_set(&args, &tx, &format!("Contact#{counter}.name"), "Ada")
+            .await
+            .unwrap();
+        tx_commit(&args, &tx).await.unwrap();
+        assert_eq!(
+            list(&args, "Contact").await.unwrap().len(),
+            2,
+            "same counter, different allocator, two objects"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **The counter lives in the store's sidecar and nowhere else**, which is what makes it survive
+    /// the process that issued it — the CLI is process-per-command, so anything held in memory is
+    /// gone by the next `borg tx create`. Seeded here rather than restarted, because reading it from
+    /// disk and writing it back *is* the whole of what a restart exercises; `scenarios/280` runs the
+    /// real binary across real process boundaries and asserts the same thing end to end.
+    #[tokio::test]
+    async fn the_counter_is_read_from_the_store_and_written_back() {
+        let dir = temp_dir("counter");
+        let args = store_with_contacts(&dir).await;
+        save_allocations(&args, &Allocations { next: 42 }).unwrap();
+
+        let pid = create_one(&args).await;
+        let Pid::Allocated { counter, .. } = pid else {
+            panic!("an object's pid is allocated")
+        };
+        assert_eq!(
+            counter, 42,
+            "a new process resumes where the last one left off"
+        );
+        assert_eq!(
+            load_allocations(&args).next,
+            43,
+            "and moves it on before the write it names, so a crash burns an id rather than reusing one"
+        );
+
+        let next = create_one(&args).await;
+        assert_ne!(pid, next, "no id is ever issued twice");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **Two transactions creating objects never conflict.** Neither read anything, and the cells
+    /// they wrote are distinct by construction — so there is no guard to trip and nothing to
+    /// serialise. This is the property the allocator design buys, asserted rather than assumed.
+    #[tokio::test]
+    async fn two_transactions_creating_objects_both_commit_with_distinct_ids() {
+        let dir = temp_dir("concurrent");
+        let args = store_with_contacts(&dir).await;
+
+        let a = tx_begin(&args).await.unwrap();
+        let b = tx_begin(&args).await.unwrap();
+        let first = tx_create(&args, &a, "Contact").await.unwrap();
+        let second = tx_create(&args, &b, "Contact").await.unwrap();
+        assert_ne!(first, second);
+
+        tx_commit(&args, &a).await.unwrap();
+        // The second commit is the one that would fail if creation guarded anything: it forked
+        // before the first landed, and the first has since written to the same buffer.
+        tx_commit(&args, &b).await.unwrap();
+
+        assert_eq!(list(&args, "Contact").await.unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Creation is a write, so it is validated like one (§8.0) — and enumeration answers about a
+    /// struct, so a name nobody declared is refused rather than answered with an empty list, which
+    /// is what a typo would otherwise look like.
+    #[tokio::test]
+    async fn an_undeclared_struct_is_refused_by_name_on_both_sides() {
+        let dir = temp_dir("undeclared");
+        let args = store_with_contacts(&dir).await;
+
+        let listed = list(&args, "Wombat").await.unwrap_err().to_string();
+        assert!(listed.contains("Wombat"), "{listed}");
+
+        let tx = tx_begin(&args).await.unwrap();
+        let created = tx_create(&args, &tx, "Wombat")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(created.contains("Wombat"), "{created}");
+        // The refused creation left nothing behind, so the transaction is still usable.
+        tx_create(&args, &tx, "Contact").await.unwrap();
+        tx_commit(&args, &tx).await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -63,7 +63,7 @@ export interface Company {
 }
 
 /** The runtime half of {@link Company}: what `tx.object(Company, id)` converts values with. */
-export const Company: StructDescriptor<Company> = defineStruct("Company", {
+export const Company: StructDescriptor<Company, "Company"> = defineStruct("Company", {
   employees: { type: refText("Employee[]"), derived: false, version: "L4" },
   founded: { type: bigint(), derived: false, version: "L4" },
   headcount: { type: int(), derived: false, version: "L4" },
@@ -82,6 +82,6 @@ export interface Employee {
 }
 
 /** The runtime half of {@link Employee}: what `tx.object(Employee, id)` converts values with. */
-export const Employee: StructDescriptor<Employee> = defineStruct("Employee", {
+export const Employee: StructDescriptor<Employee, "Employee"> = defineStruct("Employee", {
   name: { type: string(), derived: false, version: "L4" },
 });

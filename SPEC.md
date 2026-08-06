@@ -85,6 +85,13 @@ collision-free by construction — which makes merge safe without coordination.
 > hottest path in the system. This is a persisted format, so it is fixed now rather than retrofitted
 > (§17.2).
 
+There are two allocating authorities before there are two nodes, and they are the first thing the
+component buys. Allocator `0` belongs to **ids written by hand**: `Company#1` is the shorthand for
+counter 1 there (§3.4), and a scenario, a fixture or a person at a terminal chooses counters in it.
+A store allocating ids on a client's behalf (`tx_create`, §17.5) issues under an allocator of its
+own, so the two id spaces are disjoint by construction rather than by a convention somebody has to
+remember — nothing has to ask what already exists before creating something.
+
 **Content-addressed PIDs** are branch-independent and eternal. The string `"hello"` has the same PID
 on every branch, forever. Consequences: string writes can never conflict across branches, and equal
 strings are stored exactly once registry-wide. Interning storage therefore has no branch column, no
@@ -1055,8 +1062,24 @@ Keeping this above the provider line matters: were tracking to live inside the b
 cell, stream a layer, scan a buffer — which is what keeps both a plain KV store and Postgres viable
 behind one seam.
 
-The engine internally enumerates a producer's source buffer in order to discover new entities. This
-is engine-internal; enumeration is **not** exposed as a user-facing query in v1.
+The engine internally enumerates a producer's source buffer in order to discover new entities.
+
+> This **was excluded** from the client surface: *"enumeration is not exposed as a user-facing query
+> in v1."* The reason was that a query surface is not a field on a message — it is filters, ordering,
+> paging and joins, and a system that grows one by accident grows it in the shape of whatever asked
+> first. The exclusion is reversed by an application that could not otherwise be written: an app
+> cannot ask *"which contacts are there"*, and no arrangement of `get` answers it. So §17.5 has
+> `list`, and the reason for the original exclusion is what bounds it — **ids of one struct, at head,
+> unfiltered, unpaged, and outside any transaction**. It is this scan with tombstoned existence cells
+> skipped, and nothing else. What is still out is the query layer; what came in is the one read the
+> store already performed.
+
+Enumeration is not, and cannot be, a **guardable** read. A guard is a question the cell-touch index
+answers about a cell (§12.4), and *"the set of Contacts"* is not a cell; the honest guard for a
+listing would be *"no object of this struct was created or deleted since the fork"*, which is the
+absence-guard problem (§12.1) widened from one cell to a whole buffer and would make every creation
+conflict with every enumeration. So a listing is a read outside any transaction, buying exactly what
+a `get` outside one buys: nothing at commit. There is deliberately no `tx_list`.
 
 Enumeration is what a **producer newer than its data** needs, and it is the one thing the layer
 changeset cannot supply: the entities it owes were written before it existed, or on a branch it was
@@ -2072,7 +2095,7 @@ Deliberately minimal, so that a plain KV store and Postgres remain equally viabl
 // Reads. A ReadPath, never a branch — see below.
 get_cell(path, cell, version) -> Landed?          // Landed = the event, plus where it landed here
 cell_versions(path, cell) -> [DefVersion]         // which versions this cell is materialized at
-scan_buffer(path, buffer) -> Iterator<Event>      // engine-internal enumeration only
+scan_buffer(path, buffer) -> Iterator<Event>      // entity discovery (§9.6), and `list` (§17.5)
 
 // Writing into an open layer.
 author_event(cell, EventDraft) -> EventId         // streaming; never buffered whole
@@ -2336,10 +2359,29 @@ over a socket instead of over argv**, which is what an SDK speaks and what `borg
 
 It reuses §17.4's framing whole — same codecs, same per-codec framing, same **single-key object**
 rule — because the two protocols differ in who is asking and not in how a message is carried. The
-operations are the ones the CLI already has: `tx_begin`, `tx_get`, `tx_set`, `tx_commit`, `tx_abort`,
-`get`, `explain`, `branch_list`, `branch_head`, `def_show`. That is a constraint rather than a
-coincidence: the CLI is the testbed for what a client is like to use, so a protocol needing an
-operation the CLI lacks would be evidence about the CLI.
+operations are the ones the CLI already has: `tx_begin`, `tx_get`, `tx_set`, `tx_create`,
+`tx_commit`, `tx_abort`, `get`, `list`, `explain`, `branch_list`, `branch_head`, `def_show`. That is
+a constraint rather than a coincidence: the CLI is the testbed for what a client is like to use, so a
+protocol needing an operation the CLI lacks would be evidence about the CLI.
+
+Two operations arrived with the first real application rather than with the CLI, and both are on the
+CLI too, because the rule above holds in that direction as well: an operation a client needs is one
+the CLI should have.
+
+**`list` names every object of one struct, as ids.** It is the enumeration §9.6 excluded, bounded by
+the reason for the exclusion — one struct, at head, unfiltered, unpaged, ids only, and outside any
+transaction, because an enumeration is not a guardable read (§9.6). Ids only is a real cost: reading
+a field of each object is a read per object. That is the N+1 an ORM has, and it is left visible
+rather than hidden behind a reply that would have to grow a query language to keep being useful.
+
+**`tx_create` allocates an object and writes its existence cell, in the transaction, in one step.**
+Before it, every write named an object whose id the client already had, so an application had to
+invent ids and two of them would eventually invent the same one. The server allocates under an
+`AllocatorId` of its own (§3.1) — *not* the one the `Company#1` shorthand names — so ids an
+application creates and ids a person types can never collide, whichever came first. The two halves
+are one message because an id nothing wrote is not an object, and because splitting them would make
+an allocation something a client could lose by disconnecting in between. Creation reads nothing and
+writes one cell, so two transactions creating objects can never conflict.
 
 One message is not a lifted subcommand, and it is worth saying why. **`def_view` returns a branch's
 whole def view and the def-version it was read at**, which is what codegen reads (§15). Neither half
@@ -2398,6 +2440,8 @@ destination is the CLI connecting to the socket rather than being turned away by
 - Watermarks, validate/recompute, provenance envelopes, `explain()`
 - Frontier tracking, `freshness` read modes, settled-frontier reads
 - Transactions as the only write path; object transactions with automatic, source-only guards
+- Server-side object allocation, under an allocator of its own; enumeration of one struct's objects
+  as ids (§9.6, §17.5) — the query layer around it is still out
 - Rounds as transactions: settle a range, fork, apply partially, merge one layer per producer
 - Cell-touch index over source layers
 - Merge with guard-based conflict detection, naming events rather than copying them
@@ -2417,6 +2461,9 @@ destination is the CLI connecting to the socket rather than being turned away by
   Rust and Go remain out.
 - ~~Network / server layer — v1 is a library exercised by Rust tests~~ — §17.5. A **local** unix
   socket, with one process serving a store; actual distribution is still out.
+- A query layer. `list` (§17.5) answers ids of one struct at head and nothing else: no filter, no
+  ordering, no paging, no projection, no join, and no way to guard one — see §9.6 for the boundary
+  and why it is where it is.
 - Actual distribution — only the seams (§17.2)
 - `O(1)` merge — a parent layer referencing a child's event set rather than enumerating it (§13)
 - `down`-migration validation

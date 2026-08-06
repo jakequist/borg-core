@@ -40,6 +40,10 @@ export type Request =
       };
     }
   | { explain: { branch?: string | undefined; cell: string } }
+  /** Every object of one struct, as ids. Read-only, at head, outside any transaction (§9.6). */
+  | { list: { branch?: string | undefined; struct: string } }
+  /** Allocate an object and write its existence cell, in the transaction, in one step (§3.1, §8). */
+  | { tx_create: { tx: string; struct: string } }
   | { branch_list: Record<string, never> }
   | { branch_head: { branch?: string | undefined } }
   | { def_show: { branch?: string | undefined; struct: string } }
@@ -52,6 +56,9 @@ export type Response =
   | { committed: { landed: string } }
   | { conflict: { cell: string | null; reason: string; message: string } }
   | { branches: BranchInfo[] }
+  /** Canonical PID text, sorted. Ids and nothing else — see the client protocol's `List`. */
+  | { ids: string[] }
+  | { created: { id: string } }
   | { head: { branch: string; layer: string } }
   | { def: WireStructDef }
   | { defs: WireSchemaDef }

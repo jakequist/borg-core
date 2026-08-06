@@ -87,8 +87,10 @@ borg — an event-sourced data backend
   borg delete <cell>                   tombstone a cell
   borg get <cell> [--value]            read a cell, with provenance
   borg explain <cell>                  show where a value came from
+  borg list <Struct>                   every object of a struct, one pid per line
 
   borg tx begin                        fork the branch; prints a transaction handle
+  borg tx create <Struct> [--tx <id>]  allocate an object and create it; prints its pid
   borg tx get <cell> [--tx <id>]       read through a transaction, recording the read
   borg tx set <cell> <value> [--tx]    write to a transaction
   borg tx delete <cell> [--tx <id>]    tombstone through a transaction
@@ -123,6 +125,13 @@ borg — an event-sourced data backend
 Cells are written Struct:pid.field, Struct:pid, Element[]:pid or Element[]:pid[n], where a pid
 looks like o-1234abcd and names the whole identity. Struct#100 is accepted on input as a
 shorthand for counter 100 on the root branch; what borg prints is always the canonical form.
+
+`borg tx create` allocates a pid rather than taking one, under an allocator of its own — so ids it
+issues and ids you write by hand as Struct#100 can never collide, whoever creates what first. `borg
+list` is the other half: it enumerates a struct's objects and prints their pids, skipping the ones
+that were deleted. It is a read at head and it is not part of a transaction: what a listing found
+buys no protection at commit, because `the set of Contacts` is not a cell a guard can be asked
+about. It answers ids and nothing else — reading a field of each is a read of each.
 
 A value is parsed against the type its field is declared to hold, so a String field takes `true`,
 `42` and `@jake` as those characters and an Int field refuses `acme`. Strings, binary and bigints
@@ -324,7 +333,9 @@ async fn run(args: Args) -> Result<()> {
         ("set", [cell, value]) => set(&args, cell, value).await,
         ("delete", [cell]) => set(&args, cell, "~").await,
         ("get", [cell]) => get(&args, cell).await,
+        ("list", [name]) => list(&args, name).await,
         ("tx", ["begin"]) => tx_begin(&args).await,
+        ("tx", ["create", name]) => tx_create(&args, name).await,
         ("tx", ["get", cell]) => tx_get(&args, cell).await,
         ("tx", ["set", cell, value]) => tx_set(&args, cell, value).await,
         ("tx", ["delete", cell]) => tx_set(&args, cell, "~").await,
@@ -510,6 +521,19 @@ fn report(args: &Args, read: &ops::Read) -> Result<()> {
     Ok(())
 }
 
+/// Every object of a struct, one pid per line. SPEC.md §9.6, §17.5.
+///
+/// One pid per line and nothing else, because that is what a shell can use: `borg list Contact |
+/// while read id; do borg get "Contact:$id.name" --value; done` is the N+1 made visible, and making
+/// it visible is better than hiding it behind a column this command would then have to grow options
+/// for.
+async fn list(args: &Args, name: &str) -> Result<()> {
+    for pid in ops::list(&args.ops, name).await? {
+        outln!("{pid}");
+    }
+    Ok(())
+}
+
 async fn explain(args: &Args, cell: &str) -> Result<()> {
     let (cell, lineage) = ops::explain(&args.ops, cell).await?;
     let Some(lineage) = lineage else {
@@ -660,6 +684,18 @@ fn tx_target(args: &Args) -> Result<String> {
 
 async fn tx_begin(args: &Args) -> Result<()> {
     outln!("{}", ops::tx_begin(&args.ops).await?);
+    Ok(())
+}
+
+/// Allocate an object and create it, in the current transaction. Prints its pid.
+///
+/// The pid and nothing else, so that `id=$(borg tx create Contact)` works and the next line can say
+/// `borg tx set "Contact:$id.name" Ada`.
+async fn tx_create(args: &Args, name: &str) -> Result<()> {
+    outln!(
+        "{}",
+        ops::tx_create(&args.ops, &tx_target(args)?, name).await?
+    );
     Ok(())
 }
 

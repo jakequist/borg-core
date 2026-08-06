@@ -364,9 +364,14 @@ fn emit_struct(object: &StructDef) -> String {
     }
     out.push_str("}\n\n");
 
+    // The name appears in the *type* as well as in the value, and it is not redundant: it is what
+    // brands the ids `tx.create` and `branch.list` answer with, so a listed `Company` can be stored
+    // in a `Ref<"Company">` field without a cast. `StructDescriptor`'s second parameter defaults to
+    // `string`, so a hand-written descriptor that omits it still compiles and simply gets less.
     out.push_str(&format!(
         "/** The runtime half of {{@link {name}}}: what `tx.object({name}, id)` converts values with. */\n\
-         export const {name}: StructDescriptor<{name}> = defineStruct(\"{name}\", {{\n"
+         export const {name}: StructDescriptor<{name}, {n}> = defineStruct(\"{name}\", {{\n",
+        n = quoted(name)
     ));
     for field in &object.fields {
         out.push_str(&format!(
@@ -539,6 +544,19 @@ mod tests {
             "a list is a reference to the list"
         );
         assert!(source.contains(r#"refText("Employee")"#), "{source}");
+    }
+
+    /// A descriptor states its own name **in its type**, which is what lets the ids `list` and
+    /// `create` answer with be branded with the struct they belong to rather than being bare
+    /// strings (SDK-DRAFT §4.5). Without it a listed `Employee` could not be stored in an
+    /// `Employee` reference field without a cast.
+    #[test]
+    fn a_descriptor_carries_its_struct_name_as_a_literal_type() {
+        let source = module(&fixture());
+        assert!(
+            source.contains(r#"export const Employee: StructDescriptor<Employee, "Employee"> ="#),
+            "{source}"
+        );
     }
 
     /// Names are verbatim, and one JavaScript cannot spell bare is quoted rather than mangled.

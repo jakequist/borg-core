@@ -482,6 +482,24 @@ async fn answer(base: &Ops, request: Request) -> Response {
             Err(err) => failed(err),
         },
 
+        // Enumeration and creation, the two things a client could not say before (§9.6, §17.5).
+        // Both are one `ops::` call and a rendering, like every other arm — which is the claim the
+        // file makes and the reason these two needed no server-side machinery of their own.
+        Request::List {
+            branch,
+            struct_name,
+        } => ops::list(&base.on(branch), &struct_name)
+            .await
+            .map(|ids| Response::Ids(ids.iter().map(ToString::to_string).collect()))
+            .unwrap_or_else(failed),
+
+        Request::TxCreate { tx, struct_name } => ops::tx_create(base, &tx, &struct_name)
+            .await
+            .map(|pid| Response::Created {
+                id: pid.to_string(),
+            })
+            .unwrap_or_else(failed),
+
         Request::TxAbort { tx } => ops::tx_abort(base, &tx)
             .map(|()| Response::Ok {})
             .unwrap_or_else(failed),

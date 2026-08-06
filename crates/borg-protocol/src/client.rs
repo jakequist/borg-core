@@ -151,6 +151,56 @@ pub enum Request {
         #[serde(rename = "struct")]
         struct_name: String,
     },
+    /// **Every object of one struct, as ids.** SPEC.md §9.6, SDK-DRAFT §4.5.
+    ///
+    /// The enumeration §9.6 spent v1 refusing to expose, exposed — because an application that
+    /// cannot ask *"which contacts are there"* cannot be written at all, and the answer was already
+    /// in the store: this is the `scan_buffer` over a struct's existence buffer the scheduler has
+    /// always used to discover entities. Tombstoned existence cells are skipped, because a deleted
+    /// object is not one of the objects (SPEC.md §8.1).
+    ///
+    /// **Read-only, at head, and outside any transaction — there is deliberately no `tx_list`.**
+    /// A read that a commit could guard has to name a cell the touch index can be asked about
+    /// (§12.4), and *"the set of Contacts"* is not a cell: it is the absence-guard problem
+    /// generalised from one cell to a whole buffer. A guard on it would have to mean "no object of
+    /// this struct was created or deleted since the fork", which is a coarser thing than anything
+    /// else in §12 and would make every creation conflict with every enumeration. Naming that
+    /// honestly and leaving it out is the v1 answer; it is recorded as an open question in
+    /// SDK-DRAFT §5 rather than half-built here.
+    ///
+    /// **Ids only, and deliberately.** A client that wants each contact's name reads each contact's
+    /// name — one round trip per object, which is the N+1 every ORM has. That is a finding waiting
+    /// for a query layer rather than an argument for widening this reply: adding fields here would
+    /// answer one shape of question (`list` + one field) and leave every other shape — filters,
+    /// ordering, joins, aggregates — exactly where it was, while making the first thing anybody
+    /// builds on top of §17.5 a thing that has to be un-built.
+    List {
+        #[serde(default)]
+        branch: Option<String>,
+        /// Spelled `struct` on the wire, as in [`Request::DefShow`].
+        #[serde(rename = "struct")]
+        struct_name: String,
+    },
+    /// Allocate an object and write its existence cell, in the transaction, in one step.
+    ///
+    /// The other half of what an application needs and could not say: [`Request::TxSet`] can only
+    /// write cells of an object whose id the client already had. The id comes back as canonical PID
+    /// text, which is what [`Request::TxSet`]'s `cell` and a reference value are both built from.
+    ///
+    /// **The server allocates, and it allocates under an `AllocatorId` of its own** (SPEC.md §3.1).
+    /// A PID is `(branch, allocator, counter)` precisely so that two allocating authorities never
+    /// have to coordinate; allocator `0` is the one the hand-authored `Company#1` shorthand names,
+    /// so server-created objects take another, and an application's objects can never collide with a
+    /// scenario's or a fixture's by construction.
+    ///
+    /// It participates in guards like any other write: the existence cell is in the transaction's
+    /// write-set, and nothing is read — so two transactions each creating an object never conflict,
+    /// because they wrote different cells and neither observed the other's.
+    TxCreate {
+        tx: String,
+        #[serde(rename = "struct")]
+        struct_name: String,
+    },
     /// **The whole def view of a branch — what codegen reads** (SPEC.md §15, SDK-DRAFT §4.4).
     ///
     /// The one message added after `borg serve` shipped, and it was added rather than composed
@@ -199,6 +249,21 @@ pub enum Response {
         message: String,
     },
     Branches(Vec<BranchInfo>),
+    /// The answer to [`Request::List`]: canonical PID text, one per object, sorted.
+    ///
+    /// Sorted so that the same store answers the same order twice — a list whose order moved
+    /// between two identical requests would make every diff of it noise. The order is
+    /// `(branch, allocator, counter)`, which is allocation order within one allocator and nothing a
+    /// caller may read meaning into across allocators; there is no `ORDER BY` here, and no cursor
+    /// either. See [`Request::List`].
+    Ids(Vec<String>),
+    /// The object [`Request::TxCreate`] allocated: its PID, as text.
+    ///
+    /// The id and not the cell, because the id is what everything else is built from — `Contact:` +
+    /// id is the existence cell, `+ ".name"` a property cell, `@` + id a reference value.
+    Created {
+        id: String,
+    },
     Head {
         branch: String,
         layer: String,
@@ -365,6 +430,14 @@ mod tests {
             },
             Request::BranchList {},
             Request::BranchHead { branch: None },
+            Request::List {
+                branch: Some("main".into()),
+                struct_name: "Contact".into(),
+            },
+            Request::TxCreate {
+                tx: "tx-1".into(),
+                struct_name: "Contact".into(),
+            },
             Request::DefShow {
                 branch: None,
                 struct_name: "Company".into(),
@@ -404,6 +477,10 @@ mod tests {
                 name: Some("main".into()),
                 forked_at: None,
             }]),
+            Response::Ids(vec!["o-1234abcd".into(), "o-1234abce".into()]),
+            Response::Created {
+                id: "o-1234abcf".into(),
+            },
             Response::Head {
                 branch: "b1".into(),
                 layer: "L500".into(),
@@ -520,6 +597,44 @@ mod tests {
         assert_eq!(
             one(&Request::DefView { branch: None }),
             r#"{"def_view":{"branch":null}}"#
+        );
+        // The two enumeration-and-creation messages, spelled `struct` for the same reason
+        // `def_show` is.
+        assert_eq!(
+            one(&Request::List {
+                branch: None,
+                struct_name: "Contact".into()
+            }),
+            r#"{"list":{"branch":null,"struct":"Contact"}}"#
+        );
+        assert_eq!(
+            one(&Request::TxCreate {
+                tx: "tx-1".into(),
+                struct_name: "Contact".into()
+            }),
+            r#"{"tx_create":{"tx":"tx-1","struct":"Contact"}}"#
+        );
+    }
+
+    /// Enumeration answers **ids and nothing else**, and creation answers **one id**. Asserted
+    /// rather than assumed, because the pressure on both of these will be to grow a field — the
+    /// first time somebody writes `list` followed by a loop of `get`, the obvious fix looks like
+    /// putting a value in here. See [`Request::List`] for why that is a query layer's job.
+    #[test]
+    fn enumeration_answers_ids_and_creation_answers_one_id() {
+        let ids = serde_json::to_value(Response::Ids(vec!["o-1234abcd".into()])).unwrap();
+        assert_eq!(ids["ids"][0], "o-1234abcd");
+        assert!(ids["ids"][0].is_string(), "a pid is text, never a number");
+
+        let created = serde_json::to_value(Response::Created {
+            id: "o-1234abcd".into(),
+        })
+        .unwrap();
+        assert_eq!(created["created"]["id"], "o-1234abcd");
+        assert_eq!(
+            created["created"].as_object().unwrap().len(),
+            1,
+            "a creation answers the id it allocated and nothing else"
         );
     }
 

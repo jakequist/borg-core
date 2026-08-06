@@ -107,6 +107,9 @@ const c = tx.object(Company, "o-100");        // a handle; no I/O yet
 const hc = await c.get("headcount");          // read → recorded server-side → guarded at commit
 await c.set("headcount", (hc ?? 0) + 1);
 
+const fresh = await tx.create(Company);       // the server allocates the id; `fresh.id` is it
+await fresh.set("website", "acme.ai");
+
 try {
   await tx.commit();
 } catch (err) {
@@ -140,6 +143,15 @@ stands", which is honest but is not the same thing.
 Reference fields come back as branded strings — `Ref<"Employee">` is the PID at runtime and the
 target struct to the compiler, so `tx.object(Company, employeeRef)` will not compile. Fields a
 producer owns are emitted `readonly`, so neither will a write to one.
+
+**`tx.create(Struct)` makes an object; `bc.branch(n).list(Struct)` finds them.** `create` allocates
+the id server-side, under an allocator of its own, so nothing an application creates can collide with
+a `Company#1` somebody wrote by hand — and the id it answers with is branded, so it goes straight
+into a reference field with no cast. `list` answers the ids of one struct at head, skipping deleted
+objects, and it is **not** part of a transaction: "the set of Companies" is not a cell, so there is
+nothing a guard could be asked about it (§9.6). It answers ids and nothing else, so a name per object
+is a read per object — the N+1 is visible on purpose, and the query layer that would remove it is out
+of scope.
 
 ## The socket, and why your stdout is yours
 

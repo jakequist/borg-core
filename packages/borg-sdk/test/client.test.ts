@@ -30,6 +30,7 @@ import {
   string,
   type BorgContext,
   type Ref,
+  type StructDescriptor,
 } from "../src/client.js";
 
 const BORG =
@@ -54,7 +55,9 @@ interface Company {
   website: string | null;
   ceo: Ref<"Employee"> | null;
 }
-const Company = defineStruct<Company>("Company", {
+// The second type argument is the struct's own name, which is what brands the ids `list` and
+// `create` answer with — codegen emits `StructDescriptor<Company, "Company">` for the same reason.
+const Company: StructDescriptor<Company, "Company"> = defineStruct("Company", {
   headcount: { type: int(), derived: false, version: "L1" },
   website: { type: string(), derived: false, version: "L1" },
   ceo: { type: refText("Employee"), derived: false, version: "L1" },
@@ -63,7 +66,15 @@ const Company = defineStruct<Company>("Company", {
 interface Employee {
   name: string | null;
 }
-const Employee = defineStruct<Employee>("Employee", {
+const Employee: StructDescriptor<Employee, "Employee"> = defineStruct("Employee", {
+  name: { type: string(), derived: false, version: "L1" },
+});
+
+/** A struct of its own for the enumeration tests, so that what they list is only what they made. */
+interface Contact {
+  name: string | null;
+}
+const Contact: StructDescriptor<Contact, "Contact"> = defineStruct("Contact", {
   name: { type: string(), derived: false, version: "L1" },
 });
 
@@ -109,6 +120,7 @@ beforeAll(async () => {
         { DeclareField: { struct_name: "Company", field: "website", ty: "String" } },
         { DeclareField: { struct_name: "Company", field: "ceo", ty: "Employee" } },
         { DeclareField: { struct_name: "Employee", field: "name", ty: "String" } },
+        { DeclareField: { struct_name: "Contact", field: "name", ty: "String" } },
       ],
     }),
   );
@@ -270,6 +282,87 @@ suite.skipIf(!available)("the client SDK, over borg serve", () => {
     expect(await company.get("ceo")).toBe(pid);
     // What is stored is the wire form, `@` and the PID — the same text `borg set` accepts.
     expect((await company.resolve("ceo")).value).toBe(pid);
+    await tx.abort();
+    bc.close();
+  });
+
+  /**
+   * The two primitives an application needs and could not previously say: *make me one of these*,
+   * and *which of these are there* (§9.6, §17.5). Together they are the difference between a store
+   * you can address and one you can write an application against.
+   */
+  test("create allocates ids the client never chose, and list finds them all", async () => {
+    const bc = await context();
+    const tx = await bc.branch("main").begin();
+    const made = [];
+    for (const name of ["Ada", "Grace", "Barbara"]) {
+      const contact = await tx.create(Contact);
+      await contact.set("name", name);
+      made.push(contact.id);
+    }
+    // Distinct by construction — the server allocates, so nothing here had to choose an id or check
+    // one, which is what makes creating an object safe without reading anything first.
+    expect(new Set(made).size).toBe(3);
+    for (const id of made) expect(id).toMatch(/^o-[0-9a-z]+$/);
+
+    // Not yet: the creations are on the transaction's own branch until it merges (§12).
+    expect(await bc.branch("main").list(Contact)).toEqual([]);
+    await tx.commit();
+
+    const listed = await bc.branch("main").list(Contact);
+    expect([...listed].sort()).toEqual([...made].sort());
+    // Ids and nothing else. A name costs a read per contact, which is the N+1 this deliberately
+    // does not hide (SDK-DRAFT §4.5).
+    const reading = await bc.branch("main").begin();
+    const names = [];
+    for (const id of listed) names.push(await reading.object(Contact, id).get("name"));
+    expect(names.sort()).toEqual(["Ada", "Barbara", "Grace"]);
+    await reading.abort();
+    bc.close();
+  });
+
+  /**
+   * The typing the descriptor's name literal buys: an id that came out of the SDK goes back in as a
+   * reference **without a cast**, and one belonging to the wrong struct does not compile.
+   */
+  test("an id from create is a reference to its own struct, and only to that", async () => {
+    const bc = await context();
+    const tx = await bc.branch("main").begin();
+    const employee = await tx.create(Employee);
+    await employee.set("name", "Ada");
+
+    const company = tx.object(Company, "#60");
+    // No `as Ref<"Employee">` anywhere: `Employee`'s descriptor states its own name in its type, so
+    // `employee.id` already *is* an `Employee` reference to the compiler.
+    await company.set("ceo", employee.id);
+    expect(await company.get("ceo")).toBe(employee.id);
+
+    // @ts-expect-error a Company id is not an Employee reference, which is the whole point.
+    await company.set("ceo", (await tx.create(Contact)).id);
+    await tx.abort();
+    bc.close();
+  });
+
+  test("two transactions each creating an object both commit, with different ids", async () => {
+    const bc = await context();
+    const a = await bc.branch("main").begin();
+    const b = await bc.branch("main").begin();
+    const first = await a.create(Employee);
+    const second = await b.create(Employee);
+    expect(first.id).not.toBe(second.id);
+
+    // Neither read anything and the cells they wrote are distinct by construction, so there is no
+    // guard to trip — creation is the one write two clients can always both do.
+    await expect(a.commit()).resolves.toMatch(/^L\d+$/);
+    await expect(b.commit()).resolves.toMatch(/^L\d+$/);
+    bc.close();
+  });
+
+  test("listing or creating a struct nobody declared is refused by name", async () => {
+    const bc = await context();
+    await expect(bc.branch("main").list("Wombat")).rejects.toThrow(/Wombat/);
+    const tx = await bc.branch("main").begin();
+    await expect(tx.create("Wombat")).rejects.toThrow(/Wombat/);
     await tx.abort();
     bc.close();
   });

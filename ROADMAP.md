@@ -59,6 +59,15 @@ resolve to one increment in either commit order, and two racing to create one ob
 object. Transactions are ephemeral and reaped on an idle timeout; branches are the durable form of
 the same idea, and nothing reaps those.
 
+**And a client can now make an object and find one.** `borg tx create <Struct>` allocates an id
+nobody chose — under an allocator of its own, so what an application creates and what somebody types
+as `Contact#5` can never be the same object — and `borg list <Struct>` names every object of a
+struct, skipping the deleted ones. Both are on the socket and in the TypeScript client. The second
+reverses §9.6's exclusion of enumeration, bounded by the reason for the exclusion: ids of one struct,
+at head, unfiltered, unpaged, and outside any transaction, because an enumeration is not something a
+guard can be asked about. The query layer is still out, and what it would cost is written down rather
+than half-built.
+
 **And the features have now met each other.** A migration runs while a client writes the field it is
 migrating, in both merge orders; a def-only merge lands on a trunk that owes a round and neither
 mislabels its output nor wedges it; a fork of a fork migrates data inherited through two levels while
@@ -270,6 +279,25 @@ staying shell-safe by construction.
 
 `Company#1` remains accepted **on input only**, as a documented convenience for hand-authored data,
 meaning "root branch, allocator 0, counter 1". Output is always canonical.
+
+#### Server-allocated ids take an allocator of their own
+
+`tx_create` (§17.5) issues ids under `AllocatorId(1)`; allocator `0` stays the shorthand's, which is
+to say the one belonging to whoever is typing. This is the first cash-in of `(branch, allocator,
+counter)` and it arrives one node before there is a second node: the component exists so that
+allocating authorities need not coordinate, and there have been two authorities since the first
+scenario — a person choosing counters, and now the store choosing them on an application's behalf.
+Separate allocators make the two id spaces disjoint **by construction**, so `borg tx create` is safe
+to run against a store full of hand-written fixtures and neither side has to know the other exists.
+A shared allocator would have needed the store to read what already exists before creating anything,
+which is the coordination point §3.1 was written to remove.
+
+The counter itself is a sidecar (`borg.allocations.json`), and the reasoning is in SDK-DRAFT §4.5:
+`InProcessSequencer::resuming_after` resumes from the store because the log answers "the highest
+layer" in one read, and there is no equivalent for a PID — a counter spans every struct, so deriving
+it means scanning every object buffer, which makes creating `n` objects `O(n²)`. Written before the
+write it names, so a crash burns an id rather than issuing one twice. What it costs is in
+`CLAUDE.md`: it is the one sidecar whose loss a store cannot recover from.
 
 #### `BufferId` has no interning variants
 
@@ -508,6 +536,28 @@ SQLite answering identically: with one index row per landing layer, "the newest 
 maximum with no tie to break, in either backend.
 
 ### Transactions and guards
+
+#### Enumeration is a read, and there is no guarded form of it
+
+`list` (§9.6, §17.5) is outside any transaction, and the reason is not that a `tx_list` would be
+extra work — it is that there is nothing coherent for it to guard. A guard is a question the
+cell-touch index answers about **a cell** (§12.4), and "the set of Contacts" is not a cell. The
+honest guard would be *"no object of this struct was created or deleted since the fork"*, which is
+the absence-guard problem §12.1 solves for one cell, widened to a whole buffer: correct, and coarse
+enough that every creation would conflict with every enumeration.
+
+So a listing buys what a `get` outside a transaction buys, which is nothing at commit — and that
+cost is real rather than theoretical: *list, decide, write* has no protection against an object
+having appeared in between, and the available workaround (guard the specific objects you acted on)
+does not cover a decision that depended on the *set*. Shipping it this way is a bet that an
+application which cannot enumerate at all is worse than one that can enumerate unguarded, and it is
+the same bet §12.1 already makes for reads outside transactions. SDK-DRAFT §5 carries the three
+shapes a guarded form could take and why none was built.
+
+The related decision is that `list` answers **ids only**. One requested field in the reply would
+answer a single shape of question and leave filters, ordering, joins and aggregates exactly where
+they were, while making the first thing anybody builds on §17.5 a thing that has to be un-built. The
+N+1 is left visible on purpose; it is a finding waiting for a query layer.
 
 #### The read-minus-written rule is about order, not about set difference
 

@@ -336,12 +336,78 @@ is better than one at first use. The `resolve` line is §4.4's envelope split.
      a client cannot distinguish "accepted" from "not answered yet" except by asking something. The
      fix is a lingering close on the server (write, shut down the write half, drain), which is work in
      `Peer` and not in the SDK.
-5. **Sugar** (unscheduled): sync-over-async pipelines, `transact` retry, ownership inference,
+5. **The two primitives an application needs and could not say** — `list` and `tx_create`. **Built.**
+   `borg_protocol::client`'s `List` / `TxCreate`, `ops::list` / `ops::tx_create`, `borg list <Struct>`
+   and `borg tx create <Struct>`, `bc.branch(n).list(Struct)` and `tx.create(Struct)` in the client
+   SDK, **scenario 280**. Driven by `/examples/personal-crm`, which cannot express *"list the
+   contacts"* or *"create a contact"* with anything §4.3 shipped.
+
+   ### What the build settled
+
+   - **Enumeration is a read, never a guarded one, and that is a boundary rather than a gap.** A
+     guard is a question the cell-touch index answers about *a cell* (§12.4); "the set of Contacts"
+     is not a cell. The honest guard would be *"no object of this struct was created or deleted since
+     the fork"*, which is the absence-guard problem widened from one cell to a whole buffer, and it
+     would make every creation conflict with every enumeration. So there is no `tx_list`, and a
+     listing buys exactly what a `get` outside a transaction buys. **What that costs is real**: an
+     application that lists, decides, and writes based on what the list contained has no protection
+     against a contact having appeared in between. Today the answer is "guard something that is a
+     cell" — read the specific objects you acted on. §5 carries the rest.
+   - **Ids only, and the N+1 is left visible.** `list` answers pids; a name per contact is a read per
+     contact. The alternative — one requested field in the reply — answers exactly one shape of
+     question and leaves filters, ordering, joins and aggregates where they were, while making the
+     first thing anybody builds on §17.5 something that has to be un-built. It is a finding waiting
+     for a query layer and is written down as one rather than pre-empted with a field.
+   - **The server allocates under an `AllocatorId` of its own, and that is what the week-one
+     allocator design was for.** `(branch, allocator, counter)` (§3.1) exists so that allocating
+     authorities need not coordinate; there have been two of them since the first scenario — the
+     person typing `Company#1`, which is allocator `0`, and now the store. Separate allocators make
+     app-created and hand-typed objects disjoint by construction, so `tx create` is safe against a
+     store full of fixtures and neither side has to know the other exists.
+   - **The counter is persisted in a sidecar, and the honest reason is that the store cannot answer
+     the question cheaply.** `InProcessSequencer::resuming_after` is the pattern this wanted: resume
+     from what the store already holds, never restart. It does not transfer, because the log answers
+     *"the highest layer"* in one read and there is no equivalent for a PID — a counter is
+     `(branch, allocator)`-scoped and therefore spans every struct at once, so deriving it means
+     scanning every object buffer, which turns creating `n` objects into `O(n²)`. So it goes beside
+     the store with the pause flags and the transaction table, **written before the write it names**
+     so that a crash burns an id rather than issuing one twice. The residual: deleting that file
+     restarts the counter, which is the one sidecar whose loss a store cannot recover from by being
+     told again. Recorded in `CLAUDE.md`.
+   - **A generated descriptor now states its own name in its type.** `StructDescriptor<Company,
+     "Company">`, which is what lets `list` and `create` answer `Ref<"Company">` rather than `string`
+     — so an id that came out of the SDK goes back in as a reference with no cast, and one of the
+     wrong struct does not compile. The second parameter defaults to `string`, so a hand-written
+     descriptor is unaffected and simply gets less. This is the same brand §4.4 gave reference
+     *fields*, finally available on the ids the SDK itself produces.
+   - **`create` returns a handle, not a bare id**, because the next thing a caller does is always
+     write a field on it. `handle.id` is the id, branded; from `tx.object(S, "#5")` it is whatever
+     was passed, uncanonicalised, because a handle makes no round trip.
+6. **Sugar** (unscheduled): sync-over-async pipelines, `transact` retry, ownership inference,
    `hasMany` (blocked on aggregations). Nothing in §4 is now unbuilt except the WebSocket listener,
    which §5 has always said lands with the browser client rather than with the transport trait.
 
 ## 5. Open questions carried
 
+- **What guards an enumeration?** `list` is a read outside any transaction (§4.5), because "the set
+  of Contacts" is not a cell and a guard is a question about a cell. That is correct and it is not
+  free: *list, decide, write* is a real application pattern with no protection against an object
+  having appeared in between, and the workaround — guard the specific objects you acted on — does not
+  cover the decision that depended on the *set*. Three shapes have been considered and none built: a
+  **buffer-versioned guard** (the existence buffer gets a version that any creation or deletion
+  moves, and a listing guards that — cheap, and coarse enough that every creation conflicts with
+  every enumeration); a **predicate guard** re-evaluated at merge, which is where every serializable
+  database ends up and is a scheduler's worth of work; or leaving it, which is the current answer and
+  is honest as long as it is written down. This is the same family as the absence guard §12.1 already
+  solves for one cell, and the fact that the one-cell case *is* solved is the reason to believe the
+  set case is a real design question rather than an oversight.
+- **`list` has no ordering contract and no cursor**, deliberately. It sorts by PID so that two
+  identical reads answer identically, and that is all it promises — allocation order within one
+  allocator, nothing across allocators, and nothing about a field. It also materializes the whole
+  answer, like `scan_buffer` beneath it, so a struct with millions of instances is a struct this
+  should not be pointed at. Paging is not a parameter that can be bolted on: a cursor over a scan
+  that re-runs at head is a different consistency story, and it belongs with the query layer or with
+  streaming reads (`CLAUDE.md`, things left undone) rather than in front of them.
 - WebSocket server: in `borg serve` from day one or when the browser client lands? (Lean: the
   transport trait supports it from day one; the actual HTTP listener lands with the browser work.)
 - **How far does the CLI-over-socket wedge go?** `borg generate` now connects to the socket rather

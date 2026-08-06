@@ -47,7 +47,7 @@ import type {
   WireLineage,
   WireSchemaDef,
 } from "./client-protocol.js";
-import { TOMBSTONE, type AnyFieldType, type FieldType } from "./values.js";
+import { TOMBSTONE, type AnyFieldType, type FieldType, type RefText } from "./values.js";
 
 // The conversions generated code needs, from the one table this package has. `ref()` and `list()`
 // are **not** here: they are the pipeline side's carrier for a reference, and a client's is
@@ -196,13 +196,21 @@ export interface FieldDescriptor<T> {
  * A struct, as generated code describes it at runtime: the name the wire uses, and how each field's
  * values convert.
  *
- * The type parameter is the *shape* — the interface generated beside it — and the mapped `fields`
- * type is what makes a generator bug into a compile error in the generated file: a field in the
- * interface with no descriptor, or a descriptor whose conversion produces the wrong type, will not
- * assemble.
+ * The first type parameter is the *shape* — the interface generated beside it — and the mapped
+ * `fields` type is what makes a generator bug into a compile error in the generated file: a field in
+ * the interface with no descriptor, or a descriptor whose conversion produces the wrong type, will
+ * not assemble.
+ *
+ * **The second is the struct's own name, as a literal type**, and it exists so that ids can be
+ * branded on the way *out* as well as on the way in. A reference field already has type
+ * `Ref<"Employee">`; without the name in the descriptor's type, everything that answers with an id —
+ * [`BranchHandle.list`], [`ObjectHandle.id`] — could only answer `string`, and storing a listed
+ * contact in a contact-shaped reference field would need a cast at every call site. Generated code
+ * supplies it (`StructDescriptor<Company, "Company">`); hand-written descriptors may leave it out
+ * and get `Ref<string>`, which is the honest answer when nothing stated the name in a type.
  */
-export interface StructDescriptor<S> {
-  readonly name: string;
+export interface StructDescriptor<S, N extends string = string> {
+  readonly name: N;
   readonly fields: { readonly [K in keyof S]-?: FieldDescriptor<NonNullable<S[K]>> };
 }
 
@@ -210,12 +218,13 @@ export interface StructDescriptor<S> {
  * Assemble a struct descriptor. Generated code's only helper.
  *
  * A function rather than an object literal so that the shape parameter is stated once, at the call
- * site, and every field is checked against it.
+ * site, and every field is checked against it. `N` is inferred from the name argument when the
+ * result is annotated with it, which is what generated code does.
  */
-export function defineStruct<S>(
-  name: string,
+export function defineStruct<S, N extends string = string>(
+  name: N,
   fields: { readonly [K in keyof S]-?: FieldDescriptor<NonNullable<S[K]>> },
-): StructDescriptor<S> {
+): StructDescriptor<S, N> {
   return { name, fields };
 }
 
@@ -248,9 +257,20 @@ type IfEquals<X, Y, A, B> =
 // --- The surfaces ------------------------------------------------------------------------------------
 
 /** One entity, through one transaction. Constructing it is free — nothing has been read yet. */
-export interface ObjectHandle<S> {
+export interface ObjectHandle<S, N extends string = string> {
   /** The entity's canonical address: `Company:o-1234abcd`. */
   readonly cell: string;
+  /**
+   * The entity's id — the PID alone, branded with the struct it belongs to.
+   *
+   * What everything else is built from: a cell address is `Contact:` + this, and a reference field's
+   * value *is* this. From [`Tx.create`] it is always a canonical PID, because the server allocated
+   * it. From [`Tx.object`] it is **whatever was passed**, uncanonicalised — a handle makes no round
+   * trip, so it has nothing to canonicalise with. Pass the `#5` shorthand and this reads `#5`, which
+   * is a thing the server accepts as an *address* and would refuse as a reference *value*; the brand
+   * says which struct an id belongs to and cannot say that a shorthand is a PID.
+   */
+  readonly id: RefText<N>;
   /**
    * Read one field. Recorded server-side, and therefore guarded at commit (§12.1).
    *
@@ -270,8 +290,21 @@ export interface Tx {
   /** The handle. It names the transaction on every message and outlives this connection (§12.2). */
   readonly id: string;
   /** A handle on one entity. No I/O — the address is built from the struct name and the id. */
-  object<S>(struct: StructDescriptor<S>, id: string): ObjectHandle<S>;
+  object<S, N extends string>(struct: StructDescriptor<S, N>, id: string): ObjectHandle<S, N>;
   object(struct: string, id: string): ObjectHandle<Untyped>;
+  /**
+   * Allocate an object and create it, in one round trip. §3.1, §8, §17.5.
+   *
+   * The one thing a client could not previously say. `object()` names an entity whose id you already
+   * had; this is where an id comes from — the server allocates it under an `AllocatorId` of its own,
+   * so nothing an application creates can ever collide with a `Contact#5` somebody wrote by hand.
+   *
+   * The existence cell is written **in this transaction**, so the object appears when the
+   * transaction commits and never if it aborts. It joins the write-set and reads nothing, which is
+   * why two transactions each creating an object cannot conflict.
+   */
+  create<S, N extends string>(struct: StructDescriptor<S, N>): Promise<ObjectHandle<S, N>>;
+  create(struct: string): Promise<ObjectHandle<Untyped>>;
   /**
    * Merge, guarded by everything this transaction read. Answers the layer it landed in on the
    * parent — what `borg frontier reaches` waits for. Throws [`ConflictError`] if a guard moved.
@@ -298,6 +331,22 @@ export interface BranchHandle {
    */
   get(cell: string, options?: ReadOptions): Promise<Resolved<string | null>>;
   get<T>(cell: string, options: ReadOptions & { as: FieldType<T> }): Promise<Resolved<T | null>>;
+  /**
+   * Every object of one struct, as ids. §9.6, §17.5.
+   *
+   * **On the branch, not in a transaction, and that is deliberate rather than pending.** A guard is
+   * a question about a cell (§12.4), and *"the set of Contacts"* is not one — guarding an
+   * enumeration would mean guarding the absence of every object not yet created, which is the
+   * absence-guard problem widened from a cell to a whole buffer. So a listing is a read like
+   * [`get`] outside a transaction: honest, at head, and buying no protection at commit. SDK-DRAFT §5
+   * carries the question.
+   *
+   * **Ids and nothing else.** Reading a field of each is a read of each — the N+1 an ORM has, made
+   * visible rather than hidden behind a reply that would have to grow a query language to stay
+   * useful. Deleted objects are not listed (§8.1).
+   */
+  list<S, N extends string>(struct: StructDescriptor<S, N>): Promise<RefText<N>[]>;
+  list(struct: string): Promise<string[]>;
   /** Where a value came from. §11. */
   explain(cell: string): Promise<Lineage>;
   /** This branch's head layer. `L0` where it holds nothing of its own. */
@@ -415,6 +464,14 @@ class Branch implements BranchHandle {
     return envelopeOf(wire, options?.as) as Resolved<never>;
   }
 
+  async list(struct: StructDescriptor<unknown, string> | string): Promise<never[]> {
+    const name = typeof struct === "string" ? struct : struct.name;
+    const ids = expect(await ask(this.#wire, { list: { branch: this.name, struct: name } }), "ids");
+    // Branded, not converted: an id is a PID and a PID is its text (§3.1). The brand is a claim
+    // about which struct it belongs to, which the descriptor is what made checkable.
+    return ids as never[];
+  }
+
   async explain(cell: string): Promise<Lineage> {
     const wire: WireLineage = expect(
       await ask(this.#wire, { explain: { branch: this.name, cell } }),
@@ -444,7 +501,19 @@ class Transaction implements Tx {
   object(struct: StructDescriptor<unknown> | string, id: string): ObjectHandle<never> {
     const descriptor = typeof struct === "string" ? undefined : struct;
     const name = typeof struct === "string" ? struct : struct.name;
-    return new Handle(this.#wire, this.id, address(name, id), descriptor) as ObjectHandle<never>;
+    return new Handle(this.#wire, this.id, name, id, descriptor) as ObjectHandle<never>;
+  }
+
+  async create(struct: StructDescriptor<unknown> | string): Promise<ObjectHandle<never>> {
+    const name = typeof struct === "string" ? struct : struct.name;
+    const { id } = expect(
+      await ask(this.#wire, { tx_create: { tx: this.id, struct: name } }),
+      "created",
+    );
+    // The same handle `object()` builds, on an id the server chose rather than one the caller had.
+    // Nothing is cached from the creation: the object exists in the transaction, and the handle
+    // reads and writes it like any other.
+    return this.object(struct, id);
   }
 
   async commit(): Promise<string> {
@@ -466,16 +535,19 @@ class Handle implements ObjectHandle<never> {
   readonly #tx: string;
   readonly #fields: Record<string, FieldDescriptor<unknown>> | undefined;
   readonly cell: string;
+  readonly id: never;
 
   constructor(
     wire: Wire,
     tx: string,
-    cell: string,
+    struct: string,
+    id: string,
     descriptor: StructDescriptor<unknown> | undefined,
   ) {
     this.#wire = wire;
     this.#tx = tx;
-    this.cell = cell;
+    this.cell = address(struct, id);
+    this.id = id as never;
     this.#fields = descriptor?.fields as Record<string, FieldDescriptor<unknown>> | undefined;
   }
 

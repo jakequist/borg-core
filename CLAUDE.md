@@ -177,6 +177,20 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   stored record (§10.4), and a pipeline that threw on its first run wrote none, so its output reads
   as simply absent. Enumerating the cells a producer *might* have written is not a set anything can
   produce.
+- **`borg list` cannot be guarded, has no ordering contract and has no cursor.** Enumeration is a
+  read outside any transaction, because "the set of Contacts" is not a cell and a guard is a question
+  about a cell (§9.6, §12.4) — so *list, decide, write* has no protection against an object appearing
+  in between. It sorts by PID so two identical reads answer identically and promises nothing more,
+  and it materializes the whole answer like the `scan_buffer` beneath it. All three are the same
+  decision: the query layer is out (§18), and half of one is worse than none. SDK-DRAFT §5 carries
+  the shapes that were considered.
+- **The PID counter is a sidecar, and it is the one sidecar whose loss a store cannot recover from.**
+  `borg.allocations.json` holds the next counter `tx create` will issue. Every other sidecar loses
+  something you can restore by doing the thing again — push the repo, pause the branch — but deleting
+  this one restarts the count, and a fresh object can then be issued the id of an existing one. It is
+  a sidecar because the store cannot answer the question cheaply: a counter spans every struct, so
+  deriving it means scanning every object buffer, and doing that per create is `O(n²)`. It is written
+  *before* the write it names, so a crash burns an id rather than reusing one. SDK-DRAFT §4.5.
 - `refresh` re-runs every hop of a chain when any hop is behind, rather than only the hops that are.
   Correctness is unaffected; making it precise needs validation callable from the derivation engine
   without handing the engine the resolver.

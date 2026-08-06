@@ -97,8 +97,15 @@ pub trait StorageProvider: Send + Sync {
     /// a migration path when the requested version is not yet materialized.
     async fn cell_versions(&self, path: &ReadPath, cell: &CellRef) -> Result<Vec<DefVersion>>;
 
-    /// Enumerate a buffer. **Engine-internal only** — used by the scheduler to discover new
-    /// entities (SPEC.md §9.6). Enumeration is not exposed as a user-facing query in v1.
+    /// Enumerate a buffer. The scheduler's way of discovering entities a layer changeset cannot
+    /// mention (SPEC.md §9.6) — and, since `list`, the one read behind a client asking which objects
+    /// of a struct there are (§17.5). It was engine-internal until an application needed the second,
+    /// which changed who calls it and nothing about what it answers.
+    ///
+    /// It answers **records**: one row per `(cell, def-version)` visible on the path, a child's
+    /// shadowing its ancestors'. Tombstones come back like any other value, because whether a
+    /// deletion is interesting is the caller's question — the scheduler wants the entity, `list`
+    /// does not.
     async fn scan_buffer(&self, path: &ReadPath, buffer: &BufferId) -> Result<EventStream>;
 
     /// A committed layer's membership, in order. This is what drives invalidation: the committed

@@ -223,6 +223,46 @@ impl Registry {
         Ok(())
     }
 
+    /// Every object of one struct on this branch, by PID. SPEC.md §9.6, §17.5.
+    ///
+    /// The struct's existence buffer *is* the set of its instances (§4.2), so this is the same
+    /// `scan_buffer` the scheduler uses to discover entities — read through the branch's ancestry,
+    /// so a fork enumerates what it can see rather than only what it wrote.
+    ///
+    /// **A tombstoned existence cell is not one of the objects** (§8.1). The scan answers records
+    /// rather than a set, which is what the scheduler wants; deciding that a deletion means absence
+    /// is this caller's question and is answered here.
+    ///
+    /// Sorted by PID, which for one allocator is `(branch, allocator, counter)` and therefore
+    /// allocation order. Sorted at all so that two identical reads answer identically; nothing
+    /// promises the order means anything more than that.
+    ///
+    /// Materialized, like `scan_buffer` itself (`CLAUDE.md`, things left undone): a struct with
+    /// millions of instances is exactly the case that wants a cursor, and a cursor is the query
+    /// layer's shape rather than a parameter that could be bolted on here.
+    pub async fn object_ids(
+        &self,
+        branch: BranchId,
+        struct_name: &borg_core::ObjectTypeName,
+    ) -> Result<Vec<borg_core::Pid>> {
+        let path = self.branches.read_path(branch, None)?;
+        let buffer = borg_core::BufferId::Object(struct_name.clone());
+        let mut stream = self.storage.scan_buffer(&path, &buffer).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = stream.next().await {
+            let event = row?;
+            if event.value.is_tombstone() {
+                continue;
+            }
+            ids.push(*event.cell.pid());
+        }
+        // One record per existence cell — they are unversioned (§5.2), so there is one version of
+        // each to answer — but the answer is a set of objects, and saying so here costs one pass.
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// The layer to read at for a coherent snapshot of this branch. SPEC.md §10.5.
     ///
     /// Everything visible here was computed from everything else visible here — the alternative to
