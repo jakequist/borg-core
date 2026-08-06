@@ -1,0 +1,117 @@
+/* A few lines of plain CSS. No framework: the app is three views and a form. */
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #1a1a1a;
+  background: #fbfbfa;
+}
+
+main { max-width: 44rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+h1 { font-size: 1.4rem; margin: 0; }
+h2 { font-size: 1.1rem; margin: 2rem 0 0.5rem; }
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  border-bottom: 1px solid #e4e4e0;
+  padding-bottom: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+header nav { margin-left: auto; display: flex; gap: 0.75rem; }
+
+button, .link {
+  font: inherit;
+  border: 1px solid #d3d3ce;
+  background: #fff;
+  border-radius: 5px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+button:hover, .link:hover { background: #f2f2ee; }
+button[disabled] { opacity: 0.5; cursor: default; }
+button.primary { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+button.primary:hover { background: #333; }
+
+ul.contacts { list-style: none; padding: 0; margin: 0; }
+ul.contacts li {
+  border-bottom: 1px solid #ececE8;
+  padding: 0.65rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+ul.contacts a { color: inherit; text-decoration: none; font-weight: 500; }
+ul.contacts a:hover { text-decoration: underline; }
+ul.contacts .email { color: #767672; font-size: 0.9em; margin-left: auto; }
+
+label { display: block; margin: 0.85rem 0; }
+label span { display: block; font-size: 0.85em; color: #767672; margin-bottom: 0.2rem; }
+input, textarea {
+  font: inherit;
+  width: 100%;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid #d3d3ce;
+  border-radius: 5px;
+  background: #fff;
+}
+textarea { min-height: 5rem; resize: vertical; }
+
+dl.fields { display: grid; grid-template-columns: 8rem 1fr; gap: 0.4rem 1rem; margin: 0; }
+dl.fields dt { color: #767672; font-size: 0.9em; }
+dl.fields dd { margin: 0; white-space: pre-wrap; }
+dl.fields dd.absent { color: #a5a5a0; font-style: italic; }
+
+/* Provenance. A derived value that is behind, or unreachable, has to look different from one that
+   is current — that is invariant 8 reaching a person's eyes. */
+.badge {
+  display: inline-block;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid transparent;
+  vertical-align: 0.1em;
+}
+.badge.current { background: #e8f3ea; color: #2c6b3a; border-color: #cfe6d4; }
+.badge.stale, .badge.unvalidated { background: #fdf3e0; color: #8a5b00; border-color: #f2e0bb; }
+.badge.broken, .badge.tombstoned { background: #fbe9e9; color: #8f2323; border-color: #f0cccc; }
+
+.provenance {
+  margin-top: 1.5rem;
+  border: 1px solid #e4e4e0;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  background: #fff;
+  font-size: 0.88rem;
+}
+.provenance table { border-collapse: collapse; width: 100%; }
+.provenance td { padding: 0.15rem 0.5rem 0.15rem 0; vertical-align: top; }
+.provenance td:first-child { color: #767672; width: 9rem; }
+.provenance code { font-size: 0.92em; word-break: break-all; }
+
+.error {
+  border: 1px solid #f0cccc;
+  background: #fbe9e9;
+  color: #6d1d1d;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+}
+.error h3 { margin: 0 0 0.3rem; font-size: 0.95rem; }
+.error p { margin: 0.2rem 0; }
+.error code { word-break: break-all; }
+
+.muted { color: #767672; }
+footer {
+  margin-top: 3rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #e4e4e0;
+  font-size: 0.82rem;
+  color: #92928d;
+}

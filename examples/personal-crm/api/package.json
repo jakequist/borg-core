@@ -1,0 +1,9 @@
+{
+  "name": "personal-crm-api",
+  "private": true,
+  "type": "module",
+  "description": "node:http over borg-sdk/client. Zero runtime dependencies beyond the SDK.",
+  "scripts": {
+    "start": "node server.ts"
+  }
+}

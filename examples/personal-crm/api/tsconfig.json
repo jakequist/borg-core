@@ -1,0 +1,25 @@
+{
+  // What an ordinary project looks like. Nothing here is borrowed from the SDK's own tsconfig: the
+  // point of `borg generate` is that its output is TypeScript an ordinary project compiles.
+  //
+  // Node runs `server.ts` by erasing types rather than compiling them, so nothing needing an emit
+  // may appear, and imports name the `.ts` file that actually exists on disk.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["gen", "server.ts"]
+}

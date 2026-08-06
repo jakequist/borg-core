@@ -1,0 +1,10 @@
+# The CRM's repo. A repo is a directory: `borg repo push` reads this, asks every executable under
+# `pipelines/` to describe itself, and emits the resulting def events.
+#
+# The id is authoritative here and stated a second time in the DSL, where it is cross-checked.
+[repo]
+id = 7
+name = "personal-crm"
+
+[[pipelines]]
+command = "pipelines/display_name.ts"
