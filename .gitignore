@@ -6,3 +6,6 @@ dist/
 .claude/worktrees/
 __pycache__/
 .idea/
+# Secrets live in Doppler (project: borg). A local .env must never be committed.
+.env
+*.env
