@@ -178,18 +178,18 @@ cloud later, with the platform's own control plane built on Borg itself.
   SPEC.md §19, `crates/borg-host/src/stream.rs`, `scenarios/320-export-and-import`. See *Export and
   import: which sidecars are state* below for the decisions the build forced.
 - **Secrets live in Doppler** (project `borg`); deploys target the Proxmox host (`m3`) first with a
-  thin VM-provider seam named for the eventual cloud move.
+  thin VM-provider seam named for the eventual cloud move. In the event the first deployment matched
+  the host's own convention — a systemd unit in an LXC, no Docker — and the CI image remains the
+  artifact the cloud move will use.
 
-**P1 — networked, authed, deployed:** ~~WebSocket transport (browser-ready, rides standard infra)~~ ·
-~~hello acknowledgement (closes the routing deviation)~~ · ~~static org-scoped API keys~~ ·
-~~export/import~~ · Dockerfile + CI · one server live on the Proxmox host. **All but the last two are
-done** — see *The handshake is answered*, *Two transports, one protocol* and *Static API keys* below;
-TLS is deliberately not among them and is a proxy's job (§17.6).
-~~hello acknowledgement (closes the routing deviation)~~ · ~~export/import~~ · ~~Dockerfile + CI~~ ·
-static org-scoped API keys · one server live on the Proxmox host. **All but the last two are done** —
-see *The handshake is answered*, *Two transports, one protocol* and *Export and import* below. TLS
-was never among them and is a proxy's job (§17.6); `DEPLOY.md` is where that expectation is written
-down for whoever runs the thing.
+**P1 — networked, authed, deployed: done.** ~~WebSocket transport (browser-ready, rides standard
+infra)~~ · ~~hello acknowledgement (closes the routing deviation)~~ · ~~static org-scoped API keys~~ ·
+~~export/import~~ · ~~Dockerfile + CI~~ · ~~servers live~~ — staging and production `borg-server`s
+run behind a TLS-terminating tunnel at `api-staging.borg-hq.com` and `api.borg-hq.com`, auth on,
+verified end to end over `borg+wss://` with the TypeScript SDK. See *The handshake is answered*,
+*Two transports, one protocol*, *Static API keys* and *Export and import* below. TLS was never among
+the items and is a proxy's job (§17.6); `DEPLOY.md` is where that expectation is written down for
+whoever runs the thing. Host-specific ops details live in the private borg-cloud repo, not here.
 **P2 — the platform:** control-plane app on Borg — orgs, users, memberships, token issuance,
 provisioning, subdomain routing, platform.borg-hq.com.
 **P3 — tiering:** dedicated-server provisioning via the Proxmox API, on-prem packaging, and
