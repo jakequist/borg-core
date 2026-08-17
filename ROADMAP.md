@@ -174,7 +174,9 @@ cloud later, with the platform's own control plane built on Borg itself.
   feels.
 - **Format policy: guarantee the data, not the bytes.** Pre-1.0 on-disk formats may change; every
   release exports a canonical event stream and imports streams of prior releases; upgrades are
-  export → upgrade → import. Additive changes stay serde-compatible without ceremony.
+  export → upgrade → import. Additive changes stay serde-compatible without ceremony. **Built** —
+  SPEC.md §19, `crates/borg-host/src/stream.rs`, `scenarios/320-export-and-import`. See *Export and
+  import: which sidecars are state* below for the decisions the build forced.
 - **Secrets live in Doppler** (project `borg`); deploys target the Proxmox host (`m3`) first with a
   thin VM-provider seam named for the eventual cloud move.
 
@@ -183,6 +185,9 @@ cloud later, with the platform's own control plane built on Borg itself.
 Dockerfile + CI · one server live on the Proxmox host. **The first two are done** — see *The
 handshake is answered* and *Two transports, one protocol* below; TLS is deliberately not among them
 and is a proxy's job (§17.6).
+**P1 — networked, authed, deployed:** WebSocket transport (browser-ready, rides standard infra) ·
+hello acknowledgement (closes the routing deviation) · static org-scoped API keys · ~~export/import~~
+**done** · Dockerfile + CI · one server live on the Proxmox host.
 **P2 — the platform:** control-plane app on Borg — orgs, users, memberships, token issuance,
 provisioning, subdomain routing, platform.borg-hq.com.
 **P3 — tiering:** dedicated-server provisioning via the Proxmox API, on-prem packaging, and
@@ -387,6 +392,21 @@ retried — and carries on, committing a transaction that was open before the re
 a client is configured by two variables that can disagree, or that a server restart is an
 application restart, which is what it was.* — `scenarios/310-connection-urls`,
 `packages/borg-sdk/test/client.test.ts` and `crates/borg-protocol/src/url.rs`.
+
+### Durability
+
+**S20 — a registry and its restore are the same registry.** Export a store with real complexity in it
+— two branches, a merge sharing events rather than copying them, a field materialized at two
+def-versions with a migration between them, derived data, one interned string shared by two cells, a
+producer poisoned after it had succeeded, a paused branch and an advanced PID counter — import it
+into a fresh store, and require identical answers: every cell's whole envelope on every branch,
+`explain`, the def views, and the same further write deriving the same way. Then export the import
+and require the *bytes* to match, which is the cheap total check. *Failing means the format policy is
+aspirational and on-disk formats are frozen in practice, because there is no supported way off
+them.* — `crates/borg-host/tests/export_round_trip.rs`, and
+`scenarios/320-export-and-import` for the same claim through the real binaries, plus the one only a
+CLI can make: an object created after a restore does not land on the address of one that existed
+before it.
 
 ### Determinism
 
@@ -1734,6 +1754,120 @@ the application that reported it: it starts before its server, answers `503` wit
 naming the fix, and works the moment a server appears — with no restart and no connection lifecycle
 of its own. `smoke.sh` is that observation made repeatable; it is a tool and not a scenario, for the
 reason the example's README already gives.
+
+### Export and import
+
+#### Which sidecars are state, and which are residue
+
+Export was easy to specify and hard to *bound*: the log is the data, so walking it is obvious, but
+the files beside a store are not log data and each one had to be argued about separately. The rule
+that came out of doing it: **a sidecar is exported when losing it would change an answer the restored
+registry gives, and skipped when it only describes a process that is over.**
+
+- **The PID counter — exported.** Never in doubt. It is the one sidecar a store cannot recover from
+  (`CLAUDE.md`), and this stream is the backup story it never had.
+- **The producer implementation table — exported.** A restore without it is a registry holding
+  producer definitions it cannot run. The commands are paths on the exporting machine and go back
+  verbatim; a restore onto a different machine repairs them with the `repo push` that put them there
+  in the first place, and pretending otherwise — rewriting paths, or refusing to carry them — would
+  be inventing a deployment opinion inside a backup format.
+- **Pause flags — exported.** Tiny, and the failure is silent: a branch somebody paused on purpose
+  comes back deriving.
+- **Poisonings — exported, and this is the one that could have gone the other way.** A poisoning is
+  the engine's judgement about code discovered at runtime (§14) and reads as operational residue. It
+  is not, and the test that settles it is an *envelope* comparison rather than a value comparison: a
+  poisoned producer's cells read `broken`, and without the table they read `stale` — which is a
+  promise of a catch-up that is not coming, the exact lie §14 exists to prevent. `explain` loses the
+  reason too. Every test that only compared *values* would have passed either way, which is why the
+  round trip compares whole envelopes. The record is keyed on the ClientVersion it was recorded
+  against, so carrying it changes nothing about recovery: push fixed code and it retires itself.
+- **Open transactions — skipped.** Ephemeral by decree (§12.3), and restore is create-then-import, so
+  there is no client holding a handle to a registry that did not exist a moment ago. The *timeout*
+  inside the same file is exported, because that is a knob somebody set rather than a transaction
+  somebody opened — the two live in one file and are not the same kind of thing.
+- **The advisory lock — skipped.** Not state at all: a live claim naming the socket of a process that
+  is not this one.
+
+What this leaves visible rather than hidden: a restored registry's transaction branches are still
+there, as branch rows with layers and nothing pointing at them, exactly as an abandoned transaction
+leaves behind on the store it was exported from (`CLAUDE.md`, *transaction branches are never
+reaped*). The stream reproduces the registry, including the parts of it nobody has collected yet.
+
+#### An export is the whole log, and settling it would be data loss
+
+The obvious-looking move is to export at the settled frontier: §10.5 already answers *where can a
+coherent snapshot be read*, and a backup wants a coherent snapshot. It is wrong, and the reason is
+worth writing down because it will look attractive again. The settled ceiling is a **read** bound over
+a branch whose derived data lags its source data; bounding an *export* there drops every source layer
+above the watermark. That is not coherence, it is losing writes — and it would lose exactly the most
+recent ones, which is the worst possible set to lose from a backup.
+
+So an export is the whole log at head, and the lag comes with it: watermarks, the backlog, and every
+label on every derived cell. The restore works the same backlog off and arrives at the same place.
+The settled position is *reported* by an export — `the log ends at L47; the default branch is settled
+to L44` — so that a backlog captured along with the data is visible rather than a surprise.
+
+There is no torn-read problem to solve either, and that too is worth stating rather than assuming:
+embedded `borg` is refused against a served store and is one process besides, and a **served** export
+runs under that registry's own gate (§17.6), which serialises it against every other request. Nothing
+commits while the walk happens. The honest cost is that a large export holds its registry for its
+duration, which is the same gate whose relaxation is already an open question above rather than a new
+one this introduces.
+
+#### The header is deliberately almost empty
+
+Two exports of one registry are byte-identical, which makes `export → import → export → cmp` a total
+check that covers everything nobody thought to assert. That property is cheap and it is easy to
+destroy: a timestamp destroys it, a registry name destroys it, an absolute path destroys it. So the
+header carries the stream-format version and the producing binary's version and nothing else. Where a
+copy came from and when are facts about the copy rather than about the data, and a filename and an
+`ls -l` already carry both.
+
+The same reasoning made the header say `borg <version>` rather than naming the binary that wrote it:
+`borg export` and `borg-server export` are two front ends over one module, and a header that told
+them apart would make one registry export to two different byte strings depending on who asked.
+
+#### Import adopts event ids, which is a new hole in the provider surface — a deliberate one
+
+`OpenLayer::author_event` takes a *draft* precisely so that a writer cannot name an id or a layer:
+`authored` is the layer it is called on, and that is what makes it impossible to author an event
+claiming to have been written somewhere it was not. An import is the one writer for which that is
+backwards. An event id is *referenced* — by every membership row and by every read-set in the stream
+— and `authored` is what distinguishes a merged event from a copied one (§13), so re-minting either
+would leave a restore whose lineage is a plausible fiction.
+
+`adopt_event(Event)` is therefore on the trait, and the property is kept rather than abandoned: a
+provider **must refuse an event whose `authored` is not the layer it is being replayed into**, so an
+event can only be replayed into the place it says it came from. Both backends also advance their id
+sequencers past whatever they adopt, or the first ordinary write after a restore would reissue an id
+the import had just taken — which the round-trip test checks by writing to both stores and requiring
+the same layer id.
+
+#### The server-side pair takes a path, and that is the contract
+
+`export` and `import` are on §17.5, and both name a file **on the server's machine** — the same shape
+`repo_push` already has. Here it is forced rather than convenient: the protocol is one request, one
+response, in order, and a registry may be enormous. A response carrying the stream would be exactly
+the buffering the format exists to avoid, and a multi-message reply would be a change of shape rather
+than a field. The remote form is an uploaded artifact and is a field on the message when it arrives.
+
+`import` is answered by the *host* rather than by a registry, like `registry_create`, because it
+creates the registry it names. It creates and fills in **one** operation: the two halves apart leave a
+window in which the server hosts an empty registry that clients can route to and write into, and
+whatever they wrote would then either be refused by the import or silently kept beside it.
+
+#### `borg` addresses a store; `borg-server` addresses a registry
+
+The brief said `borg export [--registry ...]`. It is `borg export [<file>]` on `--store` instead,
+because `--registry` is a name under a *data directory* and a data directory is `borg-server`'s
+vocabulary — `borg` has addressed a store by path since it existed, and giving it a second addressing
+scheme for two commands would be the beginning of a third. So the pair is split the way `create` and
+`status` already are: `borg export` / `borg import` for embedded Borg, `borg-server export` /
+`borg-server import` for a data directory, whether or not something is serving it.
+
+The consequence is that `borg export --url …` does not exist, unlike `generate` and `repo push`. If a
+reason to want it appears, the missing piece is not the flag but somewhere for the bytes to go — see
+the paragraph above.
 
 ### Performance, tooling and tests
 

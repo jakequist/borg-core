@@ -39,7 +39,7 @@
 use borg_core::{BorgError, Result};
 use borg_host::host::{self, Host, LOG_FILE, PID_FILE};
 use borg_host::ops::Ops;
-use borg_host::serving;
+use borg_host::{serving, stream};
 use borg_protocol::client::{Request, Response};
 use borg_protocol::url::Address;
 use std::os::unix::process::CommandExt;
@@ -296,6 +296,184 @@ pub async fn create(data_dir: &Path, socket: &Path, name: &str, base: &Ops) -> R
     let host = Host::open(data_dir, socket)?;
     host.create(name, base).await?;
     Ok(false)
+}
+
+/// What an export or a restore turned out to be, and whether a server did it.
+///
+/// One struct for both halves because the two commands print the same shape of sentence, and the
+/// `served` flag is the one thing an operator needs to know that neither count tells them: an export
+/// taken *through* a running server is a snapshot of what that server is holding, and one taken
+/// directly is a snapshot of a directory nobody is serving.
+pub struct Moved {
+    pub served: bool,
+    pub summary: String,
+}
+
+/// Export a registry — through the server when one is running, directly when one is not.
+///
+/// The pair is the same one [`create`] draws, and here it is load-bearing rather than convenient: a
+/// running server holds the advisory lock on every registry it hosts, so a second process reading
+/// the store behind its back is exactly what the lock forbids. Through the socket, the export runs
+/// under that registry's own gate and is a coherent snapshot for free (SPEC.md §19). With no server
+/// up, this process is the only one there is and reads the store directly.
+///
+/// **`file` is a path on the server's machine** when a server does it. That is the same contract
+/// `repo push --url` has, and it is stated rather than hidden: the alternative for a remote server is
+/// carrying the bytes, which is a field on the message rather than a different shape.
+pub async fn export(
+    data_dir: &Path,
+    socket: &Path,
+    name: Option<&str>,
+    file: &Path,
+    base: &Ops,
+) -> Result<Moved> {
+    let path = absolute(file);
+    if serving::is_listening(socket) {
+        let request = Request::Export {
+            registry: name.map(str::to_string),
+            path: path.display().to_string(),
+        };
+        return match borg_protocol::client::ask(&Address::Unix(socket.into()), name, &request)? {
+            Response::Exported {
+                path,
+                layers,
+                events,
+                interned,
+                head,
+                settled,
+            } => Ok(Moved {
+                served: true,
+                summary: exported(&path, layers, events, interned, &head, &settled),
+            }),
+            Response::Error { message } => Err(BorgError::Storage(message)),
+            other => Err(BorgError::Storage(format!(
+                "unexpected answer to export: {other:?}"
+            ))),
+        };
+    }
+    let host = Host::open(data_dir, socket)?;
+    let slot = host.route(name)?;
+    let handle = std::fs::File::create(&path)
+        .map_err(|err| BorgError::Storage(format!("{}: {err}", path.display())))?;
+    let mut out = std::io::BufWriter::new(handle);
+    let report = stream::export(
+        &Ops {
+            store: slot.store.clone(),
+            held: None,
+            ..base.clone()
+        },
+        &mut out,
+    )
+    .await?;
+    Ok(Moved {
+        served: false,
+        summary: exported(
+            &path.display().to_string(),
+            report.layers,
+            report.events,
+            report.interned,
+            &report.head.to_string(),
+            &report.settled.to_string(),
+        ),
+    })
+}
+
+/// Restore a registry from a stream — through the server when one is running, directly when not.
+///
+/// Creating and filling are **one** operation either way (`Host::restore`): a registry that existed
+/// empty for a moment is a registry a client could have routed to and written into, and the write
+/// would then be either refused or silently kept beside the restore.
+pub async fn import(
+    data_dir: &Path,
+    socket: &Path,
+    name: &str,
+    file: &Path,
+    base: &Ops,
+) -> Result<Moved> {
+    let path = absolute(file);
+    if serving::is_listening(socket) {
+        let request = Request::Import {
+            name: name.to_string(),
+            path: path.display().to_string(),
+        };
+        return match borg_protocol::client::ask(&Address::Unix(socket.into()), None, &request)? {
+            Response::Imported {
+                name,
+                layers,
+                events,
+                branches,
+                head,
+                written_by,
+            } => Ok(Moved {
+                served: true,
+                summary: restored(&name, layers, events, branches, &head, &written_by),
+            }),
+            Response::Error { message } => Err(BorgError::Storage(message)),
+            other => Err(BorgError::Storage(format!(
+                "unexpected answer to import: {other:?}"
+            ))),
+        };
+    }
+    let host = Host::open(data_dir, socket)?;
+    let (_, report) = host.restore(name, base, &path).await?;
+    Ok(Moved {
+        served: false,
+        summary: restored(
+            name,
+            report.layers,
+            report.events,
+            report.branches,
+            &report.head.to_string(),
+            &report.written_by,
+        ),
+    })
+}
+
+/// The path a *server* will read or write, resolved here rather than there.
+///
+/// A relative path means something to the shell that typed it and nothing to a daemon whose working
+/// directory is wherever it was started. Resolving it against this process's cwd is what makes
+/// `borg-server export main backup.ndjson` write beside the operator rather than somewhere they
+/// would have to go looking — and it is the honest half of the local-path contract: it works because
+/// the server is on this machine, and the day it is not, the path has to be replaced by the bytes.
+fn absolute(file: &Path) -> PathBuf {
+    if file.is_absolute() {
+        return file.to_path_buf();
+    }
+    std::env::current_dir().map_or_else(|_| file.to_path_buf(), |cwd| cwd.join(file))
+}
+
+fn exported(
+    path: &str,
+    layers: u64,
+    events: u64,
+    interned: u64,
+    head: &str,
+    settled: &str,
+) -> String {
+    let lag = if head == settled {
+        String::new()
+    } else {
+        format!("; derived data is settled to {settled}, and the backlog is captured with it")
+    };
+    format!(
+        "wrote {path}: {} layers, {} events, {} interned values — the log ends at {head}{lag}",
+        layers, events, interned
+    )
+}
+
+fn restored(
+    name: &str,
+    layers: u64,
+    events: u64,
+    branches: u64,
+    head: &str,
+    written_by: &str,
+) -> String {
+    format!(
+        "restored registry {name}: {layers} layers, {events} events, {branches} branches, head \
+         {head} — the stream was written by {written_by}"
+    )
 }
 
 /// The server's log, or the sentence explaining why there is none.

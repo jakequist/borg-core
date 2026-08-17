@@ -20,6 +20,18 @@ There are **two binaries**: `borg` (the client, `crates/borg-cli`) and `borg-ser
 `crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310 and 330 start a real server, so both have to be
 built before `run-all.sh`; `check.sh` builds both. 330 also needs a free TCP port, because it starts
 a server listening on a WebSocket as well as on its socket.
+`crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310 and 320 start a real server, so both have
+to be built before `run-all.sh`; `check.sh` builds both.
+
+```
+borg export [<file>] / borg import <file>            # a registry as a canonical event stream (§19)
+borg-server export [<name>] <file> / import <name> <file>
+```
+
+**Export/import is the format policy made real** — pre-1.0 the on-disk bytes may change, the *data*
+may not. If you change anything the stream carries, `crates/borg-host/tests/export_round_trip.rs` and
+`scenarios/320-export-and-import` are what say so; if you change what a *store* holds without
+changing the stream, the round trip is what proves the promise still holds.
 
 ```
 cd packages/borg-sdk && pnpm install && pnpm run check          # typecheck, vitest, build
@@ -63,8 +75,9 @@ crates/borg-protocol        the worker wire contract; `client.rs` is the client 
 crates/borg-engine          log, branches, defs, derivation, resolver, registry
 crates/borg-host            what it takes to *host* a store, shared by both binaries: `ops.rs` is
                             what the commands do, `push.rs` is `repo push`, `sidecar.rs` the files
-                            beside a store, `serving.rs` the advisory lock, and `host.rs` a data
-                            directory of registries (§17.6)
+                            beside a store, `serving.rs` the advisory lock, `host.rs` a data
+                            directory of registries (§17.6), and `stream.rs` export/import — a
+                            registry as a canonical event stream (§19)
 crates/borg-cli             the `borg` binary — argv and printing over `borg-host`, plus
                             `generate.rs`, which emits the typed client (§15). Embedded Borg: it
                             operates directly on a store nobody is serving, and has no `serve`.
@@ -75,6 +88,10 @@ crates/borg-server          the `borg-server` binary — `serve.rs` is `borg-hos
                             `GET /health` is the one HTTP endpoint), and `lifecycle.rs` is
                             start/stop/status/logs; `status` and `create` are clients of the server
                             they administer, over `borg_protocol::client::ask`
+                            socket and `lifecycle.rs` is start/stop/status/logs; `status`,
+                            `create`, `export` and `import` are clients of the server they
+                            administer, over `borg_protocol::client::ask`, and fall back to
+                            operating on the data directory directly when nothing is serving it
 packages/borg-sdk           the TypeScript SDK. Two entry points, deliberately opposite: `borg-sdk`
                             is the author-side DSL and the worker protocol, `borg-sdk/client` is
                             the consumer-side client over `borg-server`. `values.ts` is the one
@@ -87,7 +104,7 @@ packages/borg-sdk-py        the Python SDK: the pipeline half, and the neutralit
                             contract
 scenarios/                  end-to-end scenarios driving the real binaries; `ts-lib.sh` is the
                             skip-if-no-node harness the TypeScript ones share, and `lib.sh` holds
-                            `BORG_SERVER_BIN` for the six that start a server
+                            `BORG_SERVER_BIN` for the seven that start a server
 ```
 
 Dependency arrows point inward to `borg-core`. Trait crates (`borg-storage`, `borg-exec`) are
@@ -327,6 +344,30 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   its `origin` reads `derived`. `borg get Wombat#1.nose` prints exactly that, and the SDK reproduces
   it because there is one read path. Pre-dates the SDKs; asserted in `packages/borg-sdk`'s client
   suite so that nobody "fixes" it in one of the two places.
+- **An export holds its registry for its whole duration, and that is the price of the snapshot.**
+  There is no snapshot machinery in `stream::export` because there is no torn read to prevent: a
+  served export runs under the registry's gate and embedded `borg` is one process the lock has
+  already made exclusive. It is the same gate `ROADMAP.md`'s *Concurrent requests within one
+  registry* tracks, so the fix — if a multi-gigabyte export blocking a registry ever becomes the
+  complaint — is that change and not a second one.
+- **An export is at head, never at the settled frontier.** Settling would drop every source layer
+  above the watermark, which is losing the most recent writes out of a backup. The settled position
+  is *reported* so a captured backlog is visible; it bounds nothing. Do not "fix" this — see
+  `ROADMAP.md`, *An export is the whole log, and settling it would be data loss*.
+- **`stream::export` re-parses every cell address it writes.** The canonical text form is documented
+  lossless and is injective over every address the constructors build, but this is a backup format
+  and a silently mangled cell on restore is the worst failure it has — so a mismatch is a loud export
+  failure rather than a stream that reads back as something else. One parse per event, on a path that
+  is already doing JSON per event.
+- **Interned content is emitted per layer, not per registry.** The seen-set is bounded by one layer's
+  distinct values, which is the bound `read_layer` already imposes; a registry-wide set would be
+  bounded by the number of distinct strings in the store, which is exactly what a streaming format
+  promises not to hold. Re-emitting a shared string once per layer costs a hash lookup on import,
+  because interning is idempotent.
+- **A restored registry keeps its transaction branches**, as branch rows with layers and nothing
+  pointing at them — the same residue an abandoned transaction leaves on the store it came from. The
+  stream reproduces the registry including the parts nobody has collected yet, which is right until
+  reaping is a decision somebody has made (above).
 - `Set`, `Map`, aggregation pipelines, mid-list insertion and container isolation are deferred (§18).
   Generated SDKs are no longer: `borg generate --lang ts` is built, and Python, Rust and Go are not.
   A generated list field yields the handle to the list and not its elements, because element

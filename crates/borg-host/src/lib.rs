@@ -29,6 +29,9 @@
 //! * [`render`] — the one renderer both `borg generate` and the server use for a struct definition,
 //!   because codegen reading a different shape depending on whether it went through a socket would
 //!   be the bug that only shows up on a served store.
+//! * [`stream`] — **export and import** (§19): a registry as a canonical event stream, which is what
+//!   makes the format policy real. One mechanism, four jobs — backup, restore, format migration and
+//!   clone/seed — because the log is the data and every index is already a fold over it.
 
 pub mod host;
 pub mod ops;
@@ -36,3 +39,4 @@ pub mod push;
 pub mod render;
 pub mod serving;
 pub mod sidecar;
+pub mod stream;

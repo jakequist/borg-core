@@ -296,7 +296,7 @@ impl Host {
         }
     }
 
-    /// Make a registry. SPEC.md §17.6.
+    /// Make an empty registry. SPEC.md §17.6.
     ///
     /// **A server operation, not a filesystem one**, and that is the whole reason it is here: a
     /// directory appearing under the data dir while a server is up is a store the server has not
@@ -304,20 +304,56 @@ impl Host {
     /// is claimed, routable and reported by `status` from the moment it exists — and on a remote
     /// server, where there is no filesystem to reach, this is the only shape that could have worked.
     pub async fn create(&self, name: &str, base: &Ops) -> Result<Arc<Slot>> {
+        let (made, ops) = self.prepare(name, base)?;
+        ops::init(&ops).await?;
+        self.adopt(name, made)
+    }
+
+    /// Make a registry **and fill it from an export stream**, in one operation. SPEC.md §19.
+    ///
+    /// One operation, not create-then-import, because the two halves apart leave a window in which
+    /// the server hosts an empty registry that clients can route to and write into — and whatever
+    /// they wrote would then be refused by the import, or worse, silently kept beside it. A restored
+    /// registry is routable from the moment it exists and is complete from the moment it is routable.
+    ///
+    /// A restore that fails leaves nothing under the data dir: `stream::import` removes a store it
+    /// created and could not finish, which is the same guarantee embedded `borg import` gets, and it
+    /// matters more here — a half-written store under a data directory is a registry the *next*
+    /// `borg-server start` would discover and host.
+    pub async fn restore(
+        &self,
+        name: &str,
+        base: &Ops,
+        stream: &Path,
+    ) -> Result<(Arc<Slot>, crate::stream::Imported)> {
+        let (made, ops) = self.prepare(name, base)?;
+        let handle = std::fs::File::open(stream)
+            .map_err(|err| BorgError::Storage(format!("{}: {err}", stream.display())))?;
+        let mut input = std::io::BufReader::new(handle);
+        let report = crate::stream::import(&ops.store, &mut input).await?;
+        Ok((self.adopt(name, made)?, report))
+    }
+
+    /// Check the name, check nothing is there, and work out where the store would go. Nothing is
+    /// created and nothing is claimed — see [`Host::adopt`] for the other half.
+    fn prepare(&self, name: &str, base: &Ops) -> Result<(Slot, Ops)> {
         check_name(name)?;
         if self.registries.lock().unwrap().contains_key(name) {
             return Err(BorgError::Storage(format!(
                 "a registry named `{name}` already exists"
             )));
         }
-        let dir = self.data_dir.join(name);
-        let made = slot(name, &dir);
-        ops::init(&Ops {
+        let made = slot(name, &self.data_dir.join(name));
+        let ops = Ops {
             store: made.store.clone(),
             held: None,
             ..base.clone()
-        })
-        .await?;
+        };
+        Ok((made, ops))
+    }
+
+    /// Take a finished store into the hosted set.
+    fn adopt(&self, name: &str, made: Slot) -> Result<Arc<Slot>> {
         // Claimed **only if this process is serving** — see [`Host::serving`]. A registry created
         // while a server is up must be locked from the moment it exists, because it is hosted from
         // the moment it exists; one created against a directory nobody is serving must not be.

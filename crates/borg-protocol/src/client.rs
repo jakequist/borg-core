@@ -497,6 +497,41 @@ pub enum Request {
         #[serde(default)]
         path: Option<String>,
     },
+    /// **Write a registry out as a canonical event stream.** SPEC.md §19.
+    ///
+    /// `path` is a file **on the server's disk**, for the same reason [`Request::RepoPush`]'s is and
+    /// with the same consequence: a local server writes where the operator asked, and a remote one
+    /// will want the bytes carried rather than named. What makes a path the right shape *here* and
+    /// not merely the convenient one is size. A registry may be enormous and must never be
+    /// materialized whole, and this protocol is one request, one response, in order — a response
+    /// carrying the stream would be exactly the buffering the format exists to avoid, and a
+    /// multi-message reply would be a change of shape rather than a field.
+    ///
+    /// The export runs under the registry's gate (`borg_host::host`), so nothing commits while it
+    /// walks: what it captures is the whole log at one instant, not a settled read. See
+    /// `borg_host::stream::export` for why settling would be data loss rather than coherence.
+    ///
+    /// `registry` overrides the connection's, so a backup client covering three registries needs one
+    /// connection rather than three.
+    Export {
+        #[serde(default)]
+        registry: Option<String>,
+        /// A file **on the server**. See above.
+        path: String,
+    },
+    /// **Create a registry and fill it from a stream.** SPEC.md §19.
+    ///
+    /// A host operation like [`Request::RegistryCreate`], and for the stronger version of the same
+    /// reason: restore is create-then-import, importing into a registry that already holds anything
+    /// is refused, and doing the two halves as separate messages would leave a window in which the
+    /// server is hosting an empty registry that clients can route to and write to. One message, one
+    /// registry, already full.
+    ///
+    /// `path` is on the server's disk, as [`Request::Export`]'s is.
+    Import {
+        name: String,
+        path: String,
+    },
     /// What this server hosts. SPEC.md §17.6.
     ///
     /// The one message that needs no registry, which is what makes it answerable by a client that
@@ -579,6 +614,30 @@ pub enum Response {
         #[serde(default)]
         layer: Option<String>,
         report: Vec<String>,
+    },
+    /// What an export wrote, and **where the log stood when it wrote it**. SPEC.md §19.
+    ///
+    /// `head` is the position the stream represents; `settled` is where the branch's derived data
+    /// had caught up to (§10.5), reported so that a backlog captured along with the data is visible
+    /// rather than a surprise on restore. Layer ids are text, as everywhere else here.
+    Exported {
+        path: String,
+        layers: u64,
+        events: u64,
+        interned: u64,
+        head: String,
+        settled: String,
+    },
+    /// What a restore turned out to be, including the release that wrote the stream — which is the
+    /// one fact an operator wants when a restore behaves oddly and the format policy is what they
+    /// are relying on. SPEC.md §19.
+    Imported {
+        name: String,
+        layers: u64,
+        events: u64,
+        branches: u64,
+        head: String,
+        written_by: String,
     },
     /// The answer to [`Request::Registries`]: what this server hosts, and which of them it has
     /// opened. `open` is lazy opening made visible — a registry nobody has used has not had its log

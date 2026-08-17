@@ -39,7 +39,7 @@ else
 fi
 
 step "scenarios"
-# Both binaries: the client the scenarios drive, and the server two of them start (SPEC.md §17.6).
+# Both binaries: the client every scenario drives, and the server seven of them start (§17.6).
 cargo build -p borg-cli -p borg-server
 bash scenarios/run-all.sh
 
