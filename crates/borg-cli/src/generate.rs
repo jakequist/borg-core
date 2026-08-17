@@ -62,9 +62,9 @@ pub struct Generate {
     /// `-o` / `--out`.
     pub out: PathBuf,
     pub watch: bool,
-    /// From `--url` / `$BORG_URL`: the socket to read through, instead of the one the store's own
+    /// From `--url` / `$BORG_URL`: the address to read through, instead of the socket the store's own
     /// lock record names. See [`read_schema`].
-    pub socket: Option<PathBuf>,
+    pub address: Option<borg_protocol::url::Address>,
     /// From the same URL: which registry on that socket (SPEC.md §17.6, §17.7). `None` is `None` in
     /// the handshake, and the server's n=1 convenience decides.
     pub registry: Option<String>,
@@ -150,23 +150,24 @@ async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, Strin
     // lock record says both halves: where the server is listening, and **what it calls this store**.
     // One socket serves a directory of registries and the handshake is what routes (§17.6), so a
     // generator that knew only the address would be asking an arbitrary registry for its schema.
-    let served = if options.socket.is_some() {
+    let served = if options.address.is_some() {
         None
     } else {
         serving::served_on(&args.store)
     };
-    let socket = options
-        .socket
-        .clone()
-        .or_else(|| served.as_ref().map(|served| served.socket.clone()));
-    match socket {
-        Some(socket) => {
+    let address = options.address.clone().or_else(|| {
+        served
+            .as_ref()
+            .map(|served| borg_protocol::url::Address::Unix(served.socket.clone()))
+    });
+    match address {
+        Some(address) => {
             let registry = options
                 .registry
                 .clone()
                 .or_else(|| served.and_then(|served| served.registry));
-            let schema = over_socket(&socket, registry.as_deref(), args.branch.as_deref())?;
-            Ok((schema, format!("through {}", socket.display())))
+            let schema = over_server(&address, registry.as_deref(), args.branch.as_deref())?;
+            Ok((schema, format!("through {address}")))
         }
         None => {
             let (version, structs) = ops::def_view(args).await?;
@@ -188,16 +189,19 @@ async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, Strin
 /// The registry comes from the URL, or from the store's lock record so that a server hosting
 /// several is asked about *this* store. Absent where the record predates named registries, which
 /// the server reads as "the sole registry" — the same default a hand-written client takes (§17.6).
-fn over_socket(socket: &Path, registry: Option<&str>, branch: Option<&str>) -> Result<SchemaDef> {
+fn over_server(
+    address: &borg_protocol::url::Address,
+    registry: Option<&str>,
+    branch: Option<&str>,
+) -> Result<SchemaDef> {
     let request = Request::DefView {
         branch: branch.map(str::to_string),
     };
-    match borg_protocol::client::ask(socket, registry, &request)? {
+    match borg_protocol::client::ask(address, registry, &request)? {
         Response::Defs(schema) => Ok(schema),
         Response::Error { message } => Err(BorgError::Storage(message)),
         other => Err(BorgError::Storage(format!(
-            "{}: expected definitions, got {other:?}",
-            socket.display()
+            "{address}: expected definitions, got {other:?}"
         ))),
     }
 }

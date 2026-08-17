@@ -53,6 +53,14 @@ pub mod client;
 /// `borg` CLI and `borg-server` already depend on.
 pub mod url;
 
+/// **The WebSocket transport.** SPEC.md §17.4, §17.6.
+///
+/// One protocol, the other framing: a WebSocket is already message-framed, so the per-codec framing
+/// above disappears there rather than being wrapped. Here because the framing decision is the
+/// protocol's and both the client half (`client::ask`) and the server half (`borg_server::serve`)
+/// have to make it identically.
+pub mod ws;
+
 pub const VERSION: u32 = 1;
 
 /// How messages are encoded on the wire.
@@ -414,17 +422,46 @@ pub enum ProtocolError {
 
 type Result<T> = std::result::Result<T, ProtocolError>;
 
-/// Write one framed message.
-pub fn write_message<T: Serialize, W: Write>(out: &mut W, codec: Codec, message: &T) -> Result<()> {
+/// One message's **bytes**, in `codec`, with no framing around them.
+///
+/// Split out from [`write_message`] when the WebSocket transport arrived (SPEC.md §17.4): a
+/// WebSocket is already message-framed, so a peer there needs the encoding without the newline or
+/// the length prefix — and wrapping a framed stream inside a framed transport would put two
+/// delimiters around one message and make the outer one carry a delimiter nobody reads. So framing
+/// is a layer above this, present over a byte stream and absent over a message stream, and the
+/// *encoding* is shared whole.
+pub fn encode_message<T: Serialize>(codec: Codec, message: &T) -> Result<Vec<u8>> {
     match codec {
         Codec::Json => {
-            let line = serde_json::to_string(message)
-                .map_err(|e| ProtocolError::Encoding(e.to_string()))?;
-            writeln!(out, "{line}")?;
+            serde_json::to_vec(message).map_err(|e| ProtocolError::Encoding(e.to_string()))
         }
         Codec::Msgpack => {
-            let body = rmp_serde::to_vec_named(message)
-                .map_err(|e| ProtocolError::Encoding(e.to_string()))?;
+            rmp_serde::to_vec_named(message).map_err(|e| ProtocolError::Encoding(e.to_string()))
+        }
+    }
+}
+
+/// The other half of [`encode_message`]: one message's bytes, back into the message.
+pub fn decode_message<T: for<'de> Deserialize<'de>>(codec: Codec, body: &[u8]) -> Result<T> {
+    match codec {
+        Codec::Json => serde_json::from_slice(body).map_err(|e| {
+            ProtocolError::Encoding(format!("{e} in `{}`", String::from_utf8_lossy(body)))
+        }),
+        Codec::Msgpack => {
+            rmp_serde::from_slice(body).map_err(|e| ProtocolError::Encoding(e.to_string()))
+        }
+    }
+}
+
+/// Write one framed message.
+pub fn write_message<T: Serialize, W: Write>(out: &mut W, codec: Codec, message: &T) -> Result<()> {
+    let body = encode_message(codec, message)?;
+    match codec {
+        Codec::Json => {
+            out.write_all(&body)?;
+            out.write_all(b"\n")?;
+        }
+        Codec::Msgpack => {
             let len = u32::try_from(body.len())
                 .map_err(|_| ProtocolError::Encoding("message too large".into()))?;
             out.write_all(&len.to_be_bytes())?;
@@ -454,8 +491,7 @@ pub fn read_message<T: for<'de> Deserialize<'de>, R: BufRead>(
                     break;
                 }
             }
-            serde_json::from_str(line.trim())
-                .map_err(|e| ProtocolError::Encoding(format!("{e} in `{}`", line.trim())))
+            decode_message(Codec::Json, line.trim().as_bytes())
         }
         Codec::Msgpack => {
             let mut len = [0u8; 4];
@@ -468,7 +504,7 @@ pub fn read_message<T: for<'de> Deserialize<'de>, R: BufRead>(
             }
             let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
             input.read_exact(&mut body)?;
-            rmp_serde::from_slice(&body).map_err(|e| ProtocolError::Encoding(e.to_string()))
+            decode_message(Codec::Msgpack, &body)
         }
     }
 }

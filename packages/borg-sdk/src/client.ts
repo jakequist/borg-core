@@ -49,22 +49,32 @@
  */
 
 import {
-  borgSocket,
+  addressText,
+  borgAddress,
   dialBorgServer,
+  dialBorgWebSocket,
   parseBorgUrl,
   URL_ENV,
+  type BorgAddress,
   type BorgUrl,
 } from "./connection.js";
-import { BorgProtocolError, LineStream, type MessageStream } from "./lines.js";
-import type {
-  BranchInfo,
-  ClientHello,
-  Request,
-  Response,
-  ServerHello,
-  WireEnvelope,
-  WireLineage,
-  WireSchemaDef,
+import {
+  BorgProtocolError,
+  LineStream,
+  WebSocketStream,
+  type MessageStream,
+} from "./lines.js";
+import {
+  CLIENT_PROTOCOL_VERSION,
+  type BranchInfo,
+  type ClientHello,
+  type HelloAck,
+  type Request,
+  type Response,
+  type ServerHello,
+  type WireEnvelope,
+  type WireLineage,
+  type WireSchemaDef,
 } from "./client-protocol.js";
 import { TOMBSTONE, type AnyFieldType, type FieldType, type RefText } from "./values.js";
 
@@ -94,6 +104,7 @@ export {
   BorgUrlError,
   parseBorgUrl,
   wellKnownSocket,
+  type BorgAddress,
   type BorgUrl,
 } from "./connection.js";
 export type {
@@ -494,7 +505,7 @@ export interface BorgContext {
 
 // --- The implementation -------------------------------------------------------------------------------
 
-type Wire = MessageStream<Response | ServerHello, Request | ClientHello>;
+type Wire = MessageStream<Response | ServerHello | HelloAck, Request | ClientHello>;
 
 /**
  * Connect to a `borg-server` and complete the handshake.
@@ -516,7 +527,7 @@ export async function createBorgContext(options: BorgContextOptions): Promise<Bo
 }
 
 /** Where a set of options says to connect, and which registry to name. */
-function whereToConnect(options: BorgContextOptions): { socket: string; registry: string | undefined } {
+function whereToConnect(options: BorgContextOptions): Endpoint {
   const env = options.env ?? process.env;
   if (options.url !== undefined && options.socket !== undefined) {
     throw new BorgClientError(
@@ -532,7 +543,10 @@ function whereToConnect(options: BorgContextOptions): { socket: string; registry
     return connectionOf(parseBorgUrl(options.url), env);
   }
   if (options.socket !== undefined) {
-    return { socket: options.socket, registry: options.registry };
+    return {
+      address: { kind: "unix", path: options.socket },
+      registry: options.registry,
+    };
   }
   const ambient = env[URL_ENV];
   if (ambient === undefined || ambient === "") {
@@ -544,11 +558,14 @@ function whereToConnect(options: BorgContextOptions): { socket: string; registry
   return connectionOf(parseBorgUrl(ambient), env);
 }
 
-function connectionOf(
-  url: BorgUrl,
-  env: NodeJS.ProcessEnv,
-): { socket: string; registry: string | undefined } {
-  return { socket: borgSocket(url, env), registry: url.registry ?? undefined };
+/** Where a context connects and which registry it names. */
+interface Endpoint {
+  readonly address: BorgAddress;
+  readonly registry: string | undefined;
+}
+
+function connectionOf(url: BorgUrl, env: NodeJS.ProcessEnv): Endpoint {
+  return { address: borgAddress(url, env), registry: url.registry ?? undefined };
 }
 
 /**
@@ -564,23 +581,20 @@ function connectionOf(
  * must not be re-sent. The redial happens for the *next* operation, which the caller chose to make.
  */
 class Session {
-  readonly #address: { socket: string; registry: string | undefined };
+  readonly #endpoint: Endpoint;
   readonly #clientVersion: string | undefined;
   #wire: Wire | null = null;
   /** A dial in progress, so two concurrent operations open one socket rather than two. */
   #dialling: Promise<Wire> | null = null;
   #closed = false;
 
-  constructor(
-    address: { socket: string; registry: string | undefined },
-    clientVersion: string | undefined,
-  ) {
-    this.#address = address;
+  constructor(endpoint: Endpoint, clientVersion: string | undefined) {
+    this.#endpoint = endpoint;
     this.#clientVersion = clientVersion;
   }
 
   get address(): string {
-    return this.#address.socket;
+    return addressText(this.#endpoint.address);
   }
 
   get connected(): boolean {
@@ -621,9 +635,23 @@ class Session {
     return this.#dialling;
   }
 
+  /**
+   * **One connection, over whichever transport the address named**, and the identical handshake on
+   * both. A unix socket frames per line; a WebSocket is framed already (`./lines.ts`). Nothing below
+   * this method can tell which it got, which is what makes the reconnect story one story.
+   */
+  async #open(): Promise<Wire> {
+    const address = this.#endpoint.address;
+    if (address.kind === "ws") {
+      const socket = await dialBorgWebSocket(address.url);
+      return new WebSocketStream(socket, "the server");
+    }
+    const socket = await dialBorgServer(address.path);
+    return new LineStream(socket, socket, () => socket.end(), "the server");
+  }
+
   async #dial(): Promise<Wire> {
-    const socket = await dialBorgServer(this.#address.socket);
-    const wire: Wire = new LineStream(socket, socket, () => socket.end(), "the server");
+    const wire = await this.#open();
 
     const hello = await wire.receive();
     if (hello === null) throw new BorgProtocolError("the server hung up before saying hello");
@@ -632,20 +660,42 @@ class Session {
         `the server's opening message was not a hello: ${stringify(hello)}`,
       );
     }
-    const reply: ClientHello = { version: hello.version, codec: "json" };
+    // **This client's own version, not the server's echoed back** (§17.5). Echoing would make the
+    // client claim to speak whatever it was told, which is the one claim a version exists to check.
+    const reply: ClientHello = { version: CLIENT_PROTOCOL_VERSION, codec: "json" };
     if (this.#clientVersion !== undefined) reply.client_version = this.#clientVersion;
     // **The registry is settled here, once per connection** (§17.6) — which is exactly why a
     // reconnect has to re-handshake rather than merely re-open: a new socket that skipped this
     // would be a connection to a server with no idea which store it is for.
-    if (this.#address.registry !== undefined) reply.registry = this.#address.registry;
+    if (this.#endpoint.registry !== undefined) reply.registry = this.#endpoint.registry;
     wire.send(reply);
+
+    // **And the server answers, before a request goes out.** This is what closes the deviation the
+    // SDK used to carry: a registry the server does not host, or a protocol it does not speak, is a
+    // refusal *here*, so `createBorgContext` fails where the connection was configured rather than
+    // at whichever line happened to make the first call. A reconnect re-runs it, so a context whose
+    // registry was deleted under it fails on its next operation and says why.
+    const ack = await wire.receive();
+    if (ack === null) {
+      throw new BorgProtocolError("the server hung up without acknowledging the handshake");
+    }
+    if (typeof ack === "object" && "refused" in ack) {
+      wire.close();
+      throw new BorgClientError(ack.refused.reason);
+    }
+    if (typeof ack !== "object" || !("accepted" in ack)) {
+      wire.close();
+      throw new BorgProtocolError(
+        `the server did not acknowledge the handshake: ${stringify(ack)}`,
+      );
+    }
     return wire;
   }
 
   /** One request, one reply, with `error` turned into a throw and `conflict` optionally allowed. */
   async ask(request: Request, options?: { conflicts: boolean }): Promise<Response> {
     const wire = await this.#connection();
-    let reply: Response | ServerHello | null;
+    let reply: Response | ServerHello | HelloAck | null;
     try {
       reply = await wire.request(request);
     } catch (err) {
@@ -653,13 +703,13 @@ class Session {
       // The framing layer's own words, rewritten to say what a caller has to decide about: the
       // socket is gone, this operation was not retried, and the next one will reconnect.
       throw new BorgDisconnectedError(
-        this.#address.socket,
+        this.address,
         err instanceof Error ? err.message : String(err),
       );
     }
     if (reply === null) {
       this.#drop(wire);
-      throw new BorgDisconnectedError(this.#address.socket, "the server hung up");
+      throw new BorgDisconnectedError(this.address, "the server hung up");
     }
     if ("error" in reply) throw new BorgClientError(reply.error.message);
     if ("conflict" in reply && options?.conflicts !== true) {
@@ -949,7 +999,7 @@ type Payload<K extends string> =
   Extract<Response, Record<K, unknown>> extends Record<K, infer V> ? V : never;
 
 /** The reply this request has to have had, or a protocol error naming what came instead. */
-function expect<K extends string>(reply: Response | ServerHello, key: K): Payload<K> {
+function expect<K extends string>(reply: Response | ServerHello | HelloAck, key: K): Payload<K> {
   if (key in reply) {
     return (reply as Record<K, Payload<K>>)[key];
   }

@@ -41,6 +41,7 @@ use borg_host::host::{self, Host, LOG_FILE, PID_FILE};
 use borg_host::ops::Ops;
 use borg_host::serving;
 use borg_protocol::client::{Request, Response};
+use borg_protocol::url::Address;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -71,13 +72,18 @@ fn how_to_start(data_dir: &Path) -> String {
 }
 
 /// Run the server in this process. What `--foreground` does, and what the backgrounded child is.
-pub async fn foreground(data_dir: &Path, socket: &Path, base: &Ops) -> Result<()> {
+pub async fn foreground(
+    data_dir: &Path,
+    socket: &Path,
+    base: &Ops,
+    websockets: &[String],
+) -> Result<()> {
     let host = Host::open(data_dir, socket)?;
-    crate::serve::run(&host, base).await
+    crate::serve::run(&host, base, websockets).await
 }
 
 /// Start a server in the background: re-exec, wait for it to answer, write the pidfile.
-pub fn background(data_dir: &Path, socket: &Path) -> Result<()> {
+pub fn background(data_dir: &Path, socket: &Path, websockets: &[String]) -> Result<()> {
     if serving::is_listening(socket) {
         return Err(BorgError::Storage(format!(
             "something is already listening on {} — `borg-server status` will say what",
@@ -101,13 +107,20 @@ pub fn background(data_dir: &Path, socket: &Path) -> Result<()> {
 
     let exe = std::env::current_exe()
         .map_err(|err| BorgError::Storage(format!("cannot find borg-server: {err}")))?;
-    let mut child = Command::new(exe)
+    let mut child = Command::new(exe);
+    let child = child
         .arg("start")
         .arg("--foreground")
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--socket")
-        .arg(socket)
+        .arg(socket);
+    // Passed through, because the backgrounded server *is* an ordinary `--foreground` one and a
+    // flag that survived only in the foreground case would be a second lifecycle.
+    for address in websockets {
+        child.arg("--listen").arg(address);
+    }
+    let mut child = child
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(errs)
@@ -241,7 +254,11 @@ pub struct Status {
 /// being asked about is on another machine. `borg_protocol::client::ask` is the thirty lines that
 /// takes, shared with the CLI's two socket commands so there is one handshake and not three.
 pub fn status(data_dir: &Path, socket: &Path) -> Status {
-    let registries = match borg_protocol::client::ask(socket, None, &Request::Registries {}) {
+    let registries = match borg_protocol::client::ask(
+        &Address::Unix(socket.into()),
+        None,
+        &Request::Registries {},
+    ) {
         Ok(Response::Registries(hosted)) => Some(hosted),
         _ => None,
     };
@@ -263,7 +280,7 @@ pub fn status(data_dir: &Path, socket: &Path) -> Status {
 pub async fn create(data_dir: &Path, socket: &Path, name: &str, base: &Ops) -> Result<bool> {
     if serving::is_listening(socket) {
         return match borg_protocol::client::ask(
-            socket,
+            &Address::Unix(socket.into()),
             None,
             &Request::RegistryCreate {
                 name: name.to_string(),

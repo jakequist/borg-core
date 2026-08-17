@@ -44,6 +44,15 @@ rmp-serde = "1"
 # cryptographic hash, and hand-rolling one is not a decision anybody should take.
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# RFC 6455, blocking, and no TLS at all. The browser is the client the WebSocket transport exists
+# for (§17.6), so the peer masks, fragments, interleaves control frames and closes on its own
+# schedule whether or not a hand-rolled reader expected it to — that is somebody else's wire, and
+# the one class of thing this workspace should not be writing itself. `default-features = false`
+# drops every TLS backend, which makes "TLS is terminated by a proxy" a property of the binary
+# rather than a sentence in a document; `handshake` is the only feature taken. Blocking rather than
+# `tokio-tungstenite` because the serve loop is thread-per-connection and synchronous, and the async
+# form would mean a second framing implementation on the server.
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -14,3 +14,4 @@ serde.workspace = true
 serde_json.workspace = true
 rmp-serde.workspace = true
 thiserror.workspace = true
+tungstenite.workspace = true

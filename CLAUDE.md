@@ -17,8 +17,9 @@ cargo fmt
 ```
 
 There are **two binaries**: `borg` (the client, `crates/borg-cli`) and `borg-server` (the server,
-`crates/borg-server`). Scenarios 250, 260, 270, 280, 300 and 310 start a real server, so both have to be
-built before `run-all.sh`; `check.sh` builds both.
+`crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310 and 330 start a real server, so both have to be
+built before `run-all.sh`; `check.sh` builds both. 330 also needs a free TCP port, because it starts
+a server listening on a WebSocket as well as on its socket.
 
 ```
 cd packages/borg-sdk && pnpm install && pnpm run check          # typecheck, vitest, build
@@ -55,8 +56,10 @@ crates/borg-exec            ExecutionProvider + ProducerCtx traits
 crates/borg-exec-native     in-process Rust producers
 crates/borg-exec-process    subprocess producers, over stdio or a unix socket
 crates/borg-protocol        the worker wire contract; `client.rs` is the client one (§17.5) and
-                            holds the thirty-line `ask` every Rust caller speaks it with; `url.rs`
-                            is the connection-url parser a client is configured from (§17.7)
+                            holds the thirty-line `ask` every Rust caller speaks it with, plus the
+                            hello acknowledgement; `url.rs` is the connection-url parser a client is
+                            configured from (§17.7); `ws.rs` is the WebSocket framing both ends
+                            share and the Rust client's dial
 crates/borg-engine          log, branches, defs, derivation, resolver, registry
 crates/borg-host            what it takes to *host* a store, shared by both binaries: `ops.rs` is
                             what the commands do, `push.rs` is `repo push`, `sidecar.rs` the files
@@ -68,15 +71,18 @@ crates/borg-cli             the `borg` binary — argv and printing over `borg-h
                             `generate` and `repo push` are the two commands that take a `--url`
                             and speak to a server instead (§17.7); the rest take `--store`
 crates/borg-server          the `borg-server` binary — `serve.rs` is `borg-host`'s ops over a
-                            socket and `lifecycle.rs` is start/stop/status/logs; `status` and
-                            `create` are clients of the server they administer, over
-                            `borg_protocol::client::ask`
+                            socket *and* over a WebSocket (`Transport`/`Peer` is the seam, and
+                            `GET /health` is the one HTTP endpoint), and `lifecycle.rs` is
+                            start/stop/status/logs; `status` and `create` are clients of the server
+                            they administer, over `borg_protocol::client::ask`
 packages/borg-sdk           the TypeScript SDK. Two entry points, deliberately opposite: `borg-sdk`
                             is the author-side DSL and the worker protocol, `borg-sdk/client` is
                             the consumer-side client over `borg-server`. `values.ts` is the one
-                            conversion table both use, `lines.ts` the one framing, and
-                            `connection.ts` the url parser — the same table as `borg-protocol`'s,
-                            in the other language — plus the dial and its reconnect (§17.7)
+                            conversion table both use, `lines.ts` the framing — a shared base with
+                            one subclass per transport, so the reconnect semantics cannot differ
+                            between them — and `connection.ts` the url parser (the same table as
+                            `borg-protocol`'s, in the other language) plus the dial, over a unix
+                            socket or the runtime's own `WebSocket`, and its reconnect (§17.7)
 packages/borg-sdk-py        the Python SDK: the pipeline half, and the neutrality gate on the
                             contract
 scenarios/                  end-to-end scenarios driving the real binaries; `ts-lib.sh` is the
@@ -274,18 +280,16 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
 - **`borg generate --watch` polls, because §17.5 has no server push.** One request, one response, in
   order; a subscription would be a change of shape rather than a field, so the loop asks for the def
   view every 400ms and rewrites the file when it moved. Recorded in SDK-DRAFT §4.4.
-- **A handshake the server rejects is answered and then hung up on immediately**, so a client that
-  writes its first request before reading may get an EPIPE that discards the answer it was racing.
-  The server also never acknowledges an accepted handshake, so a client cannot tell "accepted" from
-  "not answered yet" without asking something. The fix is a lingering close in `serve::Peer`, not a
-  retry in an SDK. **This is why a handshake that cannot be routed to a registry is not refused at
-  the handshake**: the error is remembered and handed to the first request that needs a registry,
-  which is a channel the client is definitely reading (`ROADMAP.md`, *The handshake names a
-  registry*). **What that costs a client is now observable rather than theoretical**:
-  `createBorgContext({url})` resolves happily against a registry the server does not host, and the
-  refusal arrives at the first operation. Asserted that way round in `scenarios/310` and in the
-  SDK's client suite, so that the cost is recorded where somebody deciding whether to revisit the
-  deviation will see it.
+- **A handshake naming *no* registry against a server hosting none or several is accepted, and the
+  ambiguity is reported by the first request that needs a store.** This is the residue of a
+  deviation that is otherwise closed: client protocol 2 answers every hello, so a hello that *names*
+  a registry the server does not host is refused at the handshake with the options listed. A hello
+  that names nothing has made no claim that could be wrong — and it is exactly the connection
+  `borg-server status` makes, since `registries` needs no store — so refusing it would make §17.6's
+  discovery escape hatch unreachable. The asymmetry is deliberate and is asserted in
+  `scenarios/300`, in `serve.rs`'s handshake tests and in the SDK's client suite. The rest of the
+  old entry here — the lost `EPIPE`, "accepted" being indistinguishable from "not answered yet" —
+  is fixed; `ROADMAP.md`, *The handshake is answered*.
 - **A client SDK's transparent reconnect is best-effort, and the honest path is the failing one.**
   A socket the peer has already closed is dropped *before* the next request is written, so an
   ordinary server bounce costs an idle client nothing — but that depends on the runtime having had a
@@ -294,6 +298,28 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   idempotent, so a commit whose answer was lost is indistinguishable from one that never arrived.
   `scenarios/310` asserts the failing case deliberately, by bouncing the server from inside a
   blocking call, because it is the case that is easy to stop testing once the happy one works.
+- **`borg-server` terminates no TLS and trusts no forwarded header.** It speaks plaintext `ws://`
+  and expects a proxy in front of it (§17.6); `tungstenite` is taken with `default-features = false`
+  so there is no TLS backend in the binary to reach by accident. Nothing in §17.5 is a function of
+  the client's address or scheme, so `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Real-IP` are all
+  read by nothing — trusting one would be a spoofable identity answering a question nobody asks, and
+  authentication is already reserved a field in `ClientHello`. `wss://` as a **listen** address is
+  refused by name rather than served in plaintext.
+- **A WebSocket listener answers its health probe on the accept thread**, with a two-second bound on
+  reading the request head. `Transport::accept` may only return a session, so a `GET /health` is
+  answered inside the accept loop and the loop goes round again; the bound is what stops a client
+  that connects and says nothing from stalling the listener rather than only itself. Widening
+  `accept` to return an `Option` would move that read nowhere, which is why it was not done.
+- **The TypeScript client SDK offers only JSON**, over both transports. MessagePack would buy a
+  dependency, and being dependency-free is what lets the package be dropped into anything; a binary
+  frame arriving is therefore reported rather than decoded. The Rust client and `borg-server` speak
+  both codecs on both transports.
+- **`borg+wss://` is dialled by the SDK and refused by the CLI**, and the asymmetry is per language
+  rather than per address. A browser or a node process gets TLS from the runtime's own `WebSocket`
+  for free; a Rust client would have to carry a certificate store to speak it, for a deployment
+  whose premise is that a proxy has already terminated. So the parser accepts it everywhere and
+  `borg_protocol::client::ask` refuses it at the dial, saying to point at the `ws://` the proxy
+  forwards to.
 - **The Python SDK has no client half and therefore no url parser.** It is the pipeline half and the
   neutrality gate on the worker contract (§17.4); nothing in it connects to a `borg-server`. The
   parser is one file per language that has a client, which today is Rust and TypeScript.

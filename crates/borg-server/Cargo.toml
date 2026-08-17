@@ -23,3 +23,7 @@ borg-protocol.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
 serde.workspace = true
 serde_json.workspace = true
+# The server half of the WebSocket transport — the same crate, the same version and the same
+# no-TLS features as `borg-protocol`'s client half, because the two ends of one wire must not be
+# two implementations of it. See the workspace manifest for why it is a dependency at all.
+tungstenite.workspace = true

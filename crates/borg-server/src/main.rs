@@ -22,7 +22,8 @@
 //! ## The commands
 //!
 //! ```text
-//! borg-server start [--foreground]     serve --data-dir; backgrounds unless told otherwise
+//! borg-server start [--foreground] [--listen ws://host:port]
+//!                                      serve --data-dir; backgrounds unless told otherwise
 //! borg-server stop                     SIGTERM, then wait for the socket to go quiet
 //! borg-server status                   the address, the pid, and what is hosted
 //! borg-server logs [-n N] [-f]         what a backgrounded server has printed
@@ -43,6 +44,8 @@ struct Args {
     data_dir: Option<PathBuf>,
     socket: Option<PathBuf>,
     foreground: bool,
+    /// `--listen ws://host:port`, repeatable. Beside the unix socket, never instead of it.
+    listen: Vec<String>,
     follow: bool,
     lines: usize,
     rest: Vec<String>,
@@ -53,7 +56,8 @@ fn usage() -> ! {
         "\
 borg-server — hosts a directory of borg registries
 
-  borg-server start [--foreground]      serve the data directory
+  borg-server start [--foreground] [--listen ws://host:port]
+                                        serve the data directory
   borg-server stop                      stop the server serving it
   borg-server status                    where it is listening and what it hosts
   borg-server logs [-n <count>] [-f]    what a backgrounded server has printed
@@ -64,6 +68,14 @@ name. The registry is the unit of tenancy — one advisory lock per store, one h
 registry anything has actually used, and one socket for all of them, because the client's handshake
 says which registry it is for. A handshake that names none gets the sole registry when there is
 exactly one, and is told the options when there is more than one.
+
+`--listen ws://0.0.0.0:7717` adds a WebSocket listener beside the unix socket — both at once, and
+the unix socket is always there because it is what every local `borg` invocation speaks. A
+WebSocket is what a browser can open and what rides an ordinary load balancer; that port also
+answers `GET /health` with the server version and how many registries are hosted, which is the one
+HTTP endpoint there is. TLS is **not** terminated here: put a proxy in front and forward plaintext
+ws:// to this port. The server trusts no forwarded header — nothing in the protocol is a function
+of the client's address, and authentication, when it exists, is a field in the handshake.
 
 `start` backgrounds by default and writes a pidfile and a log beside the registries. Use
 --foreground under a supervisor — systemd, docker, or a scenario — where staying in the foreground
@@ -83,6 +95,8 @@ Options:
   --data-dir <path>     the directory of registries to host (default ~/.borg)
   --socket <path>       where to listen (default: see above)
   --foreground          do not background; log to stdout
+  --listen <ws url>     also listen for websockets here (repeatable); port 0 binds an
+                        ephemeral one and the log names it
   -n, --lines <count>   `logs`: how many lines to show (default 50)
   -f, --follow          `logs`: keep printing as more arrives"
     );
@@ -95,6 +109,7 @@ fn parse_args() -> Args {
         data_dir: None,
         socket: None,
         foreground: false,
+        listen: Vec::new(),
         follow: false,
         lines: 50,
         rest: Vec::new(),
@@ -105,6 +120,10 @@ fn parse_args() -> Args {
             "--data-dir" => args.data_dir = raw.next().map(PathBuf::from),
             "--socket" => args.socket = raw.next().map(PathBuf::from),
             "--foreground" => args.foreground = true,
+            "--listen" => match raw.next() {
+                Some(address) => args.listen.push(address),
+                None => usage(),
+            },
             "-f" | "--follow" => args.follow = true,
             "-n" | "--lines" => {
                 args.lines = raw
@@ -146,10 +165,10 @@ async fn run(args: Args) -> Result<()> {
     let (data_dir, socket) = lifecycle::addresses(args.data_dir.clone(), args.socket.clone());
     match args.verb.as_str() {
         "start" if args.foreground => {
-            lifecycle::foreground(&data_dir, &socket, &base(&data_dir)).await
+            lifecycle::foreground(&data_dir, &socket, &base(&data_dir), &args.listen).await
         }
         "start" => {
-            lifecycle::background(&data_dir, &socket)?;
+            lifecycle::background(&data_dir, &socket, &args.listen)?;
             report_status(&lifecycle::status(&data_dir, &socket));
             Ok(())
         }

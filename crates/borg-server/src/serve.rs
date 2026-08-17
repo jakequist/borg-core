@@ -85,11 +85,27 @@
 //!
 //! ## Transport
 //!
-//! [`Transport`] and [`Peer`] exist so a WebSocket listener can slot in without touching the message
-//! layer (SDK-DRAFT §5): the *messages* are shared and only the framing differs — over a unix socket
-//! it is `borg_protocol`'s per-codec framing, over a WebSocket it would be the browser's own frames
-//! and `Codec` would not appear at all. The HTTP listener is deliberately **not** built here; the
-//! trait is the part that has to exist before the browser client, not the server.
+//! [`Transport`] and [`Peer`] exist so a WebSocket listener slots in without touching the message
+//! layer (SPEC.md §17.6): the *messages* are shared and only the framing differs — over a unix
+//! socket it is `borg_protocol`'s per-codec framing, over a WebSocket the frames are the transport's
+//! own and the framing layer disappears rather than being wrapped. Both are here now
+//! ([`UnixTransport`], [`WsTransport`]) and a server listens on both at once.
+//!
+//! **The unix socket is the local default and is always bound.** A WebSocket is what a browser can
+//! open and what rides a load balancer, and is bound only where `--listen ws://host:port` says so.
+//!
+//! **TLS is not here, and that is a deployment shape rather than an omission.** `borg-server` speaks
+//! plaintext `ws://` and expects a proxy — nginx, Caddy, an ALB — to terminate in front of it, which
+//! is what every other component of that deployment already expects; `tungstenite` is taken with no
+//! TLS backend at all so the binary cannot quietly grow one. **The server trusts no forwarded
+//! header**: not `X-Forwarded-For`, not `X-Forwarded-Proto`, not `X-Real-IP`. Nothing in §17.5 is a
+//! function of the client's address or scheme, so trusting one would be introducing a spoofable
+//! identity in order to answer a question nobody asks. When authentication arrives it arrives in
+//! `ClientHello::credential`, which is reserved for it and is on a channel a proxy does not write.
+//!
+//! One HTTP endpoint exists, on the WebSocket's port: `GET /health`, answering `200` with the
+//! server's version and how many registries it hosts. That is what a load balancer and a supervisor
+//! poll, and it is deliberately the *only* one — a second would be an API, and the API is §17.5.
 
 use borg_core::{BorgError, MergeRejection, Result};
 use borg_host::host::{Host, Slot};
@@ -97,11 +113,12 @@ use borg_host::ops::{self, Ops};
 use borg_host::render::struct_def;
 use borg_host::{push, serving};
 use borg_protocol::client::{
-    BranchInfo, ClientHello, Envelope, Lineage, LineageInput, RegistryInfo, Request, Response,
-    SchemaDef,
+    Accepted, BranchInfo, ClientHello, Envelope, HelloAck, Lineage, LineageInput, RegistryInfo,
+    Request, Response, SchemaDef,
 };
 use borg_protocol::{Codec, ProtocolError, ServerHello, negotiate};
 use std::io::BufReader;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -124,14 +141,46 @@ pub trait Transport {
 /// One connection, as typed messages.
 ///
 /// Deliberately typed rather than bytes. A unix peer frames per codec because that is what a shell
-/// client can read with `read` (SPEC.md §17.4); a WebSocket peer would frame natively and never
-/// mention [`Codec`] — so a byte-level trait would force one of the two to fake the other's framing.
+/// client can read with `read` (SPEC.md §17.4); a WebSocket peer frames natively and never mentions
+/// [`Codec`] in its framing at all — so a byte-level trait would force one of the two to fake the
+/// other's framing.
 pub trait Peer: Send {
     /// Greet the client and settle the codec. Returns what the client said about itself.
     fn hello(&mut self) -> std::result::Result<ClientHello, ProtocolError>;
+    /// The codec [`Peer::hello`] settled on. Named back to the client in the acknowledgement, from
+    /// the peer that decided it rather than from the string the client proposed — the two agree
+    /// today, and a negotiation that ever answers something other than what was asked for is
+    /// exactly when a client needs to be told.
+    fn codec(&self) -> Codec;
+    /// **Acknowledge an accepted handshake.** SPEC.md §17.5.
+    ///
+    /// Separate from [`Peer::hello`] because what goes in it — which registry the connection
+    /// settled on — is not the transport's to know: routing is [`session`]'s decision, taken
+    /// between reading the hello and answering it.
+    fn accept(&mut self, ack: &Accepted) -> std::result::Result<(), ProtocolError>;
+    /// **Refuse the handshake, and linger.** Consumes the peer, because there is nothing after it.
+    ///
+    /// Lingering is the whole point of the method existing rather than being a `send` and a drop: a
+    /// client that wrote its hello and its first request without waiting has bytes in flight, and
+    /// closing a socket with unread data in it sends a reset that discards *our* answer along with
+    /// them. So this stops writing, drains what the client sent, and only then lets go.
+    fn refuse(self: Box<Self>, reason: &str);
     fn recv(&mut self) -> std::result::Result<Request, ProtocolError>;
     fn send(&mut self, response: &Response) -> std::result::Result<(), ProtocolError>;
 }
+
+/// The server's opening word, which is the same on every transport.
+fn server_hello() -> ServerHello {
+    ServerHello {
+        version: borg_protocol::client::VERSION,
+        codecs: CODECS.iter().map(|c| c.name().to_string()).collect(),
+    }
+}
+
+/// How long a refused peer will wait for the client's in-flight bytes before giving up on being
+/// polite. Long enough for a request already on the wire, short enough that a client which stops
+/// talking cannot pin a thread.
+const LINGER: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub struct UnixTransport(UnixListener);
 
@@ -162,17 +211,46 @@ struct UnixPeer {
 
 impl Peer for UnixPeer {
     fn hello(&mut self) -> std::result::Result<ClientHello, ProtocolError> {
-        borg_protocol::write_message(
-            &mut self.writer,
-            Codec::Json,
-            &ServerHello {
-                version: borg_protocol::client::VERSION,
-                codecs: CODECS.iter().map(|c| c.name().to_string()).collect(),
-            },
-        )?;
+        borg_protocol::write_message(&mut self.writer, Codec::Json, &server_hello())?;
         let hello: ClientHello = borg_protocol::read_message(&mut self.reader, Codec::Json)?;
         self.codec = negotiate(&CODECS, &hello.codec)?;
         Ok(hello)
+    }
+
+    fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    fn accept(&mut self, ack: &Accepted) -> std::result::Result<(), ProtocolError> {
+        // JSON, like the two messages before it: a client reading the reply that names the
+        // negotiated codec cannot already be decoding in it.
+        borg_protocol::write_message(
+            &mut self.writer,
+            Codec::Json,
+            &HelloAck::Accepted(ack.clone()),
+        )
+    }
+
+    fn refuse(self: Box<Self>, reason: &str) {
+        let mut peer = *self;
+        let _ = borg_protocol::write_message(
+            &mut peer.writer,
+            Codec::Json,
+            &HelloAck::Refused {
+                reason: reason.to_string(),
+            },
+        );
+        // The lingering close, in three steps: stop writing so the client sees an orderly end,
+        // read whatever it had already sent so that closing sends a FIN rather than a reset, and
+        // bound the wait so a silent client cannot hold the thread.
+        let _ = peer.writer.shutdown(std::net::Shutdown::Write);
+        let _ = peer.writer.set_read_timeout(Some(LINGER));
+        let mut discard = [0u8; 4096];
+        while let Ok(read) = std::io::Read::read(&mut peer.writer, &mut discard) {
+            if read == 0 {
+                break;
+            }
+        }
     }
 
     fn recv(&mut self) -> std::result::Result<Request, ProtocolError> {
@@ -181,6 +259,316 @@ impl Peer for UnixPeer {
 
     fn send(&mut self, response: &Response) -> std::result::Result<(), ProtocolError> {
         borg_protocol::write_message(&mut self.writer, self.codec, response)
+    }
+}
+
+// --- The WebSocket transport ------------------------------------------------------------------------
+
+/// A TCP listener speaking WebSockets, and answering `GET /health` on the same port.
+///
+/// **It answers HTTP because it *is* HTTP**: a WebSocket is an upgraded HTTP request, so a listener
+/// that speaks one is already parsing the other, and refusing to answer a health probe on the port
+/// it is already listening on would make a supervisor open a second one.
+pub struct WsTransport {
+    listener: TcpListener,
+    host: Arc<Host>,
+    /// Read by the accept loop below, because [`Transport::accept`] may only return a *session* —
+    /// so a health probe is answered inside it and the loop goes round again, and something has to
+    /// tell that loop when to stop going round.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long a connection has to send its request line and headers. Bounded because this read
+/// happens on the accept thread: a client that connects and says nothing would otherwise stall the
+/// listener rather than only itself.
+const HEAD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+/// The largest request head this will read. A WebSocket upgrade is a few hundred bytes.
+const HEAD_LIMIT: usize = 16 * 1024;
+
+impl WsTransport {
+    /// Bind what `--listen` said. `ws://host:port`, and nothing else.
+    ///
+    /// The scheme is required rather than optional, because `--listen` is the flag that will one
+    /// day take a second kind of address and a bare `host:port` would have to be guessed at then.
+    /// **`wss://` is refused by name**: TLS is terminated by a proxy in front of this process
+    /// (§17.6), and a listener that silently spoke plaintext on a `wss://` address would be the
+    /// worst available outcome — an operator would believe the wire was encrypted.
+    pub fn bind(
+        address: &str,
+        host: Arc<Host>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<Self> {
+        let Some(authority) = address.strip_prefix("ws://") else {
+            return Err(std::io::Error::other(if address.starts_with("wss://") {
+                "this server does not terminate TLS — put a proxy in front of it and listen on \
+                 ws://, which is what the proxy forwards to"
+                    .to_string()
+            } else {
+                format!("`{address}` is not a listen address — try ws://0.0.0.0:7717")
+            }));
+        };
+        // A path would be a second place a registry could be named, and the handshake is the one
+        // place (§17.6). Refused rather than ignored, so nobody deploys a proxy rule against it.
+        let authority = match authority.split_once('/') {
+            Some((authority, "")) => authority,
+            Some(_) => {
+                return Err(std::io::Error::other(
+                    "a listen address is a host and a port — a websocket's path carries nothing, \
+                     because the registry is named in the handshake",
+                ));
+            }
+            None => authority,
+        };
+        Ok(Self {
+            listener: TcpListener::bind(authority)?,
+            host,
+            stop,
+        })
+    }
+
+    pub fn local_address(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// What `GET /health` answers: the server's version and how many registries it hosts.
+    ///
+    /// Registry *count* rather than names, and deliberately: a health endpoint is unauthenticated
+    /// and a registry name is tenancy. `registries` on §17.5 is where the names live, behind a
+    /// handshake that will one day carry a credential.
+    fn health(&self) -> String {
+        let body = format!(
+            r#"{{"status":"ok","server":"{}","registries":{}}}"#,
+            env!("CARGO_PKG_VERSION"),
+            self.host.names().len()
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+}
+
+impl Transport for WsTransport {
+    fn accept(&self) -> std::io::Result<Box<dyn Peer>> {
+        loop {
+            if self.stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let (mut stream, _) = self.listener.accept()?;
+            if self.stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(HEAD_PATIENCE));
+            let Some(head) = read_head(&mut stream) else {
+                continue;
+            };
+            if !is_upgrade(&head.text) {
+                // The one HTTP endpoint, and a 404 for everything else — a listener that answered
+                // anything else would be an API beside the API.
+                let answer = if head.text.starts_with("GET /health") {
+                    self.health()
+                } else {
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = std::io::Write::write_all(&mut stream, answer.as_bytes());
+                let _ = std::io::Write::flush(&mut stream);
+                continue;
+            }
+            // A session has no deadline; only the head did.
+            let _ = stream.set_read_timeout(None);
+            // `tungstenite` reads the request itself, and the request has already been read — so it
+            // is replayed rather than re-read. Everything consumed is replayed, including anything
+            // read past the blank line, which is why the head reader may buffer greedily.
+            match tungstenite::accept(Replayed {
+                head: head.bytes,
+                at: 0,
+                stream,
+            }) {
+                Ok(socket) => {
+                    return Ok(Box::new(WsPeer {
+                        socket,
+                        codec: Codec::Json,
+                    }));
+                }
+                // A handshake we could not complete is one connection's problem, not the
+                // listener's — an HTTP client that sent `Upgrade` and nothing else, or a scanner.
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+/// An HTTP request head, and every byte that was read to find it.
+struct Head {
+    text: String,
+    bytes: Vec<u8>,
+}
+
+/// Read up to the blank line that ends an HTTP request head. `None` if the peer went away, sent
+/// something that is not a head, or sent more than [`HEAD_LIMIT`].
+fn read_head(stream: &mut TcpStream) -> Option<Head> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = std::io::Read::read(stream, &mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if let Some(end) = find_blank_line(&bytes) {
+            return Some(Head {
+                text: String::from_utf8_lossy(&bytes[..end]).into_owned(),
+                bytes,
+            });
+        }
+        if bytes.len() > HEAD_LIMIT {
+            return None;
+        }
+    }
+}
+
+fn find_blank_line(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Whether a request head is asking for a WebSocket. Case-insensitive on both halves, because the
+/// header name is case-insensitive by RFC and browsers disagree with proxies about the value's case.
+fn is_upgrade(head: &str) -> bool {
+    head.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("upgrade")
+            && value.trim().eq_ignore_ascii_case("websocket")
+    })
+}
+
+/// A stream whose first bytes have already been read, replayed before the rest.
+///
+/// What it buys is being able to decide *what this connection is* before handing it to a library
+/// that wants to read it from the beginning — which is the whole of how one port carries both the
+/// protocol and a health endpoint.
+struct Replayed {
+    head: Vec<u8>,
+    at: usize,
+    stream: TcpStream,
+}
+
+impl std::io::Read for Replayed {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.at < self.head.len() {
+            let take = out.len().min(self.head.len() - self.at);
+            out[..take].copy_from_slice(&self.head[self.at..self.at + take]);
+            self.at += take;
+            return Ok(take);
+        }
+        std::io::Read::read(&mut self.stream, out)
+    }
+}
+
+impl Replayed {
+    /// Bound a read on the underlying socket. Used by the refusal path, where the drain is a read
+    /// on a peer that may never answer.
+    fn set_read_timeout(&self, patience: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(patience)
+    }
+}
+
+impl std::io::Write for Replayed {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut self.stream, data)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.stream)
+    }
+}
+
+struct WsPeer {
+    socket: tungstenite::WebSocket<Replayed>,
+    codec: Codec,
+}
+
+impl Peer for WsPeer {
+    fn hello(&mut self) -> std::result::Result<ClientHello, ProtocolError> {
+        self.socket
+            .send(borg_protocol::ws::frame(Codec::Json, &server_hello())?)
+            .map_err(|err| borg_protocol::ws::closed_or(&err))?;
+        let hello: ClientHello = self.read(Codec::Json)?;
+        self.codec = negotiate(&CODECS, &hello.codec)?;
+        Ok(hello)
+    }
+
+    fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    fn accept(&mut self, ack: &Accepted) -> std::result::Result<(), ProtocolError> {
+        self.write(Codec::Json, &HelloAck::Accepted(ack.clone()))
+    }
+
+    fn refuse(self: Box<Self>, reason: &str) {
+        let mut peer = *self;
+        let _ = peer.write(
+            Codec::Json,
+            &HelloAck::Refused {
+                reason: reason.to_string(),
+            },
+        );
+        // A WebSocket's lingering close is the protocol's own: a Close frame, and then reads until
+        // the peer answers with its own. `tungstenite` flushes the queued Close as it reads, so the
+        // refusal above is on the wire before this returns either way. Bounded like the unix path's
+        // drain, and for the same reason: a peer that never answers must not pin the thread.
+        let _ = peer
+            .socket
+            .get_ref()
+            .set_read_timeout(Some(borg_protocol::ws::GOODBYE));
+        let _ = peer.socket.close(None);
+        for _ in 0..64 {
+            if peer.socket.read().is_err() {
+                break;
+            }
+        }
+    }
+
+    fn recv(&mut self) -> std::result::Result<Request, ProtocolError> {
+        self.read(self.codec)
+    }
+
+    fn send(&mut self, response: &Response) -> std::result::Result<(), ProtocolError> {
+        self.write(self.codec, response)
+    }
+}
+
+impl WsPeer {
+    fn read<T: for<'de> serde::Deserialize<'de>>(
+        &mut self,
+        codec: Codec,
+    ) -> std::result::Result<T, ProtocolError> {
+        loop {
+            let message = self
+                .socket
+                .read()
+                .map_err(|err| borg_protocol::ws::closed_or(&err))?;
+            if borg_protocol::ws::is_close(&message) {
+                return Err(ProtocolError::Closed);
+            }
+            if let Some(body) = borg_protocol::ws::payload(&message) {
+                return borg_protocol::decode_message(codec, &body);
+            }
+        }
+    }
+
+    fn write<T: serde::Serialize>(
+        &mut self,
+        codec: Codec,
+        message: &T,
+    ) -> std::result::Result<(), ProtocolError> {
+        self.socket
+            .send(borg_protocol::ws::frame(codec, message)?)
+            .map_err(|err| borg_protocol::ws::closed_or(&err))
     }
 }
 
@@ -201,7 +589,12 @@ impl Drop for Lock {
 }
 
 /// Serve a data directory until the server is asked to stop.
-pub async fn run(host: &Arc<Host>, base: &Ops) -> Result<()> {
+///
+/// `websockets` is the `--listen ws://host:port` addresses, which are **in addition** to the unix
+/// socket and never instead of it: the local transport is what every `borg` invocation, every
+/// scenario and the advisory lock's liveness test already speak, and a server that could be told to
+/// stop speaking it would be a server a local developer could lock themselves out of.
+pub async fn run(host: &Arc<Host>, base: &Ops, websockets: &[String]) -> Result<()> {
     let socket = host.socket.clone();
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)
@@ -222,6 +615,31 @@ pub async fn run(host: &Arc<Host>, base: &Ops) -> Result<()> {
     // Whatever a dead server left behind. Removing it is safe precisely because the connect above
     // proved nothing is answering there.
     let _ = std::fs::remove_file(&socket);
+
+    // The stop flag is created before the websocket listeners because they hold it: a `WsTransport`
+    // answers health probes inside its own accept loop, so it is the one listener that has to be
+    // told when to stop going round.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // **Every other listener is bound before the unix socket is**, and that ordering is a race
+    // somebody has to lose. A socket becomes connectable the moment it is bound, and *connectable*
+    // is what `borg-server start`, `wait_for_socket` and the advisory lock's liveness test all
+    // mean by "up" — so a websocket bound afterwards would have a window in which the server is up
+    // and the port a client was told to use is not yet there. Binding it first closes the window.
+    let mut sockets = Vec::new();
+    for address in websockets {
+        match WsTransport::bind(address, Arc::clone(host), Arc::clone(&stop)) {
+            Ok(listener) => sockets.push(listener),
+            Err(err) => {
+                // **Refused rather than degraded.** A server that came up without the address it
+                // was told to listen on would answer a supervisor's health check on a port nobody
+                // asked it to use and be silently unreachable on the one they did.
+                host.release_all();
+                return Err(BorgError::Storage(format!(
+                    "cannot listen for websockets on {address}: {err}"
+                )));
+            }
+        }
+    }
 
     let listener = match UnixTransport::bind(&socket) {
         Ok(listener) => listener,
@@ -246,15 +664,28 @@ pub async fn run(host: &Arc<Host>, base: &Ops) -> Result<()> {
         socket.display(),
         registries_phrase(&host.names()),
     );
+    // The **resolved** address, which is not always the one that was asked for: `--listen
+    // ws://127.0.0.1:0` binds an ephemeral port, and a caller that cannot read the port back has no
+    // way to reach the server it just started. One line per listener, so a scenario or a supervisor
+    // greps the log rather than guessing.
+    let mut bound = Vec::new();
+    for listener in &sockets {
+        match listener.local_address() {
+            Ok(address) => {
+                eprintln!("listening for websockets on {address}");
+                bound.push(address);
+            }
+            Err(err) => eprintln!("a websocket listener would not name itself: {err}"),
+        }
+    }
 
     let served = Arc::new(Served {
         host: Arc::clone(host),
         base: base.clone(),
     });
 
-    // The accept loop is blocking (see `serve_on`), so waiting for a signal means being somewhere
-    // else while it runs.
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The accept loops are blocking (see `serve_on`), so waiting for a signal means being somewhere
+    // else while they run — one thread per listener, and they differ only in what they accept.
     let accepting = {
         let (served, stop) = (Arc::clone(&served), Arc::clone(&stop));
         // Captured here rather than looked up in the thread: `Handle::current` answers only from
@@ -262,6 +693,11 @@ pub async fn run(host: &Arc<Host>, base: &Ops) -> Result<()> {
         let handle = tokio::runtime::Handle::current();
         std::thread::spawn(move || serve_on(&listener, &served, &stop, &handle))
     };
+    for listener in sockets {
+        let (served, stop) = (Arc::clone(&served), Arc::clone(&stop));
+        let handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || serve_on(&listener, &served, &stop, &handle));
+    }
 
     await_shutdown().await;
 
@@ -282,6 +718,12 @@ pub async fn run(host: &Arc<Host>, base: &Ops) -> Result<()> {
     // listening on no longer exists.
     if UnixStream::connect(&socket).is_ok() {
         let _ = accepting.join();
+    }
+    // The websocket loops are woken the same way and for the same reason — an `accept` already
+    // blocked is not unblocked by a flag. Not joined: they hold nothing this process has to give
+    // back, and the unix loop above is the one whose lock files the next `borg` needs.
+    for address in bound {
+        let _ = TcpStream::connect(address);
     }
     // Open connections are threads we do not join: a client mid-request is holding a gate, and a
     // server that waited for every reader to hang up would not stop when told. The lock files and
@@ -378,13 +820,27 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
         // A codec we do not speak, or a hello we could not read. Refused *by name* — the handshake
         // is JSON whatever was going to be negotiated, so there is always a channel to say so on,
         // and a client left guessing why a socket went quiet is the worst outcome available.
-        Err(err) => {
-            let _ = peer.send(&Response::Error {
-                message: err.to_string(),
-            });
-            return;
-        }
+        Err(err) => return peer.refuse(&err.to_string()),
     };
+
+    // **A version this server cannot speak is refused, and version 1 in particular.** A version-1
+    // client writes its first request without waiting for an acknowledgement, so the ack would land
+    // where it expects a response and every answer after it would be one message out — silently.
+    // This refusal is deliverable precisely because the acknowledgement it is refusing over exists;
+    // that is what makes the break clean rather than a flag day.
+    if hello.version != borg_protocol::client::VERSION {
+        return peer.refuse(&format!(
+            "this server speaks client protocol {}, and the client said {} — {}",
+            borg_protocol::client::VERSION,
+            hello.version,
+            if hello.version < borg_protocol::client::VERSION {
+                "protocol 2 answers every hello before the first request, which protocol 1 does not \
+                 wait for; upgrade the client"
+            } else {
+                "upgrade the server"
+            }
+        ));
+    }
 
     // The def-layer the client's generated code was built from (§5.4, SDK-DRAFT §2.4). Absent means
     // "the branch as it stands", which is what an un-generated client honestly is — the same default
@@ -392,13 +848,10 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
     let version = match hello.client_version.as_deref().map(parse_layer) {
         Some(Some(layer)) => Some(layer),
         Some(None) => {
-            let _ = peer.send(&Response::Error {
-                message: format!(
-                    "client_version `{}` is not a layer id — try L7",
-                    hello.client_version.unwrap_or_default()
-                ),
-            });
-            return;
+            return peer.refuse(&format!(
+                "client_version `{}` is not a layer id — try L7",
+                hello.client_version.unwrap_or_default()
+            ));
         }
         None => None,
     };
@@ -412,14 +865,40 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
         ..served.base.clone()
     };
 
-    // **Routing is settled here and remembered — and a failure to route is remembered too.** A
-    // handshake naming nothing against a two-registry server cannot be honoured, and the answer is a
-    // sentence naming the options; what there is nowhere to put is that sentence *now*. The server
-    // does not acknowledge an accepted hello (it has nothing to say), so a client is not reading at
-    // this point, and one that were could not tell a refusal from an answer. So the error is kept
-    // and handed to the first request that needs a registry — which is every request except
-    // `registries`, and that exception is what lets a misrouted client find out what to name.
+    // **Routing is settled here, in the handshake, and the two outcomes are not symmetric.**
+    //
+    // A hello that *names* a registry has made a claim, and a claim this server cannot honour is
+    // refused at the handshake — which is what it always should have been (`ROADMAP.md`, *The
+    // handshake names a registry*) and could not be until there was an acknowledgement to refuse
+    // over. The cost of the old deferral was visible from the SDK: `createBorgContext({url})`
+    // resolved happily against a registry the server does not host.
+    //
+    // A hello that names *nothing* has made no claim that could be wrong. Against a server hosting
+    // exactly one registry it settles on that one and the acknowledgement says which — news, for a
+    // client that never asked. Against a server hosting none or several it settles on nothing and
+    // is still accepted, because that is precisely the connection an administrative client makes:
+    // `borg-server status` asks `registries`, which needs no store, and refusing it at the
+    // handshake would leave a misrouted client with no way to find out what to name. The ambiguity
+    // is then reported by the first request that needs a store, naming the options.
     let target = served.host.route(hello.registry.as_deref());
+    let settled = match (&target, hello.registry.as_deref()) {
+        (Ok(slot), _) => Some(slot.name.clone()),
+        (Err(err), Some(_)) => return peer.refuse(&err.to_string()),
+        (Err(_), None) => None,
+    };
+
+    let codec = peer.codec().name().to_string();
+    if peer
+        .accept(&Accepted {
+            version: borg_protocol::client::VERSION,
+            server: env!("CARGO_PKG_VERSION").to_string(),
+            codec,
+            registry: settled,
+        })
+        .is_err()
+    {
+        return;
+    }
 
     loop {
         let request = match peer.recv() {
@@ -1356,6 +1835,337 @@ mod tests {
         // The server's opening word is JSON whatever was chosen, or the client could not read it.
         let opening = String::from_utf8_lossy(&from_server);
         assert!(opening.starts_with('{'), "{opening}");
+    }
+
+    // --- The handshake, over real transports ---------------------------------------------------
+
+    /// A listener of the given kind, answering sessions in threads, exactly as [`run`] arranges it.
+    ///
+    /// Real sockets rather than a pair of buffers, because everything this section asserts is about
+    /// what happens *to a connection*: an acknowledgement arriving before a request is written, a
+    /// refusal surviving a client that wrote first, a close that lingers. None of that is
+    /// observable in a `Cursor`.
+    fn listening(host: &Arc<Host>, dir: &Path, name: &str) -> PathBuf {
+        let socket = dir.join(name);
+        let listener = UnixTransport::bind(&socket).unwrap();
+        let served = Arc::new(Served::new(Arc::clone(host), base_for(dir)));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || serve_on(&listener, &served, &stop, &handle));
+        socket
+    }
+
+    fn listening_ws(host: &Arc<Host>, dir: &Path) -> u16 {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Port 0: an ephemeral one, read back below. The same thing `--listen ws://127.0.0.1:0`
+        // does, which is what makes a test and a scenario able to run several servers at once.
+        let listener = WsTransport::bind("ws://127.0.0.1:0", Arc::clone(host), stop).unwrap();
+        let port = listener.local_address().unwrap().port();
+        let served = Arc::new(Served::new(Arc::clone(host), base_for(dir)));
+        let handle = tokio::runtime::Handle::current();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::spawn(move || serve_on(&listener, &served, &stop, &handle));
+        port
+    }
+
+    /// A hello of this shape, and whatever the server said back.
+    fn greet(socket: &Path, hello: &ClientHello) -> HelloAck {
+        let stream = UnixStream::connect(socket).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let _: ServerHello = borg_protocol::read_message(&mut reader, Codec::Json).unwrap();
+        borg_protocol::write_message(&mut writer, Codec::Json, hello).unwrap();
+        borg_protocol::read_message(&mut reader, Codec::Json).unwrap()
+    }
+
+    fn hello_naming(registry: Option<&str>) -> ClientHello {
+        ClientHello {
+            version: borg_protocol::client::VERSION,
+            client_version: None,
+            codec: "json".into(),
+            registry: registry.map(str::to_string),
+            credential: None,
+        }
+    }
+
+    /// **Every accepted hello is answered, and the answer says what was settled.** SPEC.md §17.5.
+    ///
+    /// For two milestones this message did not exist, and *accepted* was therefore indistinguishable
+    /// from *not answered yet*. The `registry` field is the half that is news rather than
+    /// confirmation: a client that named nothing against a one-registry server learns which store it
+    /// is talking to without asking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_handshake_is_acknowledged_and_names_what_it_settled() {
+        let dir = temp_dir("ack");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "ack.sock");
+
+        let HelloAck::Accepted(ack) = greet(&socket, &hello_naming(Some("crm"))) else {
+            panic!("a hello naming a registry this server hosts must be accepted")
+        };
+        assert_eq!(ack.version, borg_protocol::client::VERSION);
+        assert_eq!(
+            ack.codec, "json",
+            "the codec that was negotiated, named back"
+        );
+        assert_eq!(ack.server, env!("CARGO_PKG_VERSION"));
+        assert_eq!(ack.registry.as_deref(), Some("crm"));
+
+        // Nothing named, one registry hosted: the server resolves it and *says which*.
+        let HelloAck::Accepted(ack) = greet(&socket, &hello_naming(None)) else {
+            panic!("a hello naming nothing against a sole registry must be accepted")
+        };
+        assert_eq!(
+            ack.registry.as_deref(),
+            Some("crm"),
+            "the resolved registry is news to a client that never named one"
+        );
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **Routing happens in the handshake, and a registry that is not hosted is refused there.**
+    ///
+    /// This is the deviation closing (`ROADMAP.md`, *The handshake names a registry*). The refusal
+    /// used to be deferred to the first request that needed a registry, because there was no
+    /// acknowledgement to deliver it on — and the observable cost was that an SDK's
+    /// `createBorgContext` resolved happily against a store that does not exist.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registry_this_server_does_not_host_is_refused_at_the_handshake() {
+        let dir = temp_dir("refuse");
+        let host = host_with(&dir, &["crm", "analytics"]).await;
+        let socket = listening(&host, &dir, "refuse.sock");
+
+        let HelloAck::Refused { reason } = greet(&socket, &hello_naming(Some("nope"))) else {
+            panic!("a registry nobody hosts must be refused")
+        };
+        assert!(reason.contains("nope"), "{reason}");
+        assert!(
+            reason.contains("crm") && reason.contains("analytics"),
+            "the refusal names the options, so a client need not reconnect to discover them: \
+             {reason}"
+        );
+
+        // **And a hello naming *nothing* is accepted even at n≥2**, settling on no registry. It has
+        // made no claim that could be wrong, and it is exactly the connection `borg-server status`
+        // makes — `registries` needs no store, and refusing here would leave a misrouted client
+        // with nowhere to ask what to name. The ambiguity is reported by the first request that
+        // needs one.
+        let HelloAck::Accepted(ack) = greet(&socket, &hello_naming(None)) else {
+            panic!("an administrative connection must still be possible")
+        };
+        assert_eq!(ack.registry, None);
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **A client that writes before it reads still gets the refusal.** SPEC.md §17.5.
+    ///
+    /// The recorded failure: the server wrote its refusal and hung up immediately, so a client with
+    /// a request already in flight met a reset — and a reset discards the receive buffer, taking
+    /// the answer it was racing with it. The fix is a lingering close, and this is the only shape of
+    /// test that can see it, because the race is between our close and their write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_survives_a_client_that_wrote_its_request_without_waiting() {
+        let dir = temp_dir("linger");
+        let host = host_with(&dir, &["crm", "analytics"]).await;
+        let socket = listening(&host, &dir, "linger.sock");
+
+        for _ in 0..64 {
+            let stream = UnixStream::connect(&socket).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            // Not a line is read first — not even the `ServerHello`. Everything this client has to
+            // say goes out in one breath, which is what a naive SDK and a shell one-liner both do.
+            borg_protocol::write_message(&mut writer, Codec::Json, &hello_naming(Some("nope")))
+                .unwrap();
+            for _ in 0..8 {
+                let _ =
+                    borg_protocol::write_message(&mut writer, Codec::Json, &Request::BranchList {});
+            }
+
+            let mut said = String::new();
+            std::io::Read::read_to_string(&mut BufReader::new(stream), &mut said).unwrap();
+            assert!(
+                said.contains(r#""refused""#) && said.contains("nope"),
+                "the refusal was lost to the client's own write: {said}"
+            );
+        }
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **A protocol version this server does not speak is refused by name**, and version 1 in
+    /// particular — it writes its first request without waiting for an acknowledgement, so every
+    /// answer after the ack would be one message out. Silently, which is the failure a version
+    /// number exists to convert into a sentence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_protocol_version_this_server_does_not_speak_is_refused_by_name() {
+        let dir = temp_dir("version");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "version.sock");
+
+        for (claimed, needle) in [(1u32, "upgrade the client"), (99, "upgrade the server")] {
+            let mut hello = hello_naming(Some("crm"));
+            hello.version = claimed;
+            let HelloAck::Refused { reason } = greet(&socket, &hello) else {
+                panic!("version {claimed} should be refused")
+            };
+            assert!(reason.contains(needle), "{reason}");
+            assert!(reason.contains(&claimed.to_string()), "{reason}");
+        }
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The acknowledgement names the codec, and the **body** is then in it — which is the whole
+    /// reason the ack is JSON whatever was negotiated. A client decoding the ack in the codec it
+    /// asked for would have to be right before it was told.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ack_is_json_and_the_body_after_it_is_in_the_negotiated_codec() {
+        let dir = temp_dir("msgpack");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "msgpack.sock");
+
+        let stream = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let _: ServerHello = borg_protocol::read_message(&mut reader, Codec::Json).unwrap();
+        let mut hello = hello_naming(Some("crm"));
+        hello.codec = "msgpack".into();
+        borg_protocol::write_message(&mut writer, Codec::Json, &hello).unwrap();
+
+        let ack: HelloAck = borg_protocol::read_message(&mut reader, Codec::Json).unwrap();
+        let HelloAck::Accepted(ack) = ack else {
+            panic!("msgpack is a codec this server offers")
+        };
+        assert_eq!(ack.codec, "msgpack");
+
+        borg_protocol::write_message(&mut writer, Codec::Msgpack, &Request::BranchList {}).unwrap();
+        let answer: Response = borg_protocol::read_message(&mut reader, Codec::Msgpack).unwrap();
+        assert!(matches!(answer, Response::Branches(_)), "{answer:?}");
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **The same protocol over a WebSocket**, with the framing taken out and the transport's own
+    /// put in. Every claim above is a claim about the *session*, so what this asserts is that the
+    /// session cannot tell which transport it is on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_websocket_carries_the_identical_handshake_and_the_identical_answers() {
+        let dir = temp_dir("ws");
+        let host = host_with(&dir, &["crm", "analytics"]).await;
+        let port = listening_ws(&host, &dir);
+
+        let mut client = borg_protocol::ws::Client::dial("127.0.0.1", port).unwrap();
+        let _: ServerHello = client.recv(Codec::Json).unwrap();
+        client
+            .send(Codec::Json, &hello_naming(Some("crm")))
+            .unwrap();
+        let HelloAck::Accepted(ack) = client.recv::<HelloAck>(Codec::Json).unwrap() else {
+            panic!("a websocket handshake naming a hosted registry must be accepted")
+        };
+        assert_eq!(ack.registry.as_deref(), Some("crm"));
+        assert_eq!(ack.codec, "json");
+
+        client.send(Codec::Json, &Request::BranchList {}).unwrap();
+        let Response::Branches(branches) = client.recv::<Response>(Codec::Json).unwrap() else {
+            panic!("branch_list over a websocket answers branches")
+        };
+        assert_eq!(
+            branches
+                .iter()
+                .filter_map(|b| b.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["main"]
+        );
+        client.close();
+
+        // A refusal, over the transport whose close is a protocol message of its own.
+        let mut client = borg_protocol::ws::Client::dial("127.0.0.1", port).unwrap();
+        let _: ServerHello = client.recv(Codec::Json).unwrap();
+        client
+            .send(Codec::Json, &hello_naming(Some("nope")))
+            .unwrap();
+        let HelloAck::Refused { reason } = client.recv::<HelloAck>(Codec::Json).unwrap() else {
+            panic!("a registry nobody hosts is refused over a websocket too")
+        };
+        assert!(
+            reason.contains("nope") && reason.contains("crm"),
+            "{reason}"
+        );
+
+        // …and MessagePack, which is where the framing decision is visible: a binary frame rather
+        // than a length prefix inside a text one.
+        let mut client = borg_protocol::ws::Client::dial("127.0.0.1", port).unwrap();
+        let _: ServerHello = client.recv(Codec::Json).unwrap();
+        let mut hello = hello_naming(Some("crm"));
+        hello.codec = "msgpack".into();
+        client.send(Codec::Json, &hello).unwrap();
+        let HelloAck::Accepted(ack) = client.recv::<HelloAck>(Codec::Json).unwrap() else {
+            panic!("msgpack over a websocket")
+        };
+        assert_eq!(ack.codec, "msgpack");
+        client
+            .send(Codec::Msgpack, &Request::BranchList {})
+            .unwrap();
+        assert!(matches!(
+            client.recv::<Response>(Codec::Msgpack).unwrap(),
+            Response::Branches(_)
+        ));
+        client.close();
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **`GET /health`, and nothing else.** One HTTP endpoint on the WebSocket's port, for a load
+    /// balancer and a supervisor; a second would be an API beside the API, and the API is §17.5.
+    ///
+    /// The count rather than the names, because a health endpoint is unauthenticated and a registry
+    /// name is tenancy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_websocket_port_answers_one_http_endpoint() {
+        let dir = temp_dir("health");
+        let host = host_with(&dir, &["crm", "analytics"]).await;
+        let port = listening_ws(&host, &dir);
+
+        let get = |path: &str| {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            std::io::Write::write_all(
+                &mut stream,
+                format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+            let mut said = String::new();
+            std::io::Read::read_to_string(&mut stream, &mut said).unwrap();
+            said
+        };
+
+        let health = get("/health");
+        assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
+        assert!(health.contains("application/json"), "{health}");
+        assert!(health.contains(r#""registries":2"#), "{health}");
+        assert!(
+            health.contains(&format!(r#""server":"{}""#, env!("CARGO_PKG_VERSION"))),
+            "{health}"
+        );
+        assert!(
+            !health.contains("crm"),
+            "an unauthenticated endpoint does not name tenants: {health}"
+        );
+
+        assert!(
+            get("/").starts_with("HTTP/1.1 404"),
+            "one endpoint, not two"
+        );
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A repo whose one pipeline multiplies `headcount` by `factor` into `doubled`.

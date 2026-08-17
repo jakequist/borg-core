@@ -349,7 +349,7 @@ fn freshness(mode: Option<&str>) -> borg_core::FreshnessRequirement {
 /// `borg://` is resolved here rather than in the parser because the well-known address is
 /// `borg_host::host`'s to know (`borg_protocol::url::Transport::Local`).
 struct Dial {
-    socket: PathBuf,
+    address: borg_protocol::url::Address,
     /// The registry to name in the handshake. `None` is `None` on the wire — the server's n=1
     /// convenience and n≥2 refusal are one rule and live there (§17.6).
     registry: Option<String>,
@@ -361,7 +361,7 @@ fn dial(args: &Args) -> Result<Option<Dial>> {
     };
     let url = borg_protocol::url::ConnectionUrl::parse(text)?;
     Ok(Some(Dial {
-        socket: url.socket(&borg_host::host::well_known_socket()),
+        address: url.address(&borg_host::host::well_known_socket()),
         registry: url.registry,
     }))
 }
@@ -461,7 +461,7 @@ async fn run(args: Args) -> Result<()> {
                     lang: args.lang.clone(),
                     out,
                     watch: args.watch,
-                    socket: dialled.as_ref().map(|dial| dial.socket.clone()),
+                    address: dialled.as_ref().map(|dial| dial.address.clone()),
                     registry: dialled.as_ref().and_then(|dial| dial.registry.clone()),
                 },
             )
@@ -1121,12 +1121,12 @@ fn over_socket_push(args: &Args, dial: &Dial, dir: &str) -> Result<Vec<String>> 
         branch: args.ops.branch.clone(),
         path: Some(path),
     };
-    match borg_protocol::client::ask(&dial.socket, dial.registry.as_deref(), &request)? {
+    match borg_protocol::client::ask(&dial.address, dial.registry.as_deref(), &request)? {
         borg_protocol::client::Response::Pushed { report, .. } => Ok(report),
         borg_protocol::client::Response::Error { message } => Err(BorgError::Storage(message)),
         other => Err(BorgError::Storage(format!(
             "{}: expected a push report, got {other:?}",
-            dial.socket.display()
+            dial.address
         ))),
     }
 }

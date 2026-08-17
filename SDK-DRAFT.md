@@ -346,13 +346,21 @@ is better than one at first use. The `resolve` line is §4.4's envelope split.
      of shape and not a field. The loop polls the def view, which is at least the *right* thing to
      poll — head would rewrite the file on every data write. It is cheap and it is honest, and it is
      the first thing a subscription would replace.
-   - **A rejected handshake is answered and then hung up on, and whether the client sees the answer
-     is a race.** `serve::session` sends the error and returns, which closes the socket; a client that
-     writes its first request before reading gets an EPIPE that discards the very answer it was
-     racing. The server never acknowledges an *accepted* handshake either — it has nothing to say — so
-     a client cannot distinguish "accepted" from "not answered yet" except by asking something. The
-     fix is a lingering close on the server (write, shut down the write half, drain), which is work in
-     `Peer` and not in the SDK.
+   - ~~**A rejected handshake is answered and then hung up on, and whether the client sees the answer
+     is a race.**~~ **Fixed, in `Peer`, exactly where this said it belonged.** `serve::session` used
+     to send the error and return, which closes the socket; a client that wrote its first request
+     before reading got an EPIPE that discarded the very answer it was racing. And the server
+     acknowledged an *accepted* handshake with silence, so a client could not distinguish "accepted"
+     from "not answered yet" except by asking something.
+
+     Client protocol **2** answers every hello (`HelloAck`), and a refusal is followed by a lingering
+     close — write, shut down the write half, drain, bounded — which is the fix this entry named,
+     built where it named it: `Peer::accept` and `Peer::refuse`, and nothing in the SDK. The third
+     consequence was the one this entry did not connect: with no acknowledgement there was nowhere to
+     deliver a *routing* refusal either, so it was deferred to the first request and
+     `createBorgContext` resolved against registries that do not exist. All three closed at once,
+     because they were one missing message. `SPEC.md` §17.5 and `ROADMAP.md` (*The handshake is
+     answered*) carry it.
 5. **The two primitives an application needs and could not say** — `list` and `tx_create`. **Built.**
    `borg_protocol::client`'s `List` / `TxCreate`, `ops::list` / `ops::tx_create`, `borg list <Struct>`
    and `borg tx create <Struct>`, `bc.branch(n).list(Struct)` and `tx.create(Struct)` in the client
@@ -472,8 +480,25 @@ hash was not a hash of anything.
   should not be pointed at. Paging is not a parameter that can be bolted on: a cursor over a scan
   that re-runs at head is a different consistency story, and it belongs with the query layer or with
   streaming reads (`CLAUDE.md`, things left undone) rather than in front of them.
-- WebSocket server: in `borg-server` from day one or when the browser client lands? (Lean: the
-  transport trait supports it from day one; the actual HTTP listener lands with the browser work.)
+- ~~WebSocket server: in `borg-server` from day one or when the browser client lands?~~ **Answered
+  by the build**, and the lean turned out to be right for the wrong reason. The transport trait did
+  exist from day one and the HTTP listener did land later — but not with the browser work; it landed
+  with the *network*, because a WebSocket is what rides a load balancer as well as what a browser can
+  open, and the two arguments are the same argument.
+
+  What the trait bought is measurable: `Peer` needed two new methods and they are both the
+  *handshake* changing (`accept`/`refuse`), not the seam being wrong; `Transport::accept` did not
+  move. What the trait did not anticipate is that a WebSocket listener is also an HTTP listener —
+  `GET /health` is answered inside the accept loop, because `accept` may only return a session — and
+  that is recorded in `ROADMAP.md` (*Two transports, one protocol*) rather than fixed by widening the
+  return type, which would move the bounded header read nowhere.
+
+  On the client side the answer is that there is **one** SDK and not two: `lines.ts` grew a shared
+  base holding the queue, the ordering and the end-of-stream behaviour, and the two transports supply
+  only how a message becomes bytes. The connection suite runs twice against one server listening on
+  both, which is what makes "the reconnect guarantee is the connection's, not the transport's" a test
+  rather than a claim. `scenarios/330` is the same statement end to end, with S2's conflict split
+  across the two transports.
 - **How far does the CLI-over-socket wedge go?** `borg generate` now connects to the socket rather
   than being refused by it (§4.4), which is the first instance of §2.6's eventual shape. It was safe
   because generate only reads. The next candidates are `borg get` and `borg explain`, which are also

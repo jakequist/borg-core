@@ -12,6 +12,15 @@
  * with what `borg get` prints.
  */
 
+/**
+ * **The client protocol version this SDK speaks**, matching `borg_protocol::client::VERSION`.
+ *
+ * `2` is the one that answers every hello before the first request. It is stated rather than echoed
+ * from the `ServerHello`: echoing would make this client claim to speak whatever it was told, which
+ * is precisely the claim a version number exists to check.
+ */
+export const CLIENT_PROTOCOL_VERSION = 2;
+
 /** The server speaks first, and always in JSON. */
 export interface ServerHello {
   version: number;
@@ -28,12 +37,39 @@ export interface ClientHello {
    * the registry is what a connection is *to* — repeating it per message would put a tenancy
    * decision on every line.
    *
-   * **Absent means the server's sole registry, when it has exactly one**, and is refused with the
-   * options when it hosts more. That rule lives in the server and is deliberately not mirrored
-   * here: a client that guessed would be re-implementing half of it.
+   * **Absent means the server's sole registry, when it has exactly one**, and settles on nothing
+   * when it hosts more. That rule lives in the server and is deliberately not mirrored here: a
+   * client that guessed would be re-implementing half of it.
    */
   registry?: string;
 }
+
+/**
+ * **What the server says back to a hello.** SPEC.md §17.5, client protocol version 2.
+ *
+ * A version-1 server said nothing, so *accepted* and *not answered yet* were the same observation,
+ * and a registry the server does not host was discovered at whatever request happened to be first —
+ * which is why `createBorgContext` used to resolve against a store that did not exist. The client
+ * reads this before it writes a request, which is what makes a refusal deliverable at all.
+ */
+export type HelloAck =
+  | {
+      accepted: {
+        /** The client-protocol version the server speaks. */
+        version: number;
+        /** The server's own version, for a status page or a bug report. */
+        server: string;
+        /** The codec that was negotiated, named back. */
+        codec: string;
+        /**
+         * **The registry this connection settled on.** A client that named one gets it back; one
+         * that named none against a one-registry server learns which store it reached. `null` means
+         * the connection settled no registry, which is the administrative case and not a failure.
+         */
+        registry: string | null;
+      };
+    }
+  | { refused: { reason: string } };
 
 export type Request =
   | { tx_begin: { branch?: string | undefined } }

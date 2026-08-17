@@ -9,8 +9,12 @@
 #     other existed;
 #   * a write to one is invisible to the other, including a *schema* write — a repo pushed into one
 #     registry leaves the other's definitions exactly where they were;
-#   * a handshake that names no registry is refused **with the options**, because at two there is no
-#     obvious default and any guess would be a coin toss over somebody's data;
+#   * a handshake that **names a registry nobody hosts is refused at the handshake**, naming the
+#     ones that exist — the routing decision belongs to the connection (§17.5, §17.6);
+#   * a handshake that names *nothing* against two registries is accepted and settles on none, so
+#     that `registries` can still be asked; the ambiguity is reported by the first request that
+#     needs a store, because at two there is no obvious default and any guess would be a coin toss
+#     over somebody's data;
 #   * a registry is opened by the first request that needs it and not at boot, which `status`
 #     reports rather than hiding;
 #   * `start`, `status`, `stop` behave, and every failure says how to start one.
@@ -103,11 +107,15 @@ assert_eq "$(printf '%s' "$(server status)" | grep -c 'not opened')" "0" \
 
 # --- A handshake that names nothing, with two on offer ---------------------------------------------
 
+# **A hello naming nothing has made no claim that could be wrong**, so it is accepted and settles on
+# no registry — which is exactly the connection an administrative client makes. The ambiguity is
+# reported by the first request that needs a store.
+#
 # *Failing means the n=1 convenience survived contact with n=2, and a client that forgot to say which
 # registry it meant is silently answered about whichever one sorted first.*
 ambiguous="$(client '{"branch_list":{}}')"
 message="$(jval "$ambiguous" error.message)"
-assert_contains "$message" "crm" "a handshake naming no registry is refused, and the refusal names…"
+assert_contains "$message" "crm" "a request on a connection that settled no registry is refused, naming…"
 assert_contains "$message" "analytics" "…every registry it could have meant"
 
 # And the one question that needs no registry still answers, which is how a client that guessed wrong
@@ -115,10 +123,15 @@ assert_contains "$message" "analytics" "…every registry it could have meant"
 assert_contains "$(client '{"registries":{}}')" '"crm"' \
     "asking what the server hosts needs no registry, so a misrouted client can still ask"
 
-# A name nobody hosts is refused with the list rather than with "not found".
-typo="$(jval "$(client --registry crmm '{"branch_list":{}}')" error.message)"
-assert_contains "$typo" "crmm" "an unknown registry is named back…"
-assert_contains "$typo" "crm" "…beside the ones that exist"
+# **A name nobody hosts is refused at the handshake**, with the list rather than with "not found".
+# The client exits non-zero having printed the refusal on stderr, which is what a handshake that was
+# turned away *is* — there was never a session to answer a request on. Until protocol 2 this error
+# arrived at the first request instead, because the server had nowhere to put it (`ROADMAP.md`,
+# *The handshake names a registry*).
+assert_rejected 'crmm' "a registry nobody hosts is refused at the handshake, named back…" \
+    -- client --registry crmm '{"branch_list":{}}'
+assert_rejected 'analytics' "…beside the ones that exist, before any request is sent" \
+    -- client --registry crmm '{"branch_list":{}}' 
 
 # --- A push to one registry leaves the other exactly where it was ----------------------------------
 

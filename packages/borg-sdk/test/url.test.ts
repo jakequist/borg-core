@@ -10,6 +10,7 @@
 import { describe as suite, expect, test } from "vitest";
 import {
   BorgUrlError,
+  borgAddress,
   borgSocket,
   parseBorgUrl,
   wellKnownSocket,
@@ -83,13 +84,46 @@ suite("connection urls", () => {
   });
 
   /**
-   * The transport that does not exist yet is named rather than left to be invented. A client that
-   * guessed a spelling today would be wrong on the day the real one ships.
+   * **The transport that was reserved is the transport that arrived, at the spelling that was
+   * reserved for it.** Two milestones of `borg+ws://` being parsed and refused *by name* is what
+   * made this a case rather than a migration: nobody invented a different spelling in the meantime,
+   * because the refusal named this one.
+   *
+   * The port defaults the way `ws://`'s does — 80 plain, 443 secure — because a WebSocket exists
+   * here to ride infrastructure that already exists, and that infrastructure listens on those two.
    */
-  test("the websocket transport is reserved and refused by name", () => {
-    for (const text of ["borg+ws://borg.example/crm", "borg+wss://borg.example/crm"]) {
-      expect(() => parseBorgUrl(text)).toThrow(/not yet supported/);
-      expect(() => parseBorgUrl(text)).toThrow(/borg\+ws:\/\//);
+  test("the websocket transport parses into a host, a port and a registry", () => {
+    expect(parseBorgUrl("borg+ws://borg.example:7717/crm")).toEqual({
+      transport: "ws",
+      path: null,
+      ws: { secure: false, host: "borg.example", port: 7717 },
+      registry: "crm",
+    });
+    expect(parseBorgUrl("borg+ws://borg.example/crm").ws).toEqual({
+      secure: false,
+      host: "borg.example",
+      port: 80,
+    });
+    expect(parseBorgUrl("borg+wss://borg.example/crm").ws).toEqual({
+      secure: true,
+      host: "borg.example",
+      port: 443,
+    });
+    expect(parseBorgUrl("borg+ws://127.0.0.1:9000").registry).toBeNull();
+
+    // The address a dial is made against. **The path is `/` and carries no registry**: the registry
+    // travels in the handshake and nowhere else (§17.6), so there is one place for it to be said.
+    expect(borgAddress(parseBorgUrl("borg+ws://borg.example/crm"), {})).toEqual({
+      kind: "ws",
+      url: "ws://borg.example:80/",
+    });
+
+    for (const [text, needle] of [
+      ["borg+ws:///crm", /names no host/],
+      ["borg+ws://borg.example:http/crm", /is not a port/],
+      ["borg+ws://borg.example/a/b", /more than one path segment/],
+    ] as const) {
+      expect(() => parseBorgUrl(text), text).toThrow(needle);
     }
   });
 

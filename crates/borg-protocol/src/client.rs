@@ -55,14 +55,26 @@
 //!
 //! The one exception is [`Request::RepoPush`], which may name another, because a deploy client
 //! pushing to three registries should not need three connections to do it.
+//!
+//! ## The handshake is answered
+//!
+//! Three messages, in order: the server's [`ServerHello`](crate::ServerHello), the client's
+//! [`ClientHello`], the server's [`HelloAck`]. The third is what a version-1 server did not send,
+//! and its absence is what made *accepted* indistinguishable from *not answered yet*, made a
+//! refusal losable to an `EPIPE`, and left routing failures to be discovered at whatever request
+//! came first. The routing decision is taken here now, where it was always meant to be.
+//!
+//! **The handshake is JSON throughout**, whatever the body will be: a codec that has not been agreed
+//! cannot carry the message agreeing it, and that stays true of the acknowledgement — a client
+//! reading the reply that names the negotiated codec cannot already be decoding in it.
 
+use crate::url::Address;
 use borg_core::{BorgError, Result};
 use serde::{Deserialize, Serialize};
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 
-/// **One request to a running server: connect, greet, ask, read.** SPEC.md §17.5.
+/// **One request to a running server: connect, greet, *hear back*, ask, read.** SPEC.md §17.5.
 ///
 /// Thirty lines, and that is the claim rather than an accident — §17.5 has no hidden client
 /// library, which is the same thing `scenarios/250-serve`'s `client.py` says from the other side.
@@ -72,6 +84,12 @@ use std::path::Path;
 /// stateful — a connection held across requests, a transaction, a reconnect — is an SDK's job and
 /// deliberately not here (`packages/borg-sdk`).
 ///
+/// **The hello is acknowledged, and this waits for the acknowledgement before it asks.** That is
+/// one round trip a fire-and-forget handshake did not pay, and what it buys is that a refusal —
+/// a registry this server does not host, a protocol version it does not speak — arrives *as a
+/// refusal* rather than as a mysterious error on whatever the first request happened to be. See
+/// [`HelloAck`].
+///
 /// `registry` is the handshake's (§17.6) and is `None` for the questions that are about the
 /// *server* rather than about a store — `registries` and `registry_create` — which a connection
 /// that settled no registry can still ask.
@@ -79,20 +97,14 @@ use std::path::Path;
 /// **A refusal to connect is [`crate::url::unreachable`]'s sentence**, not an `io::Error`: nothing
 /// listening on a socket is the commonest failure a client has and "Connection refused" is the
 /// least useful way to report it.
-pub fn ask(socket: &Path, registry: Option<&str>, request: &Request) -> Result<Response> {
+pub fn ask(address: &Address, registry: Option<&str>, request: &Request) -> Result<Response> {
     let broke = |what: &str, err: &dyn std::fmt::Display| {
-        BorgError::Storage(format!("{}: {what}: {err}", socket.display()))
+        BorgError::Storage(format!("{address}: {what}: {err}"))
     };
-    let stream =
-        UnixStream::connect(socket).map_err(|err| crate::url::unreachable(socket, &err))?;
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|err| broke("cannot read", &err))?,
-    );
-    let mut writer = stream;
+    let mut conn = Conn::dial(address)?;
 
-    let _: crate::ServerHello = crate::read_message(&mut reader, crate::Codec::Json)
+    let _: crate::ServerHello = conn
+        .recv(crate::Codec::Json)
         .map_err(|err| broke("no hello", &err))?;
     let hello = ClientHello {
         version: VERSION,
@@ -105,18 +117,171 @@ pub fn ask(socket: &Path, registry: Option<&str>, request: &Request) -> Result<R
         // Nothing to present, and nothing checks it yet (§17.6).
         credential: None,
     };
-    crate::write_message(&mut writer, crate::Codec::Json, &hello)
+    conn.send(crate::Codec::Json, &hello)
         .map_err(|err| broke("cannot greet", &err))?;
-    crate::write_message(&mut writer, crate::Codec::Json, request)
-        .map_err(|err| broke("cannot ask", &err))?;
+    match conn
+        .recv::<HelloAck>(crate::Codec::Json)
+        .map_err(|err| broke("no acknowledgement", &err))?
+    {
+        HelloAck::Accepted(_) => {}
+        // The server's own sentence, unwrapped: a handshake that named a registry nobody hosts is
+        // already carrying the list of the ones that exist, and prefixing it with an address would
+        // bury the part that says what to do.
+        HelloAck::Refused { reason } => return Err(BorgError::Storage(reason)),
+    }
 
-    crate::read_message(&mut reader, crate::Codec::Json).map_err(|err| broke("no answer", &err))
+    conn.send(crate::Codec::Json, request)
+        .map_err(|err| broke("cannot ask", &err))?;
+    let answer = conn
+        .recv(crate::Codec::Json)
+        .map_err(|err| broke("no answer", &err));
+    conn.close();
+    answer
 }
 
-/// The client protocol's version, negotiated separately from the worker protocol's [`crate::VERSION`]
-/// even though both currently read `1`. They are two contracts over one framing and there is no
-/// reason they should have to move together.
-pub const VERSION: u32 = 1;
+/// One connection, over whichever transport the address named. See [`Conn::dial`].
+///
+/// A private enum rather than a trait: there are two transports, the whole of the difference is how
+/// a message is framed, and [`ask`] is the only caller. A trait here would be a seam nothing else
+/// slots into — `borg_server::serve::Peer` is the seam, on the side that has several.
+enum Conn {
+    Unix {
+        reader: BufReader<UnixStream>,
+        writer: UnixStream,
+    },
+    /// Boxed because a `WebSocket` carries its read and write buffers inline and is five times the
+    /// size of the pair of file descriptors beside it — and every `ask` on a laptop is the small
+    /// variant.
+    Ws(Box<crate::ws::Client>),
+}
+
+impl Conn {
+    fn dial(address: &Address) -> Result<Self> {
+        match address {
+            Address::Unix(path) => {
+                let stream = UnixStream::connect(path)
+                    .map_err(|err| crate::url::unreachable(address, &err))?;
+                let reader = BufReader::new(stream.try_clone().map_err(|err| {
+                    BorgError::Storage(format!("{}: cannot read: {err}", path.display()))
+                })?);
+                Ok(Self::Unix {
+                    reader,
+                    writer: stream,
+                })
+            }
+            // **`borg+wss://` is refused here rather than at the parser**, because the url is
+            // perfectly well-formed and is the one a deployment behind a TLS proxy is configured
+            // with — what is missing is a TLS client in *this* binary, and saying so is more useful
+            // than pretending the address is a typo. The browser SDK dials the same url happily.
+            Address::Ws { secure: true, .. } => Err(BorgError::Storage(format!(
+                "{address}: this build has no TLS client — a borg+wss:// address is reached by a \
+                 browser or a node process, and `borg` speaks borg+ws:// to a server whose TLS a \
+                 proxy has already terminated"
+            ))),
+            Address::Ws {
+                secure: false,
+                host,
+                port,
+            } => crate::ws::Client::dial(host, *port)
+                .map(|client| Self::Ws(Box::new(client)))
+                .map_err(|err| crate::url::unreachable(address, &err)),
+        }
+    }
+
+    fn send<T: Serialize>(
+        &mut self,
+        codec: crate::Codec,
+        message: &T,
+    ) -> std::result::Result<(), crate::ProtocolError> {
+        match self {
+            Self::Unix { writer, .. } => crate::write_message(writer, codec, message),
+            Self::Ws(client) => client.send(codec, message),
+        }
+    }
+
+    fn recv<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        codec: crate::Codec,
+    ) -> std::result::Result<T, crate::ProtocolError> {
+        match self {
+            Self::Unix { reader, .. } => crate::read_message(reader, codec),
+            Self::Ws(client) => client.recv(codec),
+        }
+    }
+
+    fn close(self) {
+        if let Self::Ws(client) = self {
+            client.close();
+        }
+    }
+}
+
+/// The client protocol's version, negotiated separately from the worker protocol's
+/// [`crate::VERSION`]. They are two contracts over one framing and there is no reason they should
+/// have to move together — which is exactly what this bump demonstrates: `2` adds [`HelloAck`] to
+/// the client handshake and the worker protocol stays at `1`, untouched.
+///
+/// **A server refuses `1` by name.** A version-1 client sends its hello and then writes its first
+/// request without waiting, so an acknowledgement would arrive where it expects a response and every
+/// answer after it would be off by one — silently, which is the failure mode a version number exists
+/// to convert into a sentence. The refusal is deliverable *because* of the acknowledgement it is
+/// refusing over, which is the only reason this could be a clean break rather than a flag day.
+pub const VERSION: u32 = 2;
+
+/// **What the server says back to a hello.** SPEC.md §17.5, §17.6.
+///
+/// For two milestones the server said nothing: an accepted handshake was acknowledged by silence, so
+/// *accepted* and *not answered yet* were the same observation, a refusal was written and then hung
+/// up on fast enough that the answer could be lost to an `EPIPE` on the client's next write, and a
+/// routing failure had nowhere to be delivered and was deferred to the first request that needed a
+/// registry. That last one had a visible cost: `createBorgContext({url})` resolved happily against a
+/// registry the server does not host, and the refusal arrived at some later line.
+///
+/// This is the channel those three needed. It is one message, and the client reads it before it
+/// writes a request — which is what makes a refusal deliverable at all.
+///
+/// **A refusal is followed by a lingering close**, never by an immediate one: the server stops
+/// writing, drains whatever the client had already sent, and only then drops the connection. A
+/// client that wrote its hello and its first request in one breath would otherwise get a reset that
+/// discards the very answer it was racing.
+///
+/// Single-key, like everything else on this wire: `{"accepted":{…}}` or `{"refused":{"reason":…}}`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelloAck {
+    Accepted(Accepted),
+    /// Why not, in the words the client should show a human. The connection is over.
+    Refused {
+        reason: String,
+    },
+}
+
+/// What an accepted handshake settled. See [`HelloAck`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Accepted {
+    /// The client-protocol version this server speaks — [`VERSION`], and the number a client
+    /// compares its own against.
+    pub version: u32,
+    /// The server's own version, as its package reports it. Not protocol: this is what a status
+    /// page, a bug report or a support conversation needs, and asking for it separately would be a
+    /// second round trip for a string the handshake was already sending.
+    pub server: String,
+    /// The codec that was negotiated, named back. A client already knows what it asked for; what it
+    /// does not know until now is that the server agreed.
+    pub codec: String,
+    /// **Which registry this connection settled on**, resolved (§17.6).
+    ///
+    /// A client that named one gets it back, which is a confirmation rather than news. A client that
+    /// named *none* against a server hosting exactly one gets that one's name, which is news — it is
+    /// how a local developer's connection finds out what it is talking to without asking.
+    ///
+    /// `null` means the connection settled no registry, which happens when none was named and the
+    /// server hosts none or several. That is **not** a refusal: a hello naming nothing has made no
+    /// claim that could be wrong, and it is exactly what an administrative client — `borg-server
+    /// status`, asking [`Request::Registries`] — has to be able to make. The ambiguity is reported
+    /// at the first request that needs a store, and names the options.
+    pub registry: Option<String>,
+}
 
 /// The client's reply to the server's [`ServerHello`](crate::ServerHello). Always JSON, whatever is
 /// negotiated for the body — a handshake cannot be encoded in a codec that has not been agreed yet.
@@ -921,6 +1086,87 @@ mod tests {
         .unwrap();
         assert_eq!(answer["registries"][0]["name"], "crm");
         assert_eq!(answer["registries"][0]["open"], false);
+    }
+
+    /// **Every handshake is answered, and the answer round-trips in both codecs.** SPEC.md §17.5.
+    ///
+    /// The acknowledgement is JSON on the wire whatever the body will be, but it is the same serde
+    /// impl on the same type as everything else — so asserting it in both codecs is asserting that
+    /// nothing about it is special-cased into a shape the other encoding could not carry, which is
+    /// what would rot the day a transport wants the handshake in MessagePack.
+    #[test]
+    fn a_hello_is_answered_with_an_ack_or_a_refusal_in_every_codec() {
+        let acks = vec![
+            HelloAck::Accepted(Accepted {
+                version: VERSION,
+                server: "0.1.0".into(),
+                codec: "msgpack".into(),
+                registry: Some("crm".into()),
+            }),
+            // A connection that settled no registry — an administrative client, which is a thing
+            // the protocol has to keep being able to be.
+            HelloAck::Accepted(Accepted {
+                version: VERSION,
+                server: "0.1.0".into(),
+                codec: "json".into(),
+                registry: None,
+            }),
+            HelloAck::Refused {
+                reason: "no registry named `nope` — this server hosts analytics, crm".into(),
+            },
+        ];
+        for codec in [Codec::Json, Codec::Msgpack] {
+            let mut buffer = Vec::new();
+            for ack in &acks {
+                write_message(&mut buffer, codec, ack).unwrap();
+            }
+            let mut cursor = std::io::Cursor::new(buffer);
+            for expected in &acks {
+                let got: HelloAck = read_message(&mut cursor, codec).unwrap();
+                assert_eq!(
+                    format!("{got:?}"),
+                    format!("{expected:?}"),
+                    "{} round trip",
+                    codec.name()
+                );
+            }
+        }
+    }
+
+    /// The ack obeys the single-key rule like every other message, and says the four things a
+    /// client asked for by connecting: which protocol, which server, which codec, which store.
+    #[test]
+    fn an_accepted_handshake_names_the_codec_the_server_and_the_registry() {
+        let json = serde_json::to_value(HelloAck::Accepted(Accepted {
+            version: VERSION,
+            server: "0.1.0".into(),
+            codec: "json".into(),
+            registry: Some("crm".into()),
+        }))
+        .unwrap();
+        assert_eq!(json.as_object().unwrap().len(), 1, "one key: {json}");
+        assert_eq!(json["accepted"]["version"], VERSION);
+        assert_eq!(json["accepted"]["server"], "0.1.0");
+        assert_eq!(json["accepted"]["codec"], "json");
+        assert_eq!(json["accepted"]["registry"], "crm");
+
+        let refused = serde_json::to_value(HelloAck::Refused {
+            reason: "nope".into(),
+        })
+        .unwrap();
+        assert_eq!(refused.as_object().unwrap().len(), 1, "one key: {refused}");
+        assert_eq!(refused["refused"]["reason"], "nope");
+    }
+
+    /// **The version a client states is the version this contract is at**, and it moved when the
+    /// acknowledgement arrived while the worker protocol stayed where it was. Asserted because the
+    /// two numbers living in one file is exactly how they would end up being bumped together.
+    #[test]
+    fn the_client_protocol_versions_independently_of_the_worker_protocol() {
+        assert_eq!(VERSION, 2, "the ack is what moved this");
+        assert_eq!(crate::VERSION, 1, "…and the worker protocol did not move");
+        let hello: ClientHello = serde_json::from_str("{}").unwrap();
+        assert_eq!(hello.version, VERSION);
     }
 
     /// A layer id is text, and it is the same text `borg get` prints — see the module header for why

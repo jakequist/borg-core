@@ -10,8 +10,8 @@
 #
 #   * **a connection url names a socket and a registry in one string**, and the name routes — two
 #     urls differing only in their last segment reach two stores with two schemas;
-#   * **a url that is not one quotes itself back**, and `borg+ws://` — the transport that does not
-#     exist yet — is refused *by name* rather than left for somebody to invent a spelling for;
+#   * **a url that is not one quotes itself back**, and the reserved `borg+ws://` spelling is now
+#     the one that connects — which is what two milestones of refusing it *by name* bought;
 #   * **nothing listening says how to start one.** `no borg server at <addr> — start one with:
 #     borg-server start`, identically from the CLI and from the SDK, because a message a user learns
 #     to recognise has to be the same message everywhere. This is the sentence the first application
@@ -66,11 +66,21 @@ assert_rejected '`localhost/crm`' "…and quotes itself back, because a url live
 assert_rejected 'not a registry name' "a registry name the server could never accept is caught here" \
     -- "$BORG_BIN" --url 'borg://localhost/has.dot' generate --lang ts -o "$WORK/gen"
 
-# *Failing means the next transport gets invented independently by everybody who needs one first.*
-assert_rejected 'not yet supported' "borg+ws:// is reserved for the browser transport…" \
-    -- "$BORG_BIN" --url 'borg+ws://borg.example/crm' generate --lang ts -o "$WORK/gen"
-assert_rejected 'borg+ws://' "…and the refusal names it, rather than saying 'unknown scheme'" \
-    -- "$BORG_BIN" --url 'borg+ws://borg.example/crm' generate --lang ts -o "$WORK/gen"
+# **The reserved spelling is the one that connects.** `borg+ws://` was parsed and refused by name for
+# two milestones so that nobody would invent a different one; 330 is where it carries a session.
+# What is asserted here is that it is no longer a *parse* error — an address that does not resolve
+# is a network answer, not a grammar one.
+#
+# *Failing means the transport arrived at a spelling nobody had been told to expect.*
+assert_rejected 'borg.example' "borg+ws:// is dialled rather than refused by the parser" \
+    -- "$BORG_BIN" --url 'borg+ws://borg.example.invalid/crm' generate --lang ts -o "$WORK/gen"
+# `borg+wss://` parses everywhere and is dialled only where TLS is free. A Rust client would have to
+# carry a certificate store to speak it, and the deployment shape is a proxy that has already
+# terminated — so it is refused *here*, by name, saying what to do instead.
+assert_rejected 'no TLS client' "borg+wss:// is refused by the CLI, naming what is missing" \
+    -- "$BORG_BIN" --url 'borg+wss://borg.example/crm' generate --lang ts -o "$WORK/gen"
+assert_rejected 'borg+ws://' "…and says what a proxy in front of a server forwards instead" \
+    -- "$BORG_BIN" --url 'borg+wss://borg.example/crm' generate --lang ts -o "$WORK/gen"
 
 # A url names a *server*, so a command that operates on a store directly is told so rather than
 # quietly given an answer about --store.
@@ -112,14 +122,14 @@ assert_contains "$(BORG_URL="$ANALYTICS_URL" "$BORG_BIN" generate --lang ts -o "
 assert_eq "$(cat "$WORK/gen-env/borg.generated.ts")" "$(cat "$WORK/gen-analytics/borg.generated.ts")" \
     "…to exactly the same place the flag would have"
 
-# **The deferred routing error, observed.** A handshake that cannot be routed is not refused at the
-# handshake — the server does not acknowledge an accepted hello, so there is nowhere to put the
-# refusal — and the error is handed to the first request that needs a registry instead
-# (`ROADMAP.md`, *The handshake names a registry*). For a client this looks like a connection that
-# succeeded and an operation that failed.
+# **Routing happens in the handshake.** This assertion was written the other way round — the refusal
+# deferred to the first request, because the server acknowledged nothing and had nowhere to put it —
+# and it was written that way round so that this day would flip it (`ROADMAP.md`, *The handshake
+# names a registry*). Protocol 2 answers every hello, so a claim this server cannot honour is
+# answered where the claim was made.
 assert_rejected 'nope' "a registry the server does not host is named back…" \
     -- "$BORG_BIN" --url "borg+unix://$SOCK/nope" generate --lang ts -o "$WORK/gen"
-assert_rejected 'crm' "…beside the ones that exist, at the first request rather than at the handshake" \
+assert_rejected 'crm' "…beside the ones that exist, at the handshake rather than at the first request" \
     -- "$BORG_BIN" --url "borg+unix://$SOCK/nope" generate --lang ts -o "$WORK/gen"
 
 # ── The SDK: one url, and a session that outlives the server ───────────────────────────────────────

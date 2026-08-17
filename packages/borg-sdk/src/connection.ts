@@ -81,7 +81,8 @@ export async function openUnixSocket(path: string, what: string): Promise<Socket
  * borg://localhost                            the well-known local address, no registry named
  * borg+unix:///run/user/1000/borg.sock/crm    an explicit socket, registry crm
  * borg+unix:///tmp/borg.sock                  an explicit socket, no registry named
- * borg+ws://borg.example/crm                  reserved; parsed and refused
+ * borg+ws://borg.example:7717/crm             a websocket, registry crm
+ * borg+wss://borg.example/crm                 the same, through a TLS-terminating proxy
  * ```
  *
  * Everything a client needs is *where the server is* and *which registry on it* (§17.6), and those
@@ -95,9 +96,15 @@ export async function openUnixSocket(path: string, what: string): Promise<Socket
  *
  * **`borg://` is *the* local transport**, whatever that turns out to be — today the well-known unix
  * socket, resolved by [`wellKnownSocket`]. `borg+unix://` is the escape hatch for when the address
- * has to be said out loud: a scenario, a second server, a container mount. `borg+ws://` is reserved
- * for the browser transport a unix socket cannot serve, and is refused *by name* so that nobody
- * invents a spelling for it in the meantime.
+ * has to be said out loud: a scenario, a second server, a container mount.
+ *
+ * **`borg+ws://` is the transport a browser can open**, and the one a unix socket cannot serve. It
+ * is a host and a port, and the port defaults the way `ws://`'s does — 80 plain, 443 secure —
+ * because the whole argument for a WebSocket is that it rides infrastructure that already exists,
+ * and that infrastructure listens on those two. `borg+wss://` is the same address behind a proxy
+ * that terminates TLS; the runtime's own `WebSocket` does the TLS, so it costs this package
+ * nothing. (`borg` the CLI refuses `borg+wss://`, because a Rust client would have to grow a
+ * certificate store to speak it — `borg_protocol::url` says so where it says no.)
  *
  * **Where the socket ends and the registry begins**, for `borg+unix://`: the last path segment is
  * the registry when it could *be* a registry name — letters, digits, `-` and `_`, which is the rule
@@ -108,10 +115,12 @@ export async function openUnixSocket(path: string, what: string): Promise<Socket
  * `/run/borg/crm/` is the socket `/run/borg/crm`.
  */
 export interface BorgUrl {
-  /** `local` is the well-known address; `unix` is [`BorgUrl.path`]. */
-  readonly transport: "local" | "unix";
-  /** The socket, for `unix`. `null` for `local`, which [`borgSocket`] resolves. */
+  /** `local` is the well-known address; `unix` is [`BorgUrl.path`]; `ws` is host and port. */
+  readonly transport: "local" | "unix" | "ws";
+  /** The socket, for `unix`. `null` for `local`, which [`borgSocket`] resolves, and for `ws`. */
   readonly path: string | null;
+  /** For `ws`: the host, the port, and whether TLS. `null` otherwise. */
+  readonly ws: { readonly secure: boolean; readonly host: string; readonly port: number } | null;
   /** The registry named in the url, or `null` — which is `null` in the handshake too. */
   readonly registry: string | null;
 }
@@ -170,20 +179,15 @@ export function parseBorgUrl(text: string): BorgUrl {
       return local(text, rest);
     case "borg+unix":
       return unix(text, rest);
-    // Named rather than lumped in with the unknown schemes, because this one *will* exist and the
-    // sentence a user gets should say so.
     case "borg+ws":
+      return websocket(text, rest, false);
     case "borg+wss":
-      throw malformed(
-        text,
-        "`borg+ws://` is reserved for the browser transport and is not yet supported — " +
-          "today's transports are borg:// and borg+unix://",
-      );
+      return websocket(text, rest, true);
     default:
       throw malformed(
         text,
-        `\`${scheme}\` is not a borg transport — try borg://, borg+unix:// or the reserved ` +
-          `borg+ws://`,
+        `\`${scheme}\` is not a borg transport — try borg://, borg+unix://, borg+ws:// or ` +
+          `borg+wss://`,
       );
   }
 }
@@ -202,7 +206,43 @@ function local(text: string, rest: string): BorgUrl {
         `well-known socket, and a remote server is the reserved borg+ws://`,
     );
   }
-  return { transport: "local", path: null, registry: registrySegment(text, tail) };
+  return {
+    transport: "local",
+    path: null,
+    ws: null,
+    registry: registrySegment(text, tail),
+  };
+}
+
+/**
+ * `borg+ws://<host>[:<port>][/<registry>]`, and the same for `borg+wss://`. See [`BorgUrl`] for why
+ * the port defaults to 80 and 443 rather than to a number of borg's own.
+ */
+function websocket(text: string, rest: string, secure: boolean): BorgUrl {
+  const slash = rest.indexOf("/");
+  const authority = slash < 0 ? rest : rest.slice(0, slash);
+  const tail = slash < 0 ? "" : rest.slice(slash + 1);
+  const noHost = (): never => {
+    throw malformed(text, "it names no host — borg+ws://<host>[:<port>]/<registry>");
+  };
+  if (authority === "") noHost();
+  const colon = authority.lastIndexOf(":");
+  const host = colon < 0 ? authority : authority.slice(0, colon);
+  const written = colon < 0 ? null : authority.slice(colon + 1);
+  if (host === "") noHost();
+  if (written !== null && !/^\d{1,5}$/.test(written)) {
+    throw malformed(text, `\`${written}\` is not a port — borg+ws://<host>:<port>/<registry>`);
+  }
+  const port = written === null ? (secure ? 443 : 80) : Number(written);
+  if (port > 65535) {
+    throw malformed(text, `\`${written}\` is not a port — borg+ws://<host>:<port>/<registry>`);
+  }
+  return {
+    transport: "ws",
+    path: null,
+    ws: { secure, host, port },
+    registry: registrySegment(text, tail),
+  };
 }
 
 /** `borg+unix://<socket-path>[/<registry>]`. See [`BorgUrl`] for where the two divide. */
@@ -217,15 +257,15 @@ function unix(text: string, rest: string): BorgUrl {
   if (rest.endsWith("/")) {
     const socket = rest.slice(0, -1);
     if (socket === "") throw malformed(text, "it names no socket path");
-    return { transport: "unix", path: socket, registry: null };
+    return { transport: "unix", path: socket, ws: null, registry: null };
   }
   const split = rest.lastIndexOf("/");
   const head = rest.slice(0, split);
   const last = rest.slice(split + 1);
   if (head !== "" && nameIsValid(last)) {
-    return { transport: "unix", path: head, registry: last };
+    return { transport: "unix", path: head, ws: null, registry: last };
   }
-  return { transport: "unix", path: rest, registry: null };
+  return { transport: "unix", path: rest, ws: null, registry: null };
 }
 
 /** The one path segment a `borg://` url may carry after the host. */
@@ -265,7 +305,35 @@ export function wellKnownSocket(env: NodeJS.ProcessEnv = process.env): string {
   return join(dataDir, SOCKET_FILE);
 }
 
-/** The socket a parsed url says to dial. */
+/**
+ * **Where a parsed url says to dial**, with `borg://` resolved against the well-known address.
+ *
+ * A `unix` address is a path and a `ws` address is a url; both print as themselves, which is what
+ * `BorgContext.address` hands back and what every error message names.
+ */
+export type BorgAddress =
+  | { readonly kind: "unix"; readonly path: string }
+  | { readonly kind: "ws"; readonly url: string };
+
+/** The address a parsed url says to dial. */
+export function borgAddress(url: BorgUrl, env: NodeJS.ProcessEnv = process.env): BorgAddress {
+  if (url.transport === "ws") {
+    const ws = url.ws;
+    if (ws === null) throw new BorgUrlError("a ws url with no host — this is a parser bug");
+    // **The request path is `/` and carries no registry.** The registry travels in `ClientHello`
+    // and nowhere else (§17.6); a second place to say it is a second thing to disagree.
+    return { kind: "ws", url: `${ws.secure ? "wss" : "ws"}://${ws.host}:${ws.port}/` };
+  }
+  return { kind: "unix", path: url.path ?? wellKnownSocket(env) };
+}
+
+/** What an address is called, in an error or in `BorgContext.address`. */
+export function addressText(address: BorgAddress): string {
+  // A trailing slash on a url is what a dial needs and noise in a message, so it goes here.
+  return address.kind === "unix" ? address.path : address.url.replace(/\/$/, "");
+}
+
+/** The socket a parsed url says to dial, for the `unix` case. Kept for callers that only have one. */
 export function borgSocket(url: BorgUrl, env: NodeJS.ProcessEnv = process.env): string {
   return url.path ?? wellKnownSocket(env);
 }
@@ -294,5 +362,42 @@ export async function dialBorgServer(path: string): Promise<Socket> {
           : new BorgProtocolError(`borg socket ${path}: ${err.message}`),
       );
     });
+  });
+}
+
+/**
+ * The same dial over a WebSocket, with the same two outcomes.
+ *
+ * **The runtime's own `WebSocket`**, global since Node 21 and forever in a browser — no dependency,
+ * which is what lets this package be dropped into anything, and no TLS code of its own, which is
+ * what makes `borg+wss://` free here and expensive in Rust.
+ *
+ * The failure classes are the ones a unix socket has: nothing listening is
+ * [`BorgUnreachableError`] with the same sentence, and anything else is reported as itself. A
+ * browser's `WebSocket` deliberately does not tell a page *why* a connection failed, so the
+ * distinction is one the environment sometimes cannot make and this reports what it was given.
+ */
+export async function dialBorgWebSocket(url: string): Promise<WebSocket> {
+  if (typeof WebSocket === "undefined") {
+    throw new BorgProtocolError(
+      `${url}: this runtime has no WebSocket — node 21+ has one globally, and a browser has ` +
+        `always had one`,
+    );
+  }
+  return new Promise<WebSocket>((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const opened = (): void => {
+      socket.removeEventListener("error", failed);
+      resolve(socket);
+    };
+    const failed = (): void => {
+      socket.removeEventListener("open", opened);
+      // A WebSocket error event carries no errno anywhere, and in a browser carries nothing at all
+      // by design. "Nothing is listening" is overwhelmingly what it means, and it is the sentence
+      // that tells somebody what to do — so it is the one reported, with the address in it.
+      reject(new BorgUnreachableError(url.replace(/\/$/, "")));
+    };
+    socket.addEventListener("open", opened, { once: true });
+    socket.addEventListener("error", failed, { once: true });
   });
 }

@@ -3,8 +3,8 @@
 
 The point is the same one `030-shell-pipeline` makes about the worker protocol: if this is
 workable, the client protocol has no hidden client-library complexity. There is no generated code
-here, no transaction object, no retry policy. There is a handshake, and then one request per line
-with one response per line.
+here, no transaction object, no retry policy. There is a handshake — three messages, the last of
+them the server's answer to ours — and then one request per line with one response per line.
 
     client.py SOCKET [--registry NAME] [--client-version L7] REQUEST...
 
@@ -62,6 +62,15 @@ def main(argv):
         # handshake, and never again — no message repeats it.
         reply["registry"] = registry
     send(stream, reply)
+
+    # **And the server answers, before the first request goes out** (SPEC.md §17.5). Three lines
+    # here rather than none, and they are the three that make this client able to tell "accepted"
+    # from "not answered yet" — which it previously could not, and which cost it the ability to
+    # learn that its registry does not exist until whatever it asked first came back strange.
+    ack = json.loads(stream.readline())
+    if "refused" in ack:
+        print(ack["refused"]["reason"], file=sys.stderr)
+        return 1
 
     tx = None
     for request in argv:

@@ -105,7 +105,7 @@ the other way round.
 **And a client is one string, and outlives its server.** A connection url — `borg://localhost/crm`,
 or `borg+unix:///tmp/borg.sock/crm` — carries the two halves a client needs as one fact, so they
 cannot be changed independently into a client pointed at one deployment's socket with another's
-registry name. `borg+ws://` is reserved and refused by name rather than left to be invented. The
+registry name. The
 TypeScript SDK reconnects: a broken connection is torn down, the next operation dials and
 re-handshakes, and what was in flight fails with an error that says it was **not** retried, because
 `tx_commit` is not idempotent. Transactions survive it by construction, which is what §12.2 was for.
@@ -124,6 +124,20 @@ eagerly, `start | stop | status | logs` is the operating surface, and the flaw t
 was built around is gone: a **schema can be pushed into a running server**, because the server
 performs the push and the fingerprint work made a push cost what the change costs. `borg` keeps its
 embedded mode and loses `serve`.
+
+**And the server is on the network.** `borg-server start --listen ws://0.0.0.0:7717` adds a
+WebSocket beside the unix socket — both at once, the socket always — carrying §17.5 unchanged, with
+the framing layer *disappearing* rather than being wrapped because a WebSocket is message-framed
+already. `borg+ws://` was reserved and refused by name for two milestones and arrived at exactly that
+spelling; `GET /health` on the same port is the one HTTP endpoint, for a load balancer. TLS is a
+proxy's job and no TLS backend is compiled in, which makes that a property rather than a policy.
+
+**And the handshake is answered.** Protocol 2 acknowledges every hello — with the negotiated codec,
+the server's version and the registry the connection settled on — or refuses it with a reason and a
+lingering close. That closes the deviation §17.6 had carried since routing arrived: a registry the
+server does not host is now refused *at the handshake*, so `createBorgContext` fails where it was
+configured instead of resolving against a store that does not exist. The assertions that pinned the
+old behaviour were written that way round on purpose, and they have flipped.
 
 Act 1 is the modern ORM.
 
@@ -164,9 +178,11 @@ cloud later, with the platform's own control plane built on Borg itself.
 - **Secrets live in Doppler** (project `borg`); deploys target the Proxmox host (`m3`) first with a
   thin VM-provider seam named for the eventual cloud move.
 
-**P1 — networked, authed, deployed:** WebSocket transport (browser-ready, rides standard infra) ·
-hello acknowledgement (closes the routing deviation) · static org-scoped API keys · export/import ·
-Dockerfile + CI · one server live on the Proxmox host.
+**P1 — networked, authed, deployed:** ~~WebSocket transport (browser-ready, rides standard infra)~~ ·
+~~hello acknowledgement (closes the routing deviation)~~ · static org-scoped API keys · export/import ·
+Dockerfile + CI · one server live on the Proxmox host. **The first two are done** — see *The
+handshake is answered* and *Two transports, one protocol* below; TLS is deliberately not among them
+and is a proxy's job (§17.6).
 **P2 — the platform:** control-plane app on Borg — orgs, users, memberships, token issuance,
 provisioning, subdomain routing, platform.borg-hq.com.
 **P3 — tiering:** dedicated-server provisioning via the Proxmox API, on-prem packaging, and
@@ -1367,12 +1383,18 @@ coin toss over somebody's data. The error names the options rather than merely r
 `registries` — the one message that needs no registry — is what lets a client that guessed wrong
 find out what to say.
 
-*Where the routing error is delivered* took a decision. The obvious place is the handshake, and it
-is the wrong one: the server does not acknowledge an accepted hello, because it has nothing to say,
-so a client is not reading at that point and one that were could not tell a refusal from an answer
-(`CLAUDE.md` records that gap). So the failure is remembered and handed to the first request that
-needs a registry, which is every request except `registries`. Same sentence, delivered on a channel
-the client is definitely reading.
+*Where the routing error is delivered* took a decision, and it was **reversed by protocol 2** — see
+*The handshake is answered*. The original reasoning: the obvious place is the handshake, and it was
+the wrong one, because the server did not acknowledge an accepted hello and so a client was not
+reading at that point; one that were could not tell a refusal from an answer. So the failure was
+remembered and handed to the first request that needed a registry. Same sentence, delivered on a
+channel the client is definitely reading.
+
+That was honest and it had a visible cost: `createBorgContext({url})` resolved happily against a
+registry the server does not host, and the refusal arrived at some later line. The assertions that
+pinned it — `scenarios/300`, `scenarios/310`, and the SDK's client suite — were written *that way
+round* deliberately, so that the day an acknowledgement existed they would flip rather than quietly
+keep passing. They have flipped.
 
 **`credential` is reserved and its existence is the point.** A local server has no one to
 authenticate — the socket's file permissions are the boundary — and nothing reads the field. Adding
@@ -1411,6 +1433,104 @@ with the advisory locks still held. It cost a scenario failure under load to fin
 
 **Every failure says how to start one.** `status`, `stop` and `logs` against nothing are the
 commonest confusion there is, and "no server is running" alone sends somebody to read `--help`.
+
+#### The handshake is answered, and the client protocol is at 2
+
+`ClientHello` gets a reply: `{"accepted": {version, server, codec, registry}}` or
+`{"refused": {reason}}`, single-key like everything else, JSON like the two messages before it.
+
+**One message, three problems.** The absence of it was not one gap but three, and they were only
+visible as three once there was a place to fix them. *Accepted* and *not answered yet* were the same
+observation. A refusal was written and hung up on immediately, so a client that wrote its first
+request without waiting met a reset — which discards the receive buffer along with the answer it was
+racing. And routing had nowhere to be reported, so it was deferred (above), which cost an SDK's
+`createBorgContext` the ability to fail where it was configured.
+
+**The ack says what was settled, and `registry` is the field that is news.** A client that named one
+gets confirmation; a client that named none against a one-registry server learns which store it is
+talking to. `server` is the binary's own version, in the handshake rather than in a message of its
+own because a status page and a bug report both want it and it costs nothing here.
+
+**Routing is decided at the handshake and the two outcomes are deliberately not symmetric.** A hello
+that *names* a registry has made a claim, and a claim the server cannot honour is refused there,
+listing what is hosted. A hello that names *nothing* has made no claim that could be wrong — and it
+is exactly the connection `borg-server status` makes, since `registries` needs no store — so it is
+accepted, settles on nothing, and the ambiguity is reported by the first request that needs one. The
+alternative was refusing an unnamed hello at n≥2, which would have made the escape hatch §17.6
+depends on unreachable.
+
+**A refusal lingers.** Stop writing, drain what the client already sent, then let go. On a WebSocket
+that is the protocol's own close handshake; on a unix socket it is `shutdown(WRITE)` and a bounded
+read. The bound matters: an unbounded drain lets a silent client pin a thread.
+
+**Version 1 is refused by name rather than tolerated.** A version-1 client writes its first request
+without waiting, so the ack would land where it expects a response and every answer after it would
+be one message out — silently. Tolerating it would mean the server deciding per connection whether
+to acknowledge, which is two protocols in one loop. The refusal is deliverable *because* of the
+acknowledgement it is refusing over, which is the only reason this could be a clean break instead of
+a flag day. The worker protocol is a separate contract over the same framing and stayed at 1, which
+is the whole argument for the two numbers having been separate all along.
+
+The cost is one round trip on connect. Every caller of `borg_protocol::client::ask` pays it once per
+command, and a long-lived SDK context pays it once per connection.
+
+#### Two transports, one protocol
+
+`borg-server start --listen ws://0.0.0.0:7717`, repeatable, **beside** the unix socket and never
+instead of it — the local transport is what every `borg` invocation speaks and what the advisory
+lock's liveness test *is*, so a server that could be told to stop speaking it is one somebody could
+lock themselves out of.
+
+**The `Transport`/`Peer` seam held.** It was left in `serve.rs` two milestones ago for exactly this
+and needed one addition: `Peer` grew `accept` and `refuse`, which is the *handshake* changing rather
+than the transport seam being wrong, and both had to be per-transport anyway because a lingering
+close is `shutdown(WRITE)` on one and a close frame on the other. `Transport::accept` did not move.
+The one wrinkle worth recording: a WebSocket listener is also an HTTP listener, and `accept` may
+only return a session — so a health probe is answered *inside* the accept loop, which puts a bounded
+(2 s) header read on the accept thread. Widening `accept` to return `Option<Peer>` would have moved
+that read nowhere; the bound is the fix, and it is the same class of thing as the per-registry gate.
+
+**Framing disappears rather than being wrapped.** A WebSocket is message-framed already, so a codec
+picks the frame kind — JSON in text frames, MessagePack in binary — instead of a newline or a length
+prefix. The *encoding* is shared: `encode_message`/`decode_message` were split out of
+`write_message`/`read_message` so that both transports produce identical bytes from identical types.
+Wrapping the byte framing inside a message transport would put two delimiters around one message.
+
+**The dependency is `tungstenite`, blocking, `default-features = false`, `handshake` only.** Twelve
+new crates, sharing the `digest`/`sha1` stack `sha2` already brings. The argument that survived being
+said out loud: the *client* is a browser, so the peer masks, fragments, interleaves control frames
+and closes on its own schedule whether or not a hand-rolled reader expected it to — RFC 6455 is
+somebody else's wire and this is the class of thing not to write. Blocking rather than
+`tokio-tungstenite` because the serve loop is thread-per-connection and synchronous, and the async
+form would mean a *second* framing implementation on the server. `default-features = false` drops
+every TLS backend, which makes "TLS is terminated by a proxy" a property of the binary rather than a
+sentence in a document.
+
+**TLS is out, and no forwarded header is trusted.** Not `X-Forwarded-For`, not `X-Forwarded-Proto`,
+not `X-Real-IP`. Nothing in §17.5 is a function of the client's address or scheme, so trusting one
+would introduce a spoofable identity to answer a question nobody asks — and when authentication
+arrives it arrives in `ClientHello::credential`, on a channel a proxy does not write. `wss://` as a
+*listen* address is refused by name rather than served in plaintext, because an operator who
+believed the wire was encrypted and was wrong is the worst outcome available.
+
+**One HTTP endpoint: `GET /health`**, on the WebSocket's port, answering the server version and the
+registry **count**. The count and not the names, because the endpoint is unauthenticated and a
+registry name is tenancy. Everything else is `404`; a second endpoint would be an API beside the API.
+
+**`borg+wss://` is asymmetric on purpose.** A browser and a node process get TLS from the runtime's
+own `WebSocket` for free; a Rust client would have to carry a certificate store to speak it, for a
+deployment whose premise is that a proxy has already terminated. So the parser accepts it everywhere
+and `borg` refuses it at the dial, by name, saying to point at the `ws://` the proxy forwards to.
+Refusing the scheme outright would have made the deployed address unsayable.
+
+**Listeners bind in the order that makes "up" mean up.** A socket is connectable the moment it is
+bound, and *connectable* is what `borg-server start`, `wait_for_socket` and the lock's liveness test
+all mean by up — so every websocket listener is bound *before* the unix socket, closing the window in
+which the server is up and the port a client was told to use is not there yet.
+
+`scenarios/330` is both transports at once against one registry, with S2's conflict split across
+them: a WebSocket commits, and the unix client's commit — guarded on the cell the WebSocket
+moved — is refused, naming it. The engine cannot tell the two apart, which is the point.
 
 #### One well-known socket for the whole server
 
@@ -1499,9 +1619,10 @@ is the precedent and it is the shape every deployment system already carries.
 **The scheme names the transport, so `borg://` can be redefined and `borg+ws://` cannot be
 invented.** `borg://` means *the local transport*, which today resolves to §17.6's well-known
 address; a client that wrote it keeps working if that address moves. `borg+unix://` is for saying
-the address out loud. `borg+ws://` is parsed and **refused by name** — the browser transport is the
-one that arrives next (SDK-DRAFT §5, `serve::Transport` exists for it), and the cost of not naming
-it now is that three people invent three spellings and the first real one cannot use any of them.
+the address out loud. `borg+ws://` was parsed and **refused by name** — the browser transport was
+the one that arrived next, and the cost of not naming it then would have been three people inventing
+three spellings and the first real one being unable to use any of them. **It arrived at the spelling
+that was reserved for it**, which is what that foresight bought: one match arm, and no migration.
 
 **An absent registry stays absent**, and this is the rule the whole thing turns on. §17.6 already
 decides what no registry means — the sole one at n=1, an error naming the options at n≥2 — so a
@@ -1560,6 +1681,14 @@ the client was idle, so nothing was in flight and nothing is being retried. It i
 construction — it depends on the runtime having had a turn to deliver the close — and a client that
 was busy right through the outage still discovers the outage by failing. `scenarios/310` asserts
 that case deliberately, by bouncing the server from inside a blocking call.
+
+**None of this is a property of the transport**, and the WebSocket work is where that stopped being
+an assertion and became a test: the framing layer's shared half (`packages/borg-sdk/src/lines.ts`)
+holds the queue, the ordering and what happens to a waiting reader when a connection ends, and a
+subclass supplies only how a message becomes bytes. The SDK's connection suite is run twice, once
+per transport, against one server listening on both — and `scenarios/330` asserts the hard case over
+a WebSocket in the same words 310 asserts it over a socket. Two suites rather than one would have
+been two places for a reconnect to drift.
 
 **Transactions survive by construction and needed no code.** A transaction is an id beside the store
 (§12.2), so one begun before a bounce commits after it, and `bc.transaction(id)` picks one up in a

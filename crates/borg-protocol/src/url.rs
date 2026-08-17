@@ -11,7 +11,8 @@
 //! borg://localhost                            the well-known local address, no registry named
 //! borg+unix:///run/user/1000/borg.sock/crm    an explicit socket, registry crm
 //! borg+unix:///tmp/borg.sock                  an explicit socket, no registry named
-//! borg+ws://borg.example/crm                  reserved; parsed and refused (see below)
+//! borg+ws://borg.example:7717/crm             a websocket, registry crm
+//! borg+wss://borg.example/crm                 the same, through a TLS-terminating proxy
 //! ```
 //!
 //! **An absent registry stays absent.** It is not defaulted here to `main`, to the first directory
@@ -28,10 +29,21 @@
 //! second server, a container mount. Naming the transport in the scheme is what keeps those two
 //! different strings rather than one string with a flag beside it.
 //!
-//! **`borg+ws://` is reserved and refused by name.** A browser cannot open a unix socket, so the
-//! transport that arrives next is a WebSocket (SDK-DRAFT §5, `serve::Transport`) — and the moment
-//! the first one exists, every client that had guessed at a spelling for it would be wrong. Naming
-//! it now costs one match arm and one sentence; not naming it costs a migration.
+//! **`borg+ws://` is the transport a browser can open**, and it was reserved by name for two
+//! milestones before it existed precisely so that this day would need no migration. It is a host and
+//! a port rather than a path, and it defaults its port the way `ws://` does — 80 plain, 443 secure —
+//! because the whole argument for a WebSocket is that it rides infrastructure that already exists,
+//! and infrastructure that already exists listens on those two.
+//!
+//! **`borg+wss://` is parsed everywhere and dialled only where TLS is free.** The server speaks
+//! plaintext and expects a proxy in front of it to terminate TLS (SPEC.md §17.6), so nothing in this
+//! workspace needs a TLS client — and a Rust client that grew one would pull a certificate store
+//! into a binary whose only remote transport is behind somebody else's proxy. So
+//! [`crate::client::ask`] refuses `borg+wss://` by name and says what to do about it, while a
+//! browser or a node process — where the
+//! runtime's own WebSocket does TLS at no cost — dials it. The asymmetry is per *language* and is
+//! stated rather than hidden, because the alternative was refusing the scheme outright and making
+//! the deployed shape unsayable.
 //!
 //! ## Where the socket ends and the registry begins
 //!
@@ -59,10 +71,66 @@ pub enum Transport {
     /// `borg_host::host::default_socket`, which reads `$XDG_RUNTIME_DIR` and `$HOME`, and this
     /// crate sits below `borg-host`. A second copy of that rule is exactly the drift CLAUDE.md
     /// forbids, so the parser answers *which* address and the caller supplies *where* it is
-    /// ([`ConnectionUrl::socket`]).
+    /// ([`ConnectionUrl::address`]).
     Local,
     /// `borg+unix://` — this socket, said out loud.
     Unix(PathBuf),
+    /// `borg+ws://` and `borg+wss://` — a host and a port. See the module header.
+    Ws {
+        secure: bool,
+        host: String,
+        port: u16,
+    },
+}
+
+/// **Where a client actually dials**, once a `borg://` has been resolved against the well-known
+/// address. What [`crate::client::ask`] takes and what an error message names.
+///
+/// A separate type from [`Transport`] because `Local` is a question and this is an answer: nothing
+/// below `borg-host` can turn `borg://` into a path, and nothing above it should be able to hand a
+/// half-resolved address to a dial.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+    Unix(PathBuf),
+    Ws {
+        secure: bool,
+        host: String,
+        port: u16,
+    },
+}
+
+impl Address {
+    /// The `ws://host:port/` a WebSocket client asks for.
+    ///
+    /// **The path is `/` and carries no registry.** The registry travels in `ClientHello` and
+    /// nowhere else (§17.6) — putting it in the request path as well would be a second place for it
+    /// to be said and therefore a place for the two to disagree, and a proxy routing on the path
+    /// while the handshake said something else is the exact failure one source of truth avoids.
+    #[must_use]
+    pub fn ws_url(&self) -> Option<String> {
+        match self {
+            Self::Unix(_) => None,
+            Self::Ws { secure, host, port } => Some(format!(
+                "{}://{host}:{port}/",
+                if *secure { "wss" } else { "ws" }
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unix(path) => write!(out, "{}", path.display()),
+            Self::Ws { secure, host, port } => {
+                write!(
+                    out,
+                    "{}://{host}:{port}",
+                    if *secure { "wss" } else { "ws" }
+                )
+            }
+        }
+    }
 }
 
 /// A parsed connection URL: where the server is, and which registry on it.
@@ -98,30 +166,30 @@ impl ConnectionUrl {
         match scheme {
             "borg" => local(text, rest),
             "borg+unix" => unix(text, rest),
-            // Named rather than lumped in with the unknown schemes, because this one *will* exist
-            // and the sentence a user gets should say so.
-            "borg+ws" | "borg+wss" => Err(malformed(
-                text,
-                "`borg+ws://` is reserved for the browser transport and is not yet supported — \
-                 today's transports are borg:// and borg+unix://",
-            )),
+            "borg+ws" => websocket(text, rest, false),
+            "borg+wss" => websocket(text, rest, true),
             other => Err(malformed(
                 text,
                 &format!(
-                    "`{other}` is not a borg transport — try borg://, borg+unix:// or the \
-                     reserved borg+ws://"
+                    "`{other}` is not a borg transport — try borg://, borg+unix://, borg+ws:// or \
+                     borg+wss://"
                 ),
             )),
         }
     }
 
-    /// The socket to dial. `well_known` is `borg_host::host::default_socket`'s answer, which only a
+    /// The address to dial. `well_known` is `borg_host::host::default_socket`'s answer, which only a
     /// caller above the provider line can compute — see [`Transport::Local`].
     #[must_use]
-    pub fn socket(&self, well_known: &Path) -> PathBuf {
+    pub fn address(&self, well_known: &Path) -> Address {
         match &self.transport {
-            Transport::Local => well_known.to_path_buf(),
-            Transport::Unix(path) => path.clone(),
+            Transport::Local => Address::Unix(well_known.to_path_buf()),
+            Transport::Unix(path) => Address::Unix(path.clone()),
+            Transport::Ws { secure, host, port } => Address::Ws {
+                secure: *secure,
+                host: host.clone(),
+                port: *port,
+            },
         }
     }
 }
@@ -136,7 +204,7 @@ fn local(text: &str, rest: &str) -> Result<ConnectionUrl> {
             text,
             &format!(
                 "`{host}` is not reachable over the local transport — borg:// is this machine's \
-                 well-known socket, and a remote server is the reserved borg+ws://"
+                 well-known socket, and a remote server is borg+ws://"
             ),
         ));
     }
@@ -178,6 +246,49 @@ fn unix(text: &str, rest: &str) -> Result<ConnectionUrl> {
     Ok(ConnectionUrl {
         transport: Transport::Unix(PathBuf::from(rest)),
         registry: None,
+    })
+}
+
+/// `borg+ws://<host>[:<port>][/<registry>]`, and the same for `borg+wss://`.
+///
+/// **The port defaults the way `ws://`'s does** — 80 plain, 443 secure — rather than to a
+/// borg-specific number. A WebSocket exists here to ride infrastructure that already exists, and
+/// that infrastructure listens on those two; a deployment that terminates TLS at a proxy and
+/// forwards to `borg-server` is reached at `borg+wss://borg.example/crm` with nothing else said,
+/// which is the whole point. A developer running a server directly writes the port out.
+fn websocket(text: &str, rest: &str, secure: bool) -> Result<ConnectionUrl> {
+    let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.is_empty() {
+        return Err(malformed(
+            text,
+            "it names no host — borg+ws://<host>[:<port>]/<registry>",
+        ));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let Ok(port) = port.parse::<u16>() else {
+                return Err(malformed(
+                    text,
+                    &format!("`{port}` is not a port — borg+ws://<host>:<port>/<registry>"),
+                ));
+            };
+            (host, port)
+        }
+        None => (authority, if secure { 443 } else { 80 }),
+    };
+    if host.is_empty() {
+        return Err(malformed(
+            text,
+            "it names no host — borg+ws://<host>[:<port>]/<registry>",
+        ));
+    }
+    Ok(ConnectionUrl {
+        transport: Transport::Ws {
+            secure,
+            host: host.to_string(),
+            port,
+        },
+        registry: registry_segment(text, tail)?,
     })
 }
 
@@ -230,16 +341,21 @@ fn malformed(text: &str, why: &str) -> BorgError {
 ///
 /// Anything else — a permission error, a path that is not a socket — is reported as itself, because
 /// then the io error *is* the news.
+///
+/// **The same sentence for a socket and for a websocket**, and deliberately: the value of it is that
+/// a reader recognises it, and a second wording for the transport that happens to be remote would
+/// cost exactly that. What varies is the address in the middle, which is the part that says where to
+/// look.
 #[must_use]
-pub fn unreachable(address: &Path, err: &std::io::Error) -> BorgError {
+pub fn unreachable(address: &Address, err: &std::io::Error) -> BorgError {
     match err.kind() {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            BorgError::Unreachable(format!(
-                "no borg server at {} — start one with: borg-server start",
-                address.display()
-            ))
-        }
-        _ => BorgError::Storage(format!("{}: {err}", address.display())),
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::HostUnreachable
+        | std::io::ErrorKind::NetworkUnreachable => BorgError::Unreachable(format!(
+            "no borg server at {address} — start one with: borg-server start"
+        )),
+        _ => BorgError::Storage(format!("{address}: {err}")),
     }
 }
 
@@ -254,10 +370,7 @@ mod tests {
 
     fn parsed(text: &str) -> (String, Option<String>) {
         let url = ConnectionUrl::parse(text).unwrap_or_else(|err| panic!("{text}: {err}"));
-        (
-            url.socket(Path::new(WELL_KNOWN)).display().to_string(),
-            url.registry,
-        )
+        (url.address(Path::new(WELL_KNOWN)).to_string(), url.registry)
     }
 
     /// **The table.** `packages/borg-sdk/test/url.test.ts` holds the same cases, because one string
@@ -290,6 +403,25 @@ mod tests {
             ("borg+unix:///run/borg/crm/", "/run/borg/crm", None),
             // Registry names take the characters the server accepts, and no others.
             ("borg://localhost/my_app-2", WELL_KNOWN, Some("my_app-2")),
+            // The websocket transport: a host, a port, and the same registry rule as everything
+            // else. The port defaults the way `ws://`'s does, because a deployed server is behind
+            // a proxy that already listens on 443.
+            (
+                "borg+ws://borg.example:7717/crm",
+                "ws://borg.example:7717",
+                Some("crm"),
+            ),
+            (
+                "borg+ws://borg.example/crm",
+                "ws://borg.example:80",
+                Some("crm"),
+            ),
+            (
+                "borg+wss://borg.example/crm",
+                "wss://borg.example:443",
+                Some("crm"),
+            ),
+            ("borg+ws://127.0.0.1:9000", "ws://127.0.0.1:9000", None),
         ];
         for (text, socket, registry) in table {
             assert_eq!(
@@ -318,6 +450,9 @@ mod tests {
             ("borg+unix://tmp/borg.sock", "three slashes"),
             ("borg+unix:///", "it names no socket path"),
             ("borg://localhost/crm?tls=1", "`?` has no meaning here"),
+            ("borg+ws:///crm", "it names no host"),
+            ("borg+ws://borg.example:http/crm", "`http` is not a port"),
+            ("borg+ws://borg.example/a/b", "more than one path segment"),
         ];
         for (text, needle) in table {
             let refusal = ConnectionUrl::parse(text).unwrap_err().to_string();
@@ -332,16 +467,27 @@ mod tests {
         }
     }
 
-    /// **The transport that does not exist yet is named rather than left to be invented.** A client
-    /// that guessed `ws://` or `borg+websocket://` today would be wrong on the day the real one
-    /// ships, so the scheme is reserved and the refusal says what it is reserved for.
+    /// **The transport that was reserved is the transport that arrived, at the spelling that was
+    /// reserved for it.** Two milestones of `borg+ws://` being parsed and refused by name is what
+    /// makes this a match arm rather than a migration — nobody had invented a different spelling in
+    /// the meantime, because the refusal named this one.
     #[test]
-    fn the_websocket_transport_is_reserved_and_refused_by_name() {
-        for text in ["borg+ws://borg.example/crm", "borg+wss://borg.example/crm"] {
-            let refusal = ConnectionUrl::parse(text).unwrap_err().to_string();
-            assert!(refusal.contains("not yet supported"), "{refusal}");
-            assert!(refusal.contains("borg+ws://"), "{refusal}");
-        }
+    fn the_reserved_websocket_spelling_is_the_one_that_now_connects() {
+        let url = ConnectionUrl::parse("borg+ws://borg.example/crm").unwrap();
+        assert_eq!(
+            url.transport,
+            Transport::Ws {
+                secure: false,
+                host: "borg.example".into(),
+                port: 80
+            }
+        );
+        assert_eq!(url.registry.as_deref(), Some("crm"));
+        assert_eq!(
+            url.address(Path::new(WELL_KNOWN)).ws_url().as_deref(),
+            Some("ws://borg.example:80/"),
+            "the request path is `/` — the registry travels in the handshake and nowhere else"
+        );
     }
 
     /// Nothing here defaults a registry. The server's n=1 convenience and n≥2 refusal are one rule
@@ -357,10 +503,11 @@ mod tests {
     /// have to say it identically for it to be recognisable.
     #[test]
     fn nothing_listening_says_how_to_start_one() {
+        let socket = Address::Unix(PathBuf::from("/tmp/borg.sock"));
         let absent = std::io::Error::from(std::io::ErrorKind::NotFound);
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         for err in [absent, refused] {
-            let said = unreachable(Path::new("/tmp/borg.sock"), &err).to_string();
+            let said = unreachable(&socket, &err).to_string();
             assert_eq!(
                 said,
                 "no borg server at /tmp/borg.sock — start one with: borg-server start"
@@ -368,8 +515,24 @@ mod tests {
         }
         // Anything else is its own news and is reported as itself.
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let said = unreachable(Path::new("/tmp/borg.sock"), &denied).to_string();
+        let said = unreachable(&socket, &denied).to_string();
         assert!(said.contains("/tmp/borg.sock"), "{said}");
         assert!(!said.contains("borg-server start"), "{said}");
+
+        // **The same sentence over a websocket**, because what makes it worth having is that it is
+        // recognisable, and a second wording for the remote case would cost exactly that.
+        let remote = Address::Ws {
+            secure: false,
+            host: "borg.example".into(),
+            port: 7717,
+        };
+        assert_eq!(
+            unreachable(
+                &remote,
+                &std::io::Error::from(std::io::ErrorKind::ConnectionRefused)
+            )
+            .to_string(),
+            "no borg server at ws://borg.example:7717 — start one with: borg-server start"
+        );
     }
 }

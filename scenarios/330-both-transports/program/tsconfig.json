@@ -1,0 +1,24 @@
+{
+  // As 310's, and for the same reason: the subject is the *connection*, so this is an ordinary
+  // un-generated client naming structs as strings. What differs is only the url it is handed.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    // Node runs these files by erasing types rather than compiling them, so nothing that needs an
+    // emit may appear.
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["client.ts"]
+}
