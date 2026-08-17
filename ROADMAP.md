@@ -185,7 +185,7 @@ cloud later, with the platform's own control plane built on Borg itself.
 **P1 — networked, authed, deployed: done.** ~~WebSocket transport (browser-ready, rides standard
 infra)~~ · ~~hello acknowledgement (closes the routing deviation)~~ · ~~static org-scoped API keys~~ ·
 ~~export/import~~ · ~~Dockerfile + CI~~ · ~~servers live~~ — staging and production `borg-server`s
-run behind a TLS-terminating tunnel at `api-staging.borg-hq.com` and `api.borg-hq.com`, auth on,
+run behind a TLS-terminating tunnel at `borg-staging.site` and `api.borg-hq.com`, auth on,
 verified end to end over `borg+wss://` with the TypeScript SDK. See *The handshake is answered*,
 *Two transports, one protocol*, *Static API keys* and *Export and import* below. TLS was never among
 the items and is a proxy's job (§17.6); `DEPLOY.md` is where that expectation is written down for
