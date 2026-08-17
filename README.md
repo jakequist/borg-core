@@ -36,6 +36,8 @@ projects with the same care you'd give any young database.
 borg-server start             # a local server hosting a directory of registries
 borg-server create crm
 cd examples/personal-crm && ./dev.sh    # a small real app: React + API + a Borg repo
+
+docker build -t borg-server . # the deployment artifact — see DEPLOY.md
 ```
 
 A repo defines structs and pipelines in your language:
@@ -62,6 +64,8 @@ reflects, and re-running everything if (and only if) the code or its inputs chan
 
 - **`SPEC.md`** — normative: what the system is and why. Code comments cite its sections.
 - **`ROADMAP.md`** — where this is going, and a log of every design decision with its reasoning.
+- **`DEPLOY.md`** — running the server for real: the image, the volume, backup and upgrade via
+  `export`/`import`, and why TLS is the proxy's job.
 - **`scenarios/`** — 30+ end-to-end scenarios driving the real binaries; each one is a claim about
   the system stated in prose. If a scenario passes, that devex works.
 - **`examples/personal-crm/`** — a real application, including its unvarnished `FRICTION.md`.

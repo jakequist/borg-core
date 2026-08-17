@@ -17,6 +17,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "tests"
 cargo test --workspace
 
+step "binaries"
+# Before the SDK suites, not just before the scenarios. The TypeScript client suite drives a real
+# `borg-server` and skips itself when the binaries are absent (§17.5) — so building them *after* it
+# meant that on a tree nobody had built yet, thirty-one tests silently did not run and the script
+# still said "all checks passed". That is every CI checkout. The build has to precede both consumers,
+# so it is its own step rather than the first line of the scenarios one.
+cargo build -p borg-cli -p borg-server
+
 step "typescript"
 # The TypeScript SDK's own tests. Not everywhere has a JavaScript runtime, and this script has to
 # work everywhere, so a missing toolchain is a loud skip rather than a failure — the engine's half of
@@ -39,8 +47,8 @@ else
 fi
 
 step "scenarios"
-# Both binaries: the client every scenario drives, and the server seven of them start (§17.6).
-cargo build -p borg-cli -p borg-server
+# Both binaries — the client every scenario drives, and the server seven of them start (§17.6) —
+# were built above, because the TypeScript suite needs them too.
 bash scenarios/run-all.sh
 
 printf '\n\033[1;32mall checks passed\033[0m\n'

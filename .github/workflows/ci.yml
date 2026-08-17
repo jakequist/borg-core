@@ -1,0 +1,352 @@
+# CI. `./check.sh` is the definition of done (CLAUDE.md), so CI runs exactly that — one script, one
+# job, in its own order.
+#
+# **Why it is not split into parallel jobs.** fmt, clippy, the Rust tests, both SDKs and the
+# scenarios are five things a matrix would happily run at once, and doing that would change what
+# green means: `check.sh` builds `target/debug/borg` once and both the TypeScript client suite and
+# every scenario drive *that* binary, so splitting them means either building it several times or
+# inventing a way to pass it between jobs. Neither is the script a developer runs. The whole point
+# of "CI runs check.sh" is that a green tick and a clean local run are the same claim, and the
+# moment CI runs a subset or a rearrangement, they are not.
+#
+# **Why the skip guard exists.** Almost every optional step in this repo degrades to a loud skip
+# rather than a failure, because `check.sh` has to work on a laptop with no node. That is right for
+# a laptop and wrong for CI: a skip here means the toolchain setup above it silently broke and the
+# suite quietly stopped testing something. Every skip in the repo — `check.sh`'s two, `ts_skip` in
+# `scenarios/ts-lib.sh`, scenario 240's and 330's, and the SDK client suite's `console.warn` — is
+# announced with a `⚠`, and that character is used for nothing else anywhere in the tree. So the
+# guard is: no `⚠`, and no test runner reporting a nonzero skipped count.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here names the repository. It may be renamed, and `github.repository_owner` plus a fixed
+# image name is what survives that.
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a failing test is the difference between a rerun and a diagnosis.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------------------------
+  # The whole of check.sh, with every optional toolchain present so that nothing skips.
+  # -------------------------------------------------------------------------------------------
+  check:
+    name: check.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # `check.sh` runs `cargo fmt --check` and `cargo clippy -D warnings`; neither is present
+          # in a toolchain that did not ask for them.
+          components: rustfmt, clippy
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The scale benchmark job below builds `--release` from the same workspace. Separate keys
+          # so a debug cache is never restored over a release one and half-invalidated.
+          key: check
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # `packages/borg-sdk/package.json` declares no `packageManager`, so the version is stated
+          # here. Its lockfile is v9, which pnpm 10 reads and writes.
+          version: 10
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          # Must be 22.18 or newer: `scenarios/ts-lib.sh` skips when node cannot run a `.ts` file
+          # directly, and pipelines are `.ts` files with a `#!/usr/bin/env node` shebang.
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: packages/borg-sdk/pnpm-lock.yaml
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          # `check.sh` and scenario 240 both require 3.11+ and skip below it.
+          python-version: "3.11"
+
+      - name: Install the tools the scenarios shell out to
+        # `jq` is what every shell pipeline parses the protocol with — roughly two thirds of the
+        # scenarios push a repo containing one, and none of them checks it is installed. `procps`
+        # is `/bin/kill`, which `borg-server stop` runs as a program rather than as a shell
+        # builtin; without it the liveness probe answers "dead" for a live server instead of
+        # erroring, which is the one dependency here that fails silently wrong. Both ship on
+        # ubuntu-latest today; installing them explicitly is what stops a runner image change from
+        # being the thing that breaks the suite.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq procps
+
+      - name: Assert every optional toolchain is present and new enough
+        # Before check.sh, not after: a version that is going to cause a skip should fail here,
+        # where the message says which tool and what was needed, rather than as a `⚠` two hundred
+        # lines into a log.
+        run: |
+          set -euo pipefail
+          node -e 'const [a,b]=process.versions.node.split(".").map(Number); if(!(a>22||(a===22&&b>=18))) throw new Error(`node ${process.version} cannot run a .ts file directly (needs 22.18+)`)'
+          pnpm --version
+          python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'
+          jq --version
+          command -v kill
+          command -v /bin/kill || command -v /usr/bin/kill
+
+      - name: ./check.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          # stderr merged into stdout, because every scenario skip is written to stderr and the
+          # guard below reads one file. `tee` keeps it on the console too, so a failure is
+          # readable without downloading anything.
+          ./check.sh 2>&1 | tee check.log
+
+      - name: Fail if anything skipped
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+
+          # Every skip in the tree announces itself with `⚠`, and nothing else uses it. See the
+          # file header.
+          if grep -n '⚠' check.log; then
+            echo "::error::check.sh skipped something. CI must run all of it — see the lines above."
+            status=1
+          fi
+
+          # The SDK client suite is the one that skips *quietly*: three `suite.skipIf(...)` guards
+          # in packages/borg-sdk/test/client.test.ts emit a single console.warn and are then
+          # invisible except as a count in vitest's summary — and `pnpm run --silent check` can
+          # swallow the warn. So the count is asserted separately rather than trusted to the ⚠.
+          if grep -nE '[0-9]+ skipped' check.log; then
+            echo "::error::a test runner reported skipped tests. CI must run all of them."
+            status=1
+          fi
+
+          # `python3 -m unittest -q` reports skips as `OK (skipped=N)` and with no ⚠ of its own.
+          if grep -nE 'skipped=[1-9]' check.log; then
+            echo "::error::the Python SDK suite skipped tests."
+            status=1
+          fi
+
+          if [ "$status" -eq 0 ]; then
+            echo "no skips: check.sh ran all of it"
+          fi
+          exit "$status"
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-log
+          path: check.log
+          retention-days: 14
+
+  # -------------------------------------------------------------------------------------------
+  # The fan-out benchmark. A record, not a gate.
+  # -------------------------------------------------------------------------------------------
+  bench:
+    name: fan-out benchmark
+    runs-on: ubuntu-latest
+    # n=128_000 at parallelism 1 is the slowest point on the curve, and the whole curve is 16
+    # measurements. Generous on purpose: the failure this job exists to catch is an O(n²)
+    # regression, which presents as a run that takes far longer than usual, and a tight timeout
+    # would turn that evidence into an unexplained cancellation.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+
+      - name: Record what it ran on
+        # A number without a machine is not a data point. GitHub's runners are not identical over
+        # time, so the hardware goes in the artifact beside the measurements.
+        run: |
+          set -euo pipefail
+          {
+            echo "commit:  ${{ github.sha }}"
+            echo "ref:     ${{ github.ref }}"
+            echo "date:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner:  ${{ runner.os }} ${{ runner.arch }}"
+            echo "cores:   $(nproc)"
+            echo "cpu:     $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo "memory:  $(free -h | awk '/^Mem:/ {print $2}')"
+            echo "rustc:   $(rustc --version)"
+            echo
+          } | tee scale-bench.txt
+
+      - name: cargo test --release -p borg-engine --test scale -- --ignored
+        shell: bash
+        # It must complete — a benchmark that is allowed to fail is a benchmark nobody notices
+        # stopped running. What is *not* asserted is any threshold: runners vary enough that a
+        # number gate would be noise, and the `assert_eq!`s inside `measure` already make this a
+        # correctness test as well as a measurement.
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          # The measurements are written with `eprintln!`, so stderr is the interesting stream.
+          cargo test --release -p borg-engine --test scale -- --ignored --nocapture 2>&1 \
+            | tee -a scale-bench.txt
+
+      - name: Upload the numbers
+        # `always()` so a run that timed out still leaves whatever it managed to measure, which is
+        # exactly the evidence an O(n²) regression produces.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-bench-${{ github.sha }}
+          path: scale-bench.txt
+          retention-days: 90
+
+  # -------------------------------------------------------------------------------------------
+  # The deployment artifact. Built on every push and PR; published only from main.
+  # -------------------------------------------------------------------------------------------
+  image:
+    name: borg-server image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # What `GITHUB_TOKEN` needs to push to GHCR. Scoped to this job rather than the workflow, so
+      # the two jobs above run with a read-only token.
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Work out the image name
+        id: image
+        # GHCR rejects an uppercase path, and an owner may have capitals. Nothing here names the
+        # repository, which may be renamed — only the owner and a fixed image name.
+        run: |
+          set -euo pipefail
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${owner}/borg-server" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        # Only when we are going to push. A PR from a fork gets a read-only token, and logging in
+        # with it would fail for no reason — the build below still runs and still proves the
+        # Dockerfile.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          # `latest` and the short sha. The sha tag is the one a deployment should pin: `latest` is
+          # for a human typing `docker pull`, and DEPLOY.md says to pin the other.
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      - name: Build, into the local daemon
+        # Built and loaded first, pushed only after the smoke test below passes. Two steps rather
+        # than one `push: true` so that **the smoke test gates the publish** — an image that does
+        # not serve should never reach `latest`. The push step re-runs this build against the same
+        # cache, so it costs a cache lookup and not a second compile.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: borg-server:ci
+          # BuildKit's layer cache, in Actions cache. The Dockerfile's `--mount=type=cache` for the
+          # cargo registry and target directory does not survive between runners, so a cold run is
+          # a full release build of the workspace; this keeps the apt, node and cargo layers.
+          cache-from: type=gha
+          # `ignore-error` because a cache *export* failure is not a broken image, and the Actions
+          # cache is the flakiest thing in this job. The build's own result still gates the push.
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Smoke-test the image
+        # Building proves it compiles. This proves the artifact *serves*: pid 1 comes up and stays
+        # up, the health endpoint answers on the port the image declares, a registry can be made,
+        # and the interpreters a pipeline may be written in are present — which is what the image's
+        # size is being spent on and the thing most likely to be silently broken by a base-image
+        # bump. Ends on SIGTERM, because a server that has to be killed loses its advisory locks
+        # rather than releasing them.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() { docker rm -f borg-smoke >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          echo "── the runtimes a producer may be written in (§17.4)"
+          docker run --rm --entrypoint sh borg-server:ci -c \
+            'node --version && python3 --version && bash --version | head -1 && jq --version'
+
+          echo "── node can execute a .ts pipeline directly, shebang and all"
+          docker run --rm --entrypoint sh borg-server:ci -c \
+            'printf "#!/usr/bin/env node\nconst n: number = 7;\nconsole.log(\"ts ok\", n);\n" > /tmp/p.ts && chmod +x /tmp/p.ts && /tmp/p.ts'
+
+          echo "── it serves"
+          docker run -d --name borg-smoke -p 7411:7411 borg-server:ci
+          for _ in $(seq 60); do
+            if curl -fsS http://127.0.0.1:7411/health >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          health="$(curl -fsS http://127.0.0.1:7411/health)"
+          echo "$health"
+          echo "$health" | grep -q '"status":"ok"'
+
+          echo "── a registry can be created, and the well-known address reaches the server"
+          docker exec borg-smoke borg-server --data-dir /data create smoke
+          docker exec borg-smoke borg-server --data-dir /data status
+          # `borg://localhost/<registry>` (§17.7) must resolve to the socket the entrypoint bound.
+          # It only does because the image sets XDG_RUNTIME_DIR — see the Dockerfile.
+          docker exec borg-smoke borg --url borg://localhost/smoke generate --lang ts -o /tmp/gen
+          # `-o` names a directory; the emitter writes borg.generated.ts into it.
+          docker exec borg-smoke test -s /tmp/gen/borg.generated.ts
+
+          echo "── export and import round-trip through the running server (§19)"
+          docker exec borg-smoke borg-server --data-dir /data export smoke /data/smoke.borgstream
+          docker exec borg-smoke borg-server --data-dir /data import restored /data/smoke.borgstream
+
+          echo "── it is not running as root"
+          test "$(docker exec borg-smoke id -u)" = "10001"
+
+          echo "── SIGTERM is a clean shutdown, not a kill"
+          time docker stop borg-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' borg-smoke)" = "0"
+
+      - name: Push to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

@@ -41,6 +41,9 @@ use std::path::PathBuf;
 mod lifecycle;
 mod serve;
 
+/// Where `--listen` is read from when nothing on the command line says. See `parse_args`.
+const LISTEN_ENV: &str = "BORG_LISTEN";
+
 struct Args {
     verb: String,
     data_dir: Option<PathBuf>,
@@ -113,7 +116,14 @@ Options:
   --listen <ws url>     also listen for websockets here (repeatable); port 0 binds an
                         ephemeral one and the log names it
   -n, --lines <count>   `logs`: how many lines to show (default 50)
-  -f, --follow          `logs`: keep printing as more arrives"
+  -f, --follow          `logs`: keep printing as more arrives
+
+Environment:
+  BORG_LISTEN           listen addresses, separated by commas or spaces, used only when no
+                        --listen is given — so an image's port is configuration rather than
+                        part of its command. Any --listen on the command line wins outright.
+  BORG_DERIVE_PARALLELISM
+                        how many pipeline invocations may run at once (default: the machine's)"
     );
     std::process::exit(2)
 }
@@ -151,7 +161,33 @@ fn parse_args() -> Args {
             _ => args.rest.push(arg),
         }
     }
+    // A listen address is configuration, and an image is configured by environment: `BORG_LISTEN`
+    // is what lets `docker run -e BORG_LISTEN=…` move the port without rewriting the container's
+    // command. `BORG_DERIVE_PARALLELISM` already set the precedent that operational tuning may
+    // arrive this way; what may *not* is anything the protocol is a function of, which is why this
+    // is the only flag with an environment twin.
+    //
+    // Flags win outright rather than merging with it. Two half-specified sources are how an
+    // operator ends up listening somewhere they did not ask for, and "the command line is what is
+    // running" is the answer that survives being read off `ps`. The daemonizing path re-execs with
+    // one `--listen` per address (`lifecycle::background`), so a backgrounded server listens on
+    // whatever this resolved to and never re-reads the environment for itself.
+    if args.listen.is_empty()
+        && let Some(configured) = std::env::var_os(LISTEN_ENV)
+    {
+        args.listen = listen_addresses(&configured.to_string_lossy());
+    }
     args
+}
+
+/// `BORG_LISTEN` split into addresses. Separate from `parse_args` because the process environment
+/// is global and a test that set it would be racing every other test in this binary.
+fn listen_addresses(configured: &str) -> Vec<String> {
+    configured
+        .split([',', ' ', '\t'])
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[tokio::main]
@@ -316,4 +352,45 @@ fn named(registry: &RegistryInfo) -> String {
         registry.name,
         if registry.open { "open" } else { "not opened" }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listen_addresses;
+
+    #[test]
+    fn one_address_is_the_common_case() {
+        assert_eq!(listen_addresses("ws://0.0.0.0:7411"), ["ws://0.0.0.0:7411"]);
+    }
+
+    #[test]
+    fn several_addresses_may_be_separated_by_commas_or_spaces() {
+        // Both, because a compose file writes one and a shell writes the other, and an operator
+        // should not have to learn which this parser preferred.
+        let want = ["ws://0.0.0.0:7411", "ws://127.0.0.1:7412"];
+        assert_eq!(
+            listen_addresses("ws://0.0.0.0:7411,ws://127.0.0.1:7412"),
+            want
+        );
+        assert_eq!(
+            listen_addresses("ws://0.0.0.0:7411 ws://127.0.0.1:7412"),
+            want
+        );
+    }
+
+    #[test]
+    fn an_empty_setting_asks_for_no_listener_rather_than_one_named_nothing() {
+        // `BORG_LISTEN=` is how a compose file overrides an image's default back to socket-only,
+        // and an empty string reaching `TcpListener::bind` would be a startup failure instead.
+        assert!(listen_addresses("").is_empty());
+        assert!(listen_addresses("  ").is_empty());
+    }
+
+    #[test]
+    fn separators_around_an_address_do_not_become_addresses() {
+        assert_eq!(
+            listen_addresses(", ws://0.0.0.0:7411 ,"),
+            ["ws://0.0.0.0:7411"]
+        );
+    }
 }

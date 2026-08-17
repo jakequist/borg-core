@@ -1,0 +1,20 @@
+# The build context is the workspace, and `target/` is the one directory that would dwarf it.
+# Everything excluded here is either rebuilt in the image or has no business in it.
+target/
+**/node_modules/
+**/dist/
+.git/
+.github/
+.claude/
+.nx/
+**/__pycache__/
+*.env
+.env
+
+# Not inputs to `cargo build`. The CRM example in particular carries a UI with its own toolchain,
+# and none of it reaches the two binaries this image ships. Nothing in `crates/` reaches a `.md`
+# with `include_str!`, so dropping the root ones costs no build — only this pattern is not
+# recursive, so the crates' own docs stay regardless.
+examples/
+scenarios/
+*.md

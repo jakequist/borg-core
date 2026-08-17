@@ -181,13 +181,11 @@ cloud later, with the platform's own control plane built on Borg itself.
   thin VM-provider seam named for the eventual cloud move.
 
 **P1 — networked, authed, deployed:** ~~WebSocket transport (browser-ready, rides standard infra)~~ ·
-~~hello acknowledgement (closes the routing deviation)~~ · static org-scoped API keys · export/import ·
-Dockerfile + CI · one server live on the Proxmox host. **The first two are done** — see *The
-handshake is answered* and *Two transports, one protocol* below; TLS is deliberately not among them
-and is a proxy's job (§17.6).
-**P1 — networked, authed, deployed:** WebSocket transport (browser-ready, rides standard infra) ·
-hello acknowledgement (closes the routing deviation) · static org-scoped API keys · ~~export/import~~
-**done** · Dockerfile + CI · one server live on the Proxmox host.
+~~hello acknowledgement (closes the routing deviation)~~ · ~~export/import~~ · ~~Dockerfile + CI~~ ·
+static org-scoped API keys · one server live on the Proxmox host. **All but the last two are done** —
+see *The handshake is answered*, *Two transports, one protocol* and *Export and import* below. TLS
+was never among them and is a proxy's job (§17.6); `DEPLOY.md` is where that expectation is written
+down for whoever runs the thing.
 **P2 — the platform:** control-plane app on Borg — orgs, users, memberships, token issuance,
 provisioning, subdomain routing, platform.borg-hq.com.
 **P3 — tiering:** dedicated-server provisioning via the Proxmox API, on-prem packaging, and
@@ -1868,6 +1866,76 @@ scheme for two commands would be the beginning of a third. So the pair is split 
 The consequence is that `borg export --url …` does not exist, unlike `generate` and `repo push`. If a
 reason to want it appears, the missing piece is not the flag but somewhere for the bytes to go — see
 the paragraph above.
+
+### Deployment: the image and CI
+
+#### The runtime image carries interpreters, because the server runs user code
+
+The lean-image instinct is wrong here and the reason is structural. A pipeline is not a plugin
+loaded into the server — it is an executable the server *spawns*, with `Command::new` and no shell
+in between (§17.4) — so the set of languages a pipeline may be written in is exactly the set of
+interpreters in the image. `node`, `python3`, `bash` and `jq` are therefore in it, and it is ~400 MB
+rather than ~90 MB.
+
+What settles it is where the failure lands. A lean image does not make an unsupported pipeline fail
+at build time; it makes it a **broken producer** (§14) discovered during derivation, in production,
+by whoever pushed the repo — a correctness property relocated into a base-image decision made in a
+different repository. And the usual counter-argument, attack surface, does not apply: tenant
+isolation is the VM boundary (*The production arc*), so a shorter package list buys no isolation
+that the VM was not already providing. It buys fewer languages, nothing else.
+
+The direction that *is* right is subtractive: a deployment which knows it runs only TypeScript
+should derive an image that removes the rest. That is a decision made with knowledge this repository
+does not have, which is the argument for the default being complete rather than minimal.
+
+Node is pinned to 22.18+ and asserted at build time, because a `.ts` pipeline is executed directly
+and that is the version whose type stripping makes it possible — the same floor `scenarios/ts-lib.sh`
+enforces, for the same reason, in a third place so a base-image bump cannot quietly undo it.
+
+#### `BORG_LISTEN`, and why it is the only flag with an environment twin
+
+A container's command is baked into its image and its configuration is not, so a listen address that
+could only be a flag would make moving a port a rebuild. `BORG_LISTEN` is read only when no
+`--listen` is given; flags win outright rather than merging, because two half-specified sources are
+how an operator ends up listening somewhere they did not ask for.
+
+It is the *only* one. `BORG_DERIVE_PARALLELISM` had already established that operational tuning may
+arrive by environment; what may not is anything the protocol is a function of, and a listen address
+is deployment configuration that §17.5 never observes. The line to hold is that the environment
+configures where the server is, never what it says.
+
+#### The image sets `XDG_RUNTIME_DIR`, which is not the tidying it looks like
+
+`borg://localhost/<registry>` is the well-known address (§17.7) and it resolves to
+`default_socket(default_data_dir())`. In a container with `HOME=/data` and no `XDG_RUNTIME_DIR` that
+is `/data/.borg/borg.sock`, while a server told `--data-dir /data` listens on `/data/borg.sock` —
+one directory apart, so the one address the spec calls well-known misses the server. Setting
+`XDG_RUNTIME_DIR=/data` makes both sides agree. The documented hazard of a shared runtime dir, two
+data directories colliding on one socket, does not apply to an image whose whole shape is one server.
+
+#### CI runs `check.sh` whole, and fails on a skip
+
+One job, one script, in its own order — not a matrix. `check.sh` builds `target/debug/borg` once and
+both the TypeScript client suite and every scenario drive that binary, so splitting the steps across
+jobs means building it repeatedly or shipping it between them, and neither is the script a developer
+runs. "CI is green" and "check.sh passed on my machine" have to be the same claim.
+
+The harder half is that almost every optional step degrades to a **loud skip** rather than a failure,
+which is right on a laptop with no node and wrong in CI, where a skip means the toolchain setup
+silently broke. Every skip in the tree announces itself with `⚠` and that character is used for
+nothing else anywhere, so the gate is: no `⚠` in the output, plus an assertion that no test runner
+reported a nonzero skipped count — the SDK client suite's `suite.skipIf` is otherwise invisible
+except as a number in vitest's summary.
+
+That gate immediately found a real one. `check.sh` built the binaries as the first line of its
+*scenarios* step, after the TypeScript step — so on any tree nobody had built yet, which is every CI
+checkout, thirty-one client tests skipped themselves and the script still printed "all checks
+passed". The build is now its own step before both consumers.
+
+The fan-out benchmark is a separate job that uploads its numbers as an artifact and asserts no
+threshold. Runners vary too much for a number gate to be anything but noise, but a regression of the
+class this exists to catch — `O(n²)`, which once hid for two milestones — is legible in a curve
+across runs, and a curve needs the runs to have been recorded.
 
 ### Performance, tooling and tests
 

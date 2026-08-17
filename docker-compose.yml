@@ -1,0 +1,70 @@
+# One `borg-server`, one volume. The shape the Proxmox VM runs.
+#
+# This is the whole deployment: a server, the data it holds, the pipeline code it spawns, and a
+# proxy in front of it terminating TLS. `DEPLOY.md` is the prose; this is the file.
+
+services:
+  borg:
+    image: ghcr.io/jakequist/borg-server:latest
+    # Pin the sha tag in anything that matters. `latest` is for a human typing `docker pull`; a
+    # deployment that floats has no answer to "what is running right now" and no way back.
+    #   image: ghcr.io/jakequist/borg-server:sha-1a2b3c4
+    container_name: borg
+    restart: unless-stopped
+
+    environment:
+      # The listen address as configuration rather than as part of the command (SPEC.md §17.6).
+      # Comma- or space-separated for several; empty turns the WebSocket off and leaves the unix
+      # socket, which is always bound.
+      BORG_LISTEN: ws://0.0.0.0:7411
+      # How many pipeline invocations may run at once. Unset means "as many as the machine has
+      # cores", which on a shared VM is usually more than you want to give one tenant.
+      # BORG_DERIVE_PARALLELISM: "4"
+
+    ports:
+      # Bound to loopback on purpose. The server speaks **plaintext ws://** and terminates no TLS
+      # (§17.6) — publishing 7411 on a public interface publishes an unauthenticated, unencrypted
+      # database. The reverse proxy is what the world talks to; it forwards to this.
+      - "127.0.0.1:7411:7411"
+
+    volumes:
+      # The registries, the unix socket, and anything exported into the data directory.
+      - borg-data:/data
+      # Pipeline code. A producer is an executable the server spawns by the path recorded when the
+      # repo was pushed (§9.2), so this path must be identical in every container that serves this
+      # data — a restore into a container that mounts the repo somewhere else has producers
+      # pointing at nothing. Read-only: the server runs this code, it does not write it.
+      - ./repos:/repos:ro
+
+    healthcheck:
+      # The image already declares one; restated here so that `depends_on: condition:
+      # service_healthy` works for anything added beside it, and so that a changed BORG_LISTEN port
+      # can be reflected in one file rather than requiring a rebuilt image.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7411/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+    # A write pays for the derivation it causes, in the request that caused it (CLAUDE.md), and
+    # derivation is user code. A runaway pipeline should hit a limit rather than the host's OOM
+    # killer, which would take the server with it.
+    mem_limit: 2g
+    cpus: 2.0
+
+    # Pipelines are subprocesses, so the process count is not bounded by the server alone.
+    pids_limit: 512
+
+    logging:
+      # A server that logs forever fills the disk the registries are on.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  borg-data:
+    # A named volume rather than a bind mount, so that the uid the image runs as (10001) is applied
+    # by Docker on first creation. A bind mount inherits nothing and has to be chown'd on the host
+    # — DEPLOY.md, "The volume".
+    driver: local
