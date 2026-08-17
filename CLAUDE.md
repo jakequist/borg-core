@@ -10,18 +10,23 @@ describes, **update the spec in the same change**. A spec that lags the code is 
 ## Commands
 
 ```
-./check.sh                  # fmt, clippy -D warnings, all Rust tests, both SDKs, all scenarios
+./check.sh                  # fmt, clippy -D warnings, all Rust tests, both binaries, both SDKs,
+                            # all scenarios
 cargo test --workspace      # Rust tests only
 bash scenarios/run-all.sh   # end-to-end scenarios only (needs `cargo build -p borg-cli -p borg-server`)
 cargo fmt
 ```
 
+**The `binaries` step comes before `typescript` on purpose.** The TypeScript client suite drives a
+real `borg-server` and *skips itself* when the binaries are missing, so building them as part of the
+scenarios step meant that on any tree nobody had built yet — which is every CI checkout — thirty-one
+tests quietly did not run and the script still said "all checks passed". Do not fold that build back
+into the scenarios step.
+
 There are **two binaries**: `borg` (the client, `crates/borg-cli`) and `borg-server` (the server,
 `crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310, 320, 330 and 340 start a real server,
 so both have to be built before `run-all.sh`; `check.sh` builds both. 330 also needs a free TCP port,
 because it starts a server listening on a WebSocket as well as on its socket.
-`crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310 and 320 start a real server, so both have
-to be built before `run-all.sh`; `check.sh` builds both.
 
 ```
 borg export [<file>] / borg import <file>            # a registry as a canonical event stream (§19)
@@ -108,6 +113,17 @@ packages/borg-sdk-py        the Python SDK: the pipeline half, and the neutralit
 scenarios/                  end-to-end scenarios driving the real binaries; `ts-lib.sh` is the
                             skip-if-no-node harness the TypeScript ones share, and `lib.sh` holds
                             `BORG_SERVER_BIN` for the seven that start a server
+Dockerfile                  the deployment artifact: `borg-server` and `borg` on Debian slim, with
+                            node, python3, bash and jq, because a pipeline is a subprocess the
+                            server spawns and the image's package list *is* the set of languages a
+                            pipeline may be written in. `DEPLOY.md` is the operator's half and
+                            `docker-compose.yml` the example; `ROADMAP.md`, *Deployment*, has the
+                            reasoning
+.github/workflows/ci.yml    CI. Runs `./check.sh` whole — not a subset, not a matrix — and **fails
+                            if anything skipped**: every skip in the tree announces itself with a
+                            `⚠` and that character is used for nothing else, which is what makes
+                            the guard exhaustive. A second job records the fan-out benchmark as an
+                            artifact without gating on it
 ```
 
 Dependency arrows point inward to `borg-core`. Trait crates (`borg-storage`, `borg-exec`) are

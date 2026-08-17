@@ -2709,6 +2709,13 @@ instead of it. The local transport is what every `borg` invocation speaks and wh
 lock's liveness test *is*, so a server that could be told to stop speaking it would be one a
 developer could lock themselves out of.
 
+The listen addresses may also come from **`BORG_LISTEN`**, comma- or space-separated, and that is
+the only flag with an environment twin. A container is configured by environment and its command is
+baked into the image, so a port that could only be a flag would make changing it a rebuild; the
+address is deployment configuration and nothing in the protocol is a function of it. `--listen` on
+the command line wins outright rather than merging, because two half-specified sources are how an
+operator ends up listening somewhere they did not ask for.
+
 **The WebSocket is one framing, not one protocol more.** The messages, the codecs, the handshake and
 the single-key rule are §17.5's, unchanged; what differs is that a WebSocket is message-framed
 already, so §17.4's newline and length prefix disappear and a codec picks the frame kind instead —
