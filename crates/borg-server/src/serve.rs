@@ -2,7 +2,8 @@
 //!
 //! **Built as the local instance of a hosted platform, not as a separate species.** The same binary,
 //! the same messages and the same routing are what a multi-tenant deployment would run; what a
-//! laptop leaves out is a name in a handshake and a credential nothing checks yet. So the loop is
+//! laptop leaves out is a name in a handshake and a keys file to check its credential against. So
+//! the loop is
 //! kept thin on purpose: read a message, decide which registry it is for, call the function `borg`'s
 //! own subcommand calls, write the answer back. Everything it calls lives in `borg_host`, which is
 //! where the CLI's commands live too — there is one implementation of a transaction across both
@@ -112,6 +113,7 @@
 
 use borg_core::{BorgError, MergeRejection, Result};
 use borg_host::host::{Host, Slot};
+use borg_host::keys;
 use borg_host::ops::{self, Ops};
 use borg_host::render::struct_def;
 use borg_host::{push, serving, stream};
@@ -337,7 +339,8 @@ impl WsTransport {
     ///
     /// Registry *count* rather than names, and deliberately: a health endpoint is unauthenticated
     /// and a registry name is tenancy. `registries` on §17.5 is where the names live, behind a
-    /// handshake that will one day carry a credential.
+    /// handshake that carries a credential and — on an enforcing server — is refused without one
+    /// (`borg_host::keys`).
     fn health(&self) -> String {
         let body = format!(
             r#"{{"status":"ok","server":"{}","registries":{}}}"#,
@@ -577,7 +580,8 @@ impl WsPeer {
 
 // --- The server ------------------------------------------------------------------------------------
 
-/// What the hosted registries are given up on the way out: their locks, and the socket.
+/// What the hosted registries are given up on the way out: their locks, the socket, and the local
+/// admin credential.
 struct Lock {
     host: Arc<Host>,
 }
@@ -588,6 +592,9 @@ impl Drop for Lock {
         // which is the whole reason liveness is a connect and not a file's existence.
         self.host.release_all();
         let _ = std::fs::remove_file(&self.host.socket);
+        // The admin token is per boot, so it goes with the socket it was minted for — a token
+        // outliving its server would be a credential nothing can revoke by stopping anything.
+        keys::clear_admin(&self.host.data_dir);
     }
 }
 
@@ -603,6 +610,12 @@ pub async fn run(host: &Arc<Host>, base: &Ops, websockets: &[String]) -> Result<
         std::fs::create_dir_all(parent)
             .map_err(|err| BorgError::Storage(format!("{}: {err}", parent.display())))?;
     }
+
+    // **Refuse to start on a keys file that cannot be read**, rather than starting and refusing
+    // every connection. Both are safe — neither serves an unauthenticated request — but only one of
+    // them puts the reason where an operator is looking, which is the terminal they just typed
+    // `start` into (`borg_host::keys`).
+    keys::load(&host.data_dir)?;
 
     // Asked in this order on purpose: *is anyone serving these stores* comes before *is this address
     // free*, because a second server on a different socket is the failure that matters and the one a
@@ -654,6 +667,23 @@ pub async fn run(host: &Arc<Host>, base: &Ops, websockets: &[String]) -> Result<
     let lock = Lock {
         host: Arc::clone(host),
     };
+
+    // **The local admin credential, minted before anything can connect.** SPEC.md §17.6.
+    //
+    // `borg-server status`, `create`, `export` and `import` are clients of the server they
+    // administer, so enforcement would lock them out — and the tempting fix, exempting the unix
+    // socket, would make unix and WebSocket mean different things. This is the fix instead: a
+    // `*`-scoped token in a `0600` file beside the pidfile, presented on the same field and checked
+    // by the same code as any other credential, drawing the boundary the filesystem already draws.
+    //
+    // Minted here, *after* the listeners are bound and before the socket is announced, so that
+    // nothing can connect between the two. It is not fatal: a data directory that cannot be written
+    // is a server that starts without a local admin path and says so, rather than a server that
+    // does not start.
+    if let Err(err) = keys::mint_admin(&host.data_dir) {
+        eprintln!("warning: no local admin credential ({err}) — `borg-server status` and friends");
+        eprintln!("         will need $BORG_TOKEN if this server is enforcing keys");
+    }
 
     // **No registry is opened here.** Locking every hosted store is a file write per registry;
     // opening one replays its log. A server that did the second at boot would pay every registry's
@@ -858,10 +888,30 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
         }
         None => None,
     };
-    // **`credential` is read and discarded, deliberately.** Nothing authenticates on a unix socket,
-    // where the file's permissions are the boundary; the field exists so the wire does not have to
-    // move when that stops being true (§17.6).
-    let _credential = hello.credential.as_deref();
+    // **Authentication, before routing and before anything else that could name a registry.**
+    // SPEC.md §17.6, `borg_host::keys`.
+    //
+    // The order is the no-disclosure property. Routing's refusal names what this server hosts, so a
+    // caller that has not authenticated must never reach it: otherwise a key scoped to `staging`, or
+    // no key at all, could enumerate a deployment's tenants by guessing names. So the credential is
+    // checked here, its sentence names no registry, and everything after this point works inside the
+    // scope the credential earned.
+    //
+    // A server with no keys file authorises everybody with `Scope::all()`, which is why every
+    // scenario written before this existed is unchanged.
+    let access = match keys::authorize(&served.host.data_dir, hello.credential.as_deref()) {
+        Ok(access) => access,
+        Err(err) => return peer.refuse(&err.to_string()),
+    };
+    // **The scope is checked against the *name the client asked for*, not against what is hosted.**
+    // Same reason, one step finer: a registry outside the scope has to be indistinguishable from one
+    // that does not exist, so the check happens before anything looks the name up.
+    if let Some(named) = hello.registry.as_deref()
+        && let Err(err) = keys::permit(&access.scope(), named)
+    {
+        return peer.refuse(&err.to_string());
+    }
+    let scope = access.scope();
 
     let base = Ops {
         version: version.or(served.base.version),
@@ -883,7 +933,7 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
     // `borg-server status` asks `registries`, which needs no store, and refusing it at the
     // handshake would leave a misrouted client with no way to find out what to name. The ambiguity
     // is then reported by the first request that needs a store, naming the options.
-    let target = served.host.route(hello.registry.as_deref());
+    let target = served.host.route_within(hello.registry.as_deref(), &scope);
     let settled = match (&target, hello.registry.as_deref()) {
         (Ok(slot), _) => Some(slot.name.clone()),
         (Err(err), Some(_)) => return peer.refuse(&err.to_string()),
@@ -897,6 +947,9 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
             server: env!("CARGO_PKG_VERSION").to_string(),
             codec,
             registry: settled,
+            // What mode this server is in, on the connection that was being made anyway — which is
+            // how `borg-server status` tells an open server from an authed one (§17.6).
+            auth: access.mode().to_string(),
         })
         .is_err()
     {
@@ -926,7 +979,7 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
                 continue;
             }
         };
-        let response = dispatch(served, target.as_ref(), &base, request, handle);
+        let response = dispatch(served, target.as_ref(), &base, request, handle, &scope);
         if peer.send(&response).is_err() {
             return;
         }
@@ -934,23 +987,32 @@ fn session(mut peer: Box<dyn Peer>, served: &Served, handle: &tokio::runtime::Ha
 }
 
 /// One request: find the registry it is for, take that registry, answer. SPEC.md §17.6.
+///
+/// `scope` is what the handshake's credential earned, and it is applied here as well as there
+/// because three messages name a registry of their own: `registries` enumerates them, `repo_push`
+/// and `export` may address another, and `registry_create` and `import` make one. A scope checked
+/// only at the handshake would be a scope any of those five walked straight past.
 fn dispatch(
     served: &Served,
     target: std::result::Result<&Arc<Slot>, &BorgError>,
     base: &Ops,
     request: Request,
     handle: &tokio::runtime::Handle,
+    scope: &keys::Scope,
 ) -> Response {
     // The questions that are about the *server* rather than about a store, and therefore the ones a
     // connection that settled no registry can still ask. `import` is here rather than below because
     // it *creates* the registry it names (§19) — there is no slot to route to yet, which is the same
     // reason `registry_create` is here.
     match &request {
+        // **Filtered to the scope**, because a registry name is tenancy (§17.6) — the same reason
+        // `GET /health` reports a count and not the names. On an open server the scope is `*` and
+        // this is the whole list, unchanged.
         Request::Registries {} => {
             return Response::Registries(
                 served
                     .host
-                    .hosted()
+                    .hosted_within(scope)
                     .into_iter()
                     .map(|registry| RegistryInfo {
                         name: registry.name,
@@ -960,12 +1022,22 @@ fn dispatch(
             );
         }
         Request::RegistryCreate { name } => {
+            if let Err(refusal) = keys::permit(scope, name) {
+                return Response::Error {
+                    message: refusal.to_string(),
+                };
+            }
             return match handle.block_on(served.host.create(name, base)) {
                 Ok(_) => Response::Ok {},
                 Err(err) => failed(err),
             };
         }
         Request::Import { name, path } => {
+            if let Err(refusal) = keys::permit(scope, name) {
+                return Response::Error {
+                    message: refusal.to_string(),
+                };
+            }
             return match handle.block_on(served.host.restore(name, base, Path::new(path))) {
                 Ok((_, report)) => Response::Imported {
                     name: name.clone(),
@@ -988,7 +1060,9 @@ fn dispatch(
         _ => None,
     };
     let slot = match named {
-        Some(name) => match served.host.route(Some(&name)) {
+        // Routed **within the scope**, so the registry-hopping messages cannot reach past the
+        // credential that opened the connection.
+        Some(name) => match served.host.route_within(Some(&name), scope) {
             Ok(slot) => slot,
             Err(err) => return failed(err),
         },
@@ -1375,19 +1449,36 @@ mod tests {
     }
 
     /// One request against one registry, through the same routing a connection performs.
+    ///
+    /// Unscoped, because these tests are about what a request *does* and an open server is what
+    /// every one of them predates. The scope is exercised where it is decided — the handshake — and
+    /// by `within` below, which is the same call with a credential's scope in it.
     async fn ask(
         host: &Arc<Host>,
         dir: &Path,
         registry: Option<&str>,
         request: Request,
     ) -> Response {
+        within(host, dir, registry, request, &keys::Scope::all()).await
+    }
+
+    /// The same, inside what a credential earned. See [`dispatch`].
+    async fn within(
+        host: &Arc<Host>,
+        dir: &Path,
+        registry: Option<&str>,
+        request: Request,
+        scope: &keys::Scope,
+    ) -> Response {
         let served = Served::new(Arc::clone(host), base_for(dir));
-        let target = served.host.route(registry);
+        let target = served.host.route_within(registry, scope);
         let handle = tokio::runtime::Handle::current();
         let base = served.base.clone();
         // The dispatch blocks on the runtime the way a connection thread does, so it is run on a
         // blocking thread rather than on this one.
-        tokio::task::block_in_place(|| dispatch(&served, target.as_ref(), &base, request, &handle))
+        tokio::task::block_in_place(|| {
+            dispatch(&served, target.as_ref(), &base, request, &handle, scope)
+        })
     }
 
     fn value(response: &Response) -> Option<String> {
@@ -1935,6 +2026,37 @@ mod tests {
         }
     }
 
+    /// The same hello, presenting a credential. See the authentication section below.
+    fn hello_with(registry: Option<&str>, credential: &str) -> ClientHello {
+        ClientHello {
+            credential: Some(credential.to_string()),
+            ..hello_naming(registry)
+        }
+    }
+
+    /// A hello of this shape over a **WebSocket**, and whatever the server said back.
+    ///
+    /// The unix and websocket halves of every authentication claim are asserted together rather than
+    /// in two files, because the one thing that must not be true of this feature is that the two
+    /// transports mean different things — see `borg_host::keys` for why exempting the unix socket
+    /// was refused.
+    fn greet_ws(port: u16, hello: &ClientHello) -> HelloAck {
+        let mut client = borg_protocol::ws::Client::dial("127.0.0.1", port).unwrap();
+        let _: ServerHello = client.recv(Codec::Json).unwrap();
+        client.send(Codec::Json, hello).unwrap();
+        client.recv::<HelloAck>(Codec::Json).unwrap()
+    }
+
+    /// The reason a refusal gave, or a panic naming what was accepted instead.
+    fn refusal(ack: HelloAck) -> String {
+        match ack {
+            HelloAck::Refused { reason } => reason,
+            HelloAck::Accepted(accepted) => {
+                panic!("this handshake should have been refused, and settled {accepted:?}")
+            }
+        }
+    }
+
     /// **Every accepted hello is answered, and the answer says what was settled.** SPEC.md §17.5.
     ///
     /// For two milestones this message did not exist, and *accepted* was therefore indistinguishable
@@ -2210,6 +2332,347 @@ mod tests {
             get("/").starts_with("HTTP/1.1 404"),
             "one endpoint, not two"
         );
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Static API keys, at the handshake, on both transports -----------------------------------
+    //
+    // Everything in this section is a claim about `session`, which is one function whatever the
+    // transport is — so each claim that could differ between the two is asserted over both, and the
+    // ones that are about the *rule* rather than about the wire are asserted once. See
+    // `borg_host::keys` for the decisions: no keys file means open, an unreadable one means refused,
+    // and the unix socket is deliberately not exempt.
+
+    /// **A server with no keys file is open, and that is what keeps every scenario written before
+    /// this feature passing unchanged.** SPEC.md §17.6.
+    ///
+    /// The zero-ceremony case, asserted first because it is the one a regression would be found in
+    /// last: a laptop's `borg-server start` has no configuration, and a credential presented to it
+    /// is ignored rather than refused — a client that sends one to a server that does not check it
+    /// is not misled, because it was refused nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_with_no_keys_file_accepts_everybody_over_both_transports() {
+        let dir = temp_dir("openmode");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "open.sock");
+        let port = listening_ws(&host, &dir);
+
+        for hello in [
+            hello_naming(Some("crm")),
+            hello_with(Some("crm"), "borgk_junk"),
+        ] {
+            for ack in [greet(&socket, &hello), greet_ws(port, &hello)] {
+                let HelloAck::Accepted(accepted) = ack else {
+                    panic!("an open server refuses nobody")
+                };
+                assert_eq!(accepted.registry.as_deref(), Some("crm"));
+                assert_eq!(
+                    accepted.auth, "open",
+                    "an operator has to be able to tell an open server from an authed one"
+                );
+            }
+        }
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **The first key flips the server, and the refusals disclose nothing.** SPEC.md §17.6.
+    ///
+    /// Four refusals and one acceptance, over both transports. The refusals are the point: an
+    /// unauthenticated caller learns that a credential is required, or that its own is not valid,
+    /// and never *which registries exist* — which is the property that stops a public address being
+    /// a tenant enumerator.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_enforcing_server_refuses_a_missing_or_unknown_credential_without_disclosing_anything()
+     {
+        let dir = temp_dir("enforcing");
+        let host = host_with(&dir, &["crm", "analytics"]).await;
+        let socket = listening(&host, &dir, "enforcing.sock");
+        let port = listening_ws(&host, &dir);
+        let key = keys::issue(&dir, "ci", keys::Scope::all()).unwrap();
+
+        for (hello, needle) in [
+            (hello_naming(Some("crm")), "requires a credential"),
+            (hello_with(Some("crm"), "borgk_wrong"), "not valid"),
+            // The administrative shape — a hello naming no registry — is refused too. This is the
+            // interaction with the recorded n≥2 asymmetry: naming nothing is still *accepted* when
+            // the credential is good, but "made no claim that could be wrong" was never an argument
+            // for needing no credential, and `registries` is exactly the message that must not be
+            // answerable to a stranger.
+            (hello_naming(None), "requires a credential"),
+            (hello_with(None, "borgk_wrong"), "not valid"),
+        ] {
+            for (transport, ack) in [
+                ("unix", greet(&socket, &hello)),
+                ("websocket", greet_ws(port, &hello)),
+            ] {
+                let said = refusal(ack);
+                assert!(said.contains(needle), "over {transport}: {said}");
+                assert!(
+                    !said.contains("crm") && !said.contains("analytics"),
+                    "over {transport}, a refusal named a registry to a caller that could not \
+                     authenticate: {said}"
+                );
+            }
+        }
+
+        // …and the key that was issued gets in, over both, and is told the server is enforcing.
+        let hello = hello_with(Some("crm"), &key);
+        for ack in [greet(&socket, &hello), greet_ws(port, &hello)] {
+            let HelloAck::Accepted(accepted) = ack else {
+                panic!("the issued key must get in")
+            };
+            assert_eq!(accepted.registry.as_deref(), Some("crm"));
+            assert_eq!(accepted.auth, "required");
+        }
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **Revocation takes effect on the next handshake, and on nothing else.** SPEC.md §17.6.
+    ///
+    /// The decision recorded rather than assumed: connections already open are **not** torn down.
+    /// Killing them would need per-connection tracking the server does not have and a revocation
+    /// path that reaches into every session thread, for a window that closes on its own — and the
+    /// alternative to writing that down is somebody discovering it during an incident.
+    ///
+    /// It works without restarting or telling the server anything, because `keygen` and `revoke`
+    /// write a file and the handshake re-reads it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_key_is_refused_by_the_next_handshake_and_a_live_connection_survives() {
+        let dir = temp_dir("revoked");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "revoked.sock");
+        let key = keys::issue(&dir, "ci", keys::Scope::all()).unwrap();
+
+        // A connection opened *before* the revocation, held open across it.
+        let stream = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let _: ServerHello = borg_protocol::read_message(&mut reader, Codec::Json).unwrap();
+        borg_protocol::write_message(&mut writer, Codec::Json, &hello_with(Some("crm"), &key))
+            .unwrap();
+        let HelloAck::Accepted(_) =
+            borg_protocol::read_message::<HelloAck, _>(&mut reader, Codec::Json).unwrap()
+        else {
+            panic!("the key was valid when this connection was made")
+        };
+
+        keys::revoke(&dir, "ci").unwrap();
+
+        // The next handshake is refused — no restart, no signal, nothing told the server anything.
+        let said = refusal(greet(&socket, &hello_with(Some("crm"), &key)));
+        assert!(said.contains("not valid"), "{said}");
+
+        // …and the connection that was already up is still answering. **This is the documented
+        // trade**, not an accident: connections are short-lived, and a revocation that also had to
+        // reach into open ones is machinery this does not have.
+        borg_protocol::write_message(&mut writer, Codec::Json, &Request::BranchList {}).unwrap();
+        let answer: Response = borg_protocol::read_message(&mut reader, Codec::Json).unwrap();
+        assert!(
+            matches!(answer, Response::Branches(_)),
+            "a live connection survives the revocation of the key that opened it: {answer:?}"
+        );
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **A scoped key reaches its registries and cannot see the others.** SPEC.md §17.6.
+    ///
+    /// Two properties, and the second is the one that takes thought. Refusing the connection is
+    /// obvious; making an out-of-scope registry *indistinguishable from one that does not exist* is
+    /// what stops a scoped key being a tenant enumerator, and it is why the scope check happens
+    /// before anything looks a name up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_key_cannot_reach_or_even_see_the_registries_it_was_not_given() {
+        let dir = temp_dir("scopedkey");
+        let host = host_with(&dir, &["crm", "analytics"]).await;
+        let socket = listening(&host, &dir, "scoped.sock");
+        let port = listening_ws(&host, &dir);
+        let key = keys::issue(&dir, "crm-only", keys::Scope::Only(vec!["crm".into()])).unwrap();
+
+        for (transport, ack) in [
+            ("unix", greet(&socket, &hello_with(Some("crm"), &key))),
+            ("websocket", greet_ws(port, &hello_with(Some("crm"), &key))),
+        ] {
+            let HelloAck::Accepted(accepted) = ack else {
+                panic!("over {transport}, the key's own registry must be reachable")
+            };
+            assert_eq!(accepted.registry.as_deref(), Some("crm"));
+        }
+
+        for (transport, ack) in [
+            ("unix", greet(&socket, &hello_with(Some("analytics"), &key))),
+            (
+                "websocket",
+                greet_ws(port, &hello_with(Some("analytics"), &key)),
+            ),
+        ] {
+            let said = refusal(ack);
+            assert!(said.contains("analytics"), "over {transport}: {said}");
+            assert!(
+                !said.contains("crm"),
+                "over {transport}, the refusal named what else the key reaches — and, on a server \
+                 hosting more, would have named what else exists: {said}"
+            );
+        }
+
+        // **The n=1 convenience applies to the scope, not to the server.** Two registries hosted,
+        // one visible, so naming nothing settles on the one — which is the same rule §17.6 states,
+        // read from inside the credential.
+        let HelloAck::Accepted(accepted) = greet(&socket, &hello_with(None, &key)) else {
+            panic!("one visible registry is a sole registry")
+        };
+        assert_eq!(accepted.registry.as_deref(), Some("crm"));
+
+        // …and `registries` answers the scope rather than the server, because a registry name is
+        // tenancy — the same reason `GET /health` reports a count.
+        let Response::Registries(hosted) = within(
+            &host,
+            &dir,
+            Some("crm"),
+            Request::Registries {},
+            &keys::Scope::Only(vec!["crm".into()]),
+        )
+        .await
+        else {
+            panic!("registries")
+        };
+        assert_eq!(
+            hosted.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["crm"],
+            "a scoped credential is told about its own registries and no others"
+        );
+
+        // The registry-making messages are scoped too, or a key for `crm` could make `whatever` and
+        // then reach it.
+        let Response::Error { message } = within(
+            &host,
+            &dir,
+            Some("crm"),
+            Request::RegistryCreate {
+                name: "whatever".into(),
+            },
+            &keys::Scope::Only(vec!["crm".into()]),
+        )
+        .await
+        else {
+            panic!("creating a registry outside the scope must be refused")
+        };
+        assert!(message.contains("not valid for registry"), "{message}");
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **The local admin token gets in, and it is not an exemption for the unix socket.**
+    ///
+    /// It is a credential on the same field, checked by the same code — which is why it works over
+    /// a websocket too, if you have it. Asserting that is the point: an implementation that had
+    /// quietly special-cased the transport would pass every other test in this section and fail
+    /// this one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_admin_token_is_a_credential_and_not_a_transport_exemption() {
+        let dir = temp_dir("adminserve");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "admin.sock");
+        let port = listening_ws(&host, &dir);
+        keys::issue(&dir, "ci", keys::Scope::Only(vec!["nowhere".into()])).unwrap();
+        let admin = keys::mint_admin(&dir).unwrap();
+
+        // The administrative connection: no registry named, `registries` asked. This is what
+        // `borg-server status` does, and what enforcement would otherwise have locked out.
+        let HelloAck::Accepted(accepted) = greet(&socket, &hello_with(None, &admin)) else {
+            panic!("the admin token must be able to make an administrative connection")
+        };
+        assert_eq!(accepted.auth, "required");
+        assert_eq!(
+            accepted.registry.as_deref(),
+            Some("crm"),
+            "unscoped, so the sole registry resolves as it does on an open server"
+        );
+
+        // The same credential over the other transport, because it is a credential and not a
+        // property of the socket it was read beside.
+        assert!(matches!(
+            greet_ws(port, &hello_with(Some("crm"), &admin)),
+            HelloAck::Accepted(_)
+        ));
+
+        // And the unix socket is not exempt: the same connection without the token is refused.
+        let said = refusal(greet(&socket, &hello_naming(None)));
+        assert!(said.contains("requires a credential"), "{said}");
+
+        keys::clear_admin(&dir);
+        assert!(
+            refusal(greet(&socket, &hello_with(None, &admin))).contains("not valid"),
+            "a token whose server has stopped is not a key"
+        );
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **A keys file that cannot be read refuses connections rather than serving them open.**
+    ///
+    /// The failure mode this exists for is a truncated file — a full disk, a half-finished copy, a
+    /// `>` in the wrong shell — which under the sidecar rule (*a missing or corrupt file reads as
+    /// the default*) would silently turn authentication off. `borg_host::keys` is the one file
+    /// beside a store that does not follow that rule, and this is the reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_corrupt_keys_file_refuses_every_handshake() {
+        let dir = temp_dir("corruptserve");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "corrupt.sock");
+        let key = keys::issue(&dir, "ci", keys::Scope::all()).unwrap();
+        std::fs::write(keys::keys_path(&dir), "{\"keys\": [truncat").unwrap();
+
+        for hello in [hello_naming(Some("crm")), hello_with(Some("crm"), &key)] {
+            let said = refusal(greet(&socket, &hello));
+            assert!(said.contains("cannot read its credential store"), "{said}");
+            assert!(
+                !said.contains(&dir.display().to_string()),
+                "a caller that has not authenticated learns no filesystem path: {said}"
+            );
+        }
+
+        host.shutdown().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A refusal for a *credential* lingers exactly as a refusal for a registry does — the client
+    /// that wrote its hello and its first request in one breath still reads the answer. Asserted
+    /// separately because the lingering close is easy to keep for the path that had it and lose for
+    /// a new one, and because an unauthenticated client meeting a reset would report "connection
+    /// reset by peer" where it should report "credential required".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credential_refusal_survives_a_client_that_wrote_without_waiting() {
+        let dir = temp_dir("lingerauth");
+        let host = host_with(&dir, &["crm"]).await;
+        let socket = listening(&host, &dir, "lingerauth.sock");
+        keys::issue(&dir, "ci", keys::Scope::all()).unwrap();
+
+        for _ in 0..32 {
+            let stream = UnixStream::connect(&socket).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            borg_protocol::write_message(&mut writer, Codec::Json, &hello_naming(Some("crm")))
+                .unwrap();
+            for _ in 0..8 {
+                let _ =
+                    borg_protocol::write_message(&mut writer, Codec::Json, &Request::BranchList {});
+            }
+            let mut said = String::new();
+            std::io::Read::read_to_string(&mut BufReader::new(stream), &mut said).unwrap();
+            assert!(
+                said.contains("requires a credential"),
+                "the refusal was lost to the client's own write: {said}"
+            );
+        }
 
         host.shutdown().await;
         std::fs::remove_dir_all(&dir).unwrap();

@@ -77,8 +77,9 @@ each labelled `current`.
 
 It stops the server, deletes `data/personal-crm/`, and starts it again. There is no
 `registry_delete` on the protocol and deliberately so: destroying a store over a wire whose
-`credential` nothing checks yet is exactly the shape `borg-server stop` avoided by being a `SIGTERM`
-rather than a message. Throwing a store away is a thing you do with filesystem access, on purpose.
+`credential` is a static api key rather than an identity is exactly the shape `borg-server stop`
+avoided by being a `SIGTERM` rather than a message. Throwing a store away is a thing you do with
+filesystem access, on purpose.
 Only the registry's directory goes — the server's pidfile and log live beside it in `data/`, and the
 log is where the reason a previous run died is written.
 

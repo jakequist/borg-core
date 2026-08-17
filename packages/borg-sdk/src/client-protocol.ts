@@ -42,6 +42,18 @@ export interface ClientHello {
    * client that guessed would be re-implementing half of it.
    */
   registry?: string;
+  /**
+   * **The api key this connection presents** (§17.6).
+   *
+   * Reserved on this wire for two milestones before anything checked it, and checked since static
+   * API keys arrived — the field did not move, which was the entire argument for reserving it.
+   * Tomorrow it holds a platform-issued signed token that the server *verifies* rather than looks
+   * up; that is a change to what the server does with the string, not to the string's place.
+   *
+   * **Absent is legitimate**: a server with no keys file authenticates nobody. An enforcing one
+   * refuses an absent credential in the acknowledgement, with a sentence naming no registry.
+   */
+  credential?: string;
 }
 
 /**
@@ -67,6 +79,15 @@ export type HelloAck =
          * the connection settled no registry, which is the administrative case and not a failure.
          */
         registry: string | null;
+        /**
+         * **Whether this server authenticates**: `"open"` or `"required"` (§17.6). Absent reads as
+         * `"open"`, which is what a server built before this field was one.
+         *
+         * A fact about the server, answered on the connection that was being made anyway. It never
+         * names a key or a label — an acknowledgement is read by whoever just connected, and which
+         * mode the server is in is the whole of what they need.
+         */
+        auth?: string;
       };
     }
   | { refused: { reason: string } };

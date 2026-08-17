@@ -864,3 +864,221 @@ suite.skipIf(!available).each(TRANSPORTS)("a connection over $name", (transport)
     300_000,
   );
 });
+
+/**
+ * **A credentialed client, over both transports.** SPEC.md §17.6.
+ *
+ * Its own server and its own data directory, because the whole point of this suite is a keys file —
+ * and the file's *existence* is what flips a server to enforcing, so it cannot share the open one
+ * every suite above depends on. That separation is itself the claim being made: authentication is a
+ * property of the data directory, not a mode somebody turns on.
+ *
+ * The claims are the ones an SDK is the only place to make: that a credential travels, that it
+ * travels identically over a unix socket and a websocket, and that it is **re-presented after a
+ * reconnect** — the last of those being the one that only breaks after an outage, which is exactly
+ * when nobody wants to be finding out.
+ */
+suite.skipIf(!available)("the client SDK, against a server that requires a key", () => {
+  let authDir: string;
+  let authData: string;
+  let authSocket: string;
+  let authPort: number;
+  let authServer: ChildProcess;
+  let key: string;
+  let scoped: string;
+
+  const borgServer = (...args: string[]): string =>
+    execFileSync(BORG_SERVER, ["--data-dir", authData, "--socket", authSocket, ...args], {
+      encoding: "utf8",
+    });
+
+  const startAuthServer = (): ChildProcess =>
+    spawn(
+      BORG_SERVER,
+      [
+        "start",
+        "--foreground",
+        "--data-dir",
+        authData,
+        "--socket",
+        authSocket,
+        "--listen",
+        `ws://127.0.0.1:${authPort}`,
+      ],
+      { stdio: "pipe" },
+    );
+
+  beforeAll(async () => {
+    if (!available) return;
+    authDir = mkdtempSync(join(tmpdir(), "borg-auth-"));
+    authData = join(authDir, "data");
+    authSocket = join(authDir, "borg.sock");
+    // Two registries, so that a scoped key has something to be refused from.
+    for (const name of ["crm", "analytics"]) {
+      const store = join(authData, name, "borg.db");
+      execFileSync(BORG, ["--store", store, "init"], { stdio: "pipe" });
+      const schema = join(authDir, `${name}.json`);
+      writeFileSync(
+        schema,
+        JSON.stringify({
+          repo: 1,
+          events: [{ DeclareField: { struct_name: "Company", field: "headcount", ty: "Int" } }],
+        }),
+      );
+      execFileSync(BORG, ["--store", store, "def", "push", schema], { stdio: "pipe" });
+    }
+
+    // **`keygen` writes a file and never speaks to the socket**, which is what makes minting the
+    // first credential possible at all — and why it happens here, before the server exists.
+    key = borgServer("keygen", "app").trim();
+    scoped = borgServer("keygen", "crm-only", "--registries", "crm").trim();
+
+    authPort = await freePort();
+    authServer = startAuthServer();
+    await untilListening(authSocket);
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!available) return;
+    if (authServer.exitCode === null && authServer.signalCode === null) {
+      const gone = new Promise<void>((done) => authServer.once("exit", () => done()));
+      authServer.kill("SIGTERM");
+      await gone;
+    }
+    rmSync(authDir, { recursive: true, force: true });
+  });
+
+  /** The two transports, as urls into this suite's own server. */
+  const urls = (registry: string, credential?: string): { name: string; url: string }[] => {
+    const at = credential === undefined ? "" : `:${credential}@`;
+    return [
+      { name: "a unix socket", url: `borg+unix://${at}${authSocket}/${registry}` },
+      { name: "a websocket", url: `borg+ws://${at}127.0.0.1:${authPort}/${registry}` },
+    ];
+  };
+
+  test("the key gets in and works end to end, over both transports", async () => {
+    for (const { name, url } of urls("crm", key)) {
+      const bc = await createBorgContext({ url });
+      const tx = await bc.branch("main").begin();
+      await tx.object(Company, "#1").set("headcount", 7);
+      expect(await tx.commit(), name).toMatch(/^L\d+$/);
+      expect((await bc.branch("main").get("Company#1.headcount")).value, name).toBe("7");
+      bc.close();
+    }
+  });
+
+  /**
+   * **Refused at construction, saying what to present and naming no registry.** The handshake is
+   * where this is decided (§17.6), so the failure lands where the connection was configured — and
+   * the message must not leak the tenant list to somebody who could not authenticate.
+   */
+  test("a client with no credential is refused, and told nothing else", async () => {
+    for (const { name, url } of urls("crm")) {
+      await expect(createBorgContext({ url }), name).rejects.toThrow(BorgClientError);
+      const said = await createBorgContext({ url }).catch((err: Error) => err.message);
+      expect(said, name).toContain("requires a credential");
+      expect(said, name).not.toContain("analytics");
+    }
+  });
+
+  test("a client with the wrong credential is refused in the same words for every wrong key", async () => {
+    for (const { name, url } of urls("crm", "borgk_nope")) {
+      const said = await createBorgContext({ url }).catch((err: Error) => err.message);
+      expect(said, name).toContain("not valid");
+      expect(said, name).not.toContain("analytics");
+    }
+  });
+
+  /** A scope reaches its registries and cannot see the others — §17.6, from a client. */
+  test("a scoped key reaches its registry and not the other", async () => {
+    for (const { name, url } of urls("crm", scoped)) {
+      const bc = await createBorgContext({ url });
+      expect(await bc.branch("main").head(), name).toMatch(/^L\d+$/);
+      bc.close();
+    }
+    for (const { name, url } of urls("analytics", scoped)) {
+      const said = await createBorgContext({ url }).catch((err: Error) => err.message);
+      expect(said, name).toContain("analytics");
+      expect(said, name).not.toContain("crm");
+    }
+  });
+
+  /**
+   * The credential travels the same three ways a url does: explicitly, in the url, and in
+   * `$BORG_TOKEN` — and the precedence is explicit, then url, then environment.
+   */
+  test("a credential may be passed explicitly or come from $BORG_TOKEN", async () => {
+    const explicit = await createBorgContext({
+      socket: authSocket,
+      registry: "crm",
+      credential: key,
+    });
+    expect(await explicit.branch("main").head()).toMatch(/^L\d+$/);
+    explicit.close();
+
+    const ambient = await createBorgContext({
+      url: `borg+unix://${authSocket}/crm`,
+      env: { BORG_TOKEN: key } as NodeJS.ProcessEnv,
+    });
+    expect(await ambient.branch("main").head()).toMatch(/^L\d+$/);
+    ambient.close();
+
+    // Explicit beats the environment, which is what lets one process reach two servers.
+    const beaten = createBorgContext({
+      url: `borg+unix://${authSocket}/crm`,
+      credential: "borgk_nope",
+      env: { BORG_TOKEN: key } as NodeJS.ProcessEnv,
+    });
+    await expect(beaten).rejects.toThrow(/not valid/);
+  });
+
+  /**
+   * **The reconnect re-presents the credential.** SPEC.md §17.6, §17.7.
+   *
+   * The one claim that cannot be made anywhere but here, and the one that would break silently: a
+   * context that authenticated at construction and then reconnected without the credential would
+   * work perfectly until the first server bounce and fail afterwards. It is asserted over both
+   * transports because a reconnect is a property of the connection, not of the wire under it.
+   */
+  test("a reconnect after a bounce presents the credential again", async () => {
+    for (const { name, url } of urls("crm", key)) {
+      const bc = await createBorgContext({ url });
+      expect(await bc.branch("main").head(), name).toMatch(/^L\d+$/);
+
+      const gone = new Promise<void>((done) => authServer.once("exit", () => done()));
+      authServer.kill("SIGTERM");
+      await gone;
+      authServer = startAuthServer();
+      await untilListening(authSocket);
+
+      // A fresh handshake, on a socket that did not exist a moment ago, against a server that still
+      // requires a key — so this only passes if the credential went out again.
+      const tx = await bc.branch("main").begin();
+      await tx.object(Company, "#2").set("headcount", 3);
+      expect(await tx.commit(), name).toMatch(/^L\d+$/);
+      expect(bc.connected, name).toBe(true);
+      bc.close();
+    }
+  }, 120_000);
+
+  /**
+   * **Revocation takes effect on the next handshake**, and a live connection is deliberately not
+   * torn down — the trade `borg_host::keys` records. `keys revoke` writes a file beside a running
+   * server and tells it nothing.
+   */
+  test("a revoked key is refused by the next connection, and the live one carries on", async () => {
+    const rotating = borgServer("keygen", "rotating").trim();
+    const url = `borg+unix://:${rotating}@${authSocket}/crm`;
+    const bc = await createBorgContext({ url });
+    expect(await bc.branch("main").head()).toMatch(/^L\d+$/);
+
+    borgServer("keys", "revoke", "rotating");
+
+    await expect(createBorgContext({ url })).rejects.toThrow(/not valid/);
+    // …and the connection that was already up still answers. Short-lived connections are what makes
+    // this an acceptable window; tearing them down needs per-connection tracking nothing has.
+    expect(await bc.branch("main").head()).toMatch(/^L\d+$/);
+    bc.close();
+  });
+});

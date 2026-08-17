@@ -181,13 +181,10 @@ cloud later, with the platform's own control plane built on Borg itself.
   thin VM-provider seam named for the eventual cloud move.
 
 **P1 — networked, authed, deployed:** ~~WebSocket transport (browser-ready, rides standard infra)~~ ·
-~~hello acknowledgement (closes the routing deviation)~~ · static org-scoped API keys · export/import ·
-Dockerfile + CI · one server live on the Proxmox host. **The first two are done** — see *The
-handshake is answered* and *Two transports, one protocol* below; TLS is deliberately not among them
-and is a proxy's job (§17.6).
-**P1 — networked, authed, deployed:** WebSocket transport (browser-ready, rides standard infra) ·
-hello acknowledgement (closes the routing deviation) · static org-scoped API keys · ~~export/import~~
-**done** · Dockerfile + CI · one server live on the Proxmox host.
+~~hello acknowledgement (closes the routing deviation)~~ · ~~static org-scoped API keys~~ ·
+~~export/import~~ · Dockerfile + CI · one server live on the Proxmox host. **All but the last two are
+done** — see *The handshake is answered*, *Two transports, one protocol* and *Static API keys* below;
+TLS is deliberately not among them and is a proxy's job (§17.6).
 **P2 — the platform:** control-plane app on Borg — orgs, users, memberships, token issuance,
 provisioning, subdomain routing, platform.borg-hq.com.
 **P3 — tiering:** dedicated-server provisioning via the Proxmox API, on-prem packaging, and
@@ -392,6 +389,18 @@ retried — and carries on, committing a transaction that was open before the re
 a client is configured by two variables that can disagree, or that a server restart is an
 application restart, which is what it was.* — `scenarios/310-connection-urls`,
 `packages/borg-sdk/test/client.test.ts` and `crates/borg-protocol/src/url.rs`.
+
+**S21 — a server that requires a key refuses everything else, and tells it nothing.** The first
+`keygen` flips a running server to enforcing without a restart; the url that worked a moment ago is
+refused at the handshake with *credential required* and **no registry name in it**; the keyed url
+works end to end through a commit; a key scoped to one registry cannot reach the other and its
+refusal names nothing else; a revoked key is refused by the next connection while the live one
+carries on; and `status` names the mode throughout — against a server it administers with a
+credential rather than through an exempt transport. *Failing means either that a deployed server can
+be reached without one, or that a public address enumerates its tenants for anyone who connects, or
+that a local server has grown configuration — and this feature is worth having only if all three
+stay false.* — `scenarios/340-api-keys`, `crates/borg-host/src/keys.rs`,
+`crates/borg-server/src/serve.rs` and `packages/borg-sdk/test/client.test.ts`.
 
 ### Durability
 
@@ -1416,10 +1425,12 @@ pinned it — `scenarios/300`, `scenarios/310`, and the SDK's client suite — w
 round* deliberately, so that the day an acknowledgement existed they would flip rather than quietly
 keep passing. They have flipped.
 
-**`credential` is reserved and its existence is the point.** A local server has no one to
-authenticate — the socket's file permissions are the boundary — and nothing reads the field. Adding
-it once authentication exists would mean moving the wire at exactly the moment there is a deployment
-that cannot take a wire change. It costs one `Option<String>` now.
+**`credential` was reserved and its existence was the point.** A local server has no one to
+authenticate — the socket's file permissions are the boundary — and for two milestones nothing read
+the field. Adding it once authentication existed would have meant moving the wire at exactly the
+moment there is a deployment that cannot take a wire change. It cost one `Option<String>`, and it
+paid: *Static API keys* below is the thing that checks it, and **the wire did not move** — no
+version bump, no new message, one additive field on the acknowledgement.
 
 #### `start | stop | status | logs`, backgrounding by default
 
@@ -1721,6 +1732,95 @@ both up, a container, an api whose job is to answer `503` until the backend is t
 unchanged: an error at construction names the address you just configured, and one at first use
 names whichever line happened to be first.
 
+#### Static API keys, and what deliberately stays out
+
+The P1 auth item, built as the smallest thing that puts a server on the internet, and shaped so the
+platform's signed tokens replace it without a wire change. The engine **verifies** credentials and
+never owns identity — that is the control/data-plane split above, and it is why every decision here
+is about *checking a string*, never about who somebody is.
+
+**The file's existence is the whole configuration.** No keys file means an open server; the first
+`keygen` flips it. The alternative — a flag, an environment variable, an `auth = on` — is one more
+thing to be wrong in one more place, and it would have made `borg-server start` on a laptop a thing
+with ceremony. The cost is that "how do I turn this on" has an answer nobody would guess without
+being told, which `status`, `keys` and `--help` all now say.
+
+**A corrupt keys file is a refusal, not an open server**, and it is the only state beside a store
+that breaks the sidecar rule (*missing or corrupt reads as the default*). The rule is justified by
+a sidecar holding nothing that cannot be recreated; a keys file holds exactly that in the direction
+that matters, because reading corrupt as absent would turn authentication off by accident. A server
+refuses to boot on one, and one corrupted while it runs refuses every handshake.
+
+**The refusals disclose nothing, and the ordering is what makes that true.** The credential is
+checked *before* routing, because routing's refusal names what the server hosts — so an
+unauthenticated caller could otherwise enumerate a deployment's tenants by guessing. The scope is
+checked against the name the client asked for, *before* anything looks it up, so an out-of-scope
+registry is indistinguishable from one that does not exist. And a key that was revoked is refused in
+the same words as one that never existed, because which of those it is, is a fact about the key
+list. From inside a credential, scope is a filter on what exists rather than a check after the fact:
+`registries` and every routing refusal are scoped, and the n=1 convenience applies to the scope
+rather than to the server.
+
+**The admin path: a minted token, not an exempt transport.** `status`, `create`, `export` and
+`import` are clients of the server they administer, and enforcement locks them out. Two options were
+real:
+
+- *Exempt the unix socket.* Rejected. It would make unix and WebSocket mean different things, so
+  every guarantee here would grow "…over the network" — and the local case, which is the one
+  everybody develops against, would be the one nothing tests. The bug that gets shipped by an
+  exemption is not the exemption; it is the second exemption somebody adds later by analogy.
+- *Have the lifecycle commands read the data directory directly.* This is what they do for the
+  pidfile and the log, and it would have worked — but `status` deliberately asks the **server** what
+  it hosts rather than reading a directory (a directory answers about a directory, and answers
+  nothing at all once the server is elsewhere). Making auth the one thing it reads locally would
+  have split that.
+
+So: a server mints a `*`-scoped token into `<data-dir>/borg-server.admin`, mode `0600`, at boot, and
+removes it with the socket and the advisory locks. Its own commands present it on the same field and
+it is checked by the same code — a credential, whose provenance happens to be a file. The boundary
+is the filesystem's, and it is the honest one: whoever can read the data directory could already
+read the stores under it. `$BORG_TOKEN` overrides it, which is how a lifecycle command reaches a
+server it does not share a filesystem with. `scenarios/340` asserts the negative — take the token
+away and `status` is refused like anybody else — because that assertion is the one that would fail
+if somebody "simplified" this back into an exemption.
+
+**Revocation is handshake-time, and live connections survive it.** Tearing them down needs
+per-connection tracking the server does not keep and a revocation path reaching into every session
+thread, for a window that closes on its own: connections are short-lived, and a client that
+reconnects re-presents its credential and is refused. Recorded rather than discovered, and asserted
+in both directions — the next handshake fails, the open one carries on — so that nobody has to find
+out during an incident. If it ever needs to be immediate, the cost is a registry of live sessions
+and a way to signal them, which is the same machinery concurrent requests within a registry would
+want, and it should be one change rather than two.
+
+**Revoking the last key leaves a locked server; deleting the file leaves an open one.** The file
+survives at zero keys, deliberately: those are opposite operations, and it must be impossible to
+reach the loosest by repeating the strictest.
+
+**`keygen` and `revoke` write a file and never speak to the socket.** Minting the first credential
+over a connection that already requires one is a circle, so the two commands share a filesystem
+rather than a protocol. The payoff beyond bootstrap is that enforcement and rotation need no restart
+— the handshake re-reads the file — and the price is that they need filesystem access, which is the
+same access `--reset` above already argues is the right permission for a destructive operation.
+
+**The key never exists twice.** `sha256:<hex>` in the file, plaintext only in the line `keygen`
+prints — on stdout, so it pipes into a secret store, with the commentary on stderr. The one leak
+that had to be closed on purpose: every url parser *quotes the url back* in its refusals, and a
+connection url with a credential in its userinfo is exactly how a secret reaches a log file. So both
+parsers redact, `ConnectionUrl`'s `Debug` redacts, and `scenarios/340` greps the keys file, the
+server log, `status`, `keys` and a url refusal for the key it issued.
+
+**What stays out.** Expiry, rotation policy, per-branch or per-operation permissions, an audit log,
+rate limiting, and anything that would need the server to know what a user or an org is. A key with
+an expiry is the platform's signed token wearing a worse disguise; read/write scoping is a real
+question but the unit it would attach to is not settled (a branch is not a tenant, §17.6), and
+half of it is worse than none. TLS is out and is a proxy's job, unchanged.
+
+**The platform's version is the same field, verified instead of looked up.** A signed token means
+`authorize` checks a signature and reads a scope out of claims, with no phone-home, so on-prem
+verifies offline. The seam is already the right shape: one function taking the presented string and
+answering an `Access`, called in one place.
+
 #### Nothing listening says how to start one
 
 `no borg server at <addr> — start one with: borg-server start`, from `borg_protocol::url::
@@ -1744,8 +1844,8 @@ appears once a server outlives the script that started it.
 
 **`--reset` stops the server, deletes the registry's directory and starts it again**, rather than
 going through the socket. A `registry_delete` message would be a destructive operation on a wire
-whose `credential` nothing checks yet — which is the same argument that made `stop` a `SIGTERM`
-rather than a protocol message. Throwing a store away is a thing you do with filesystem access, on
+whose `credential` is a static api key rather than an identity (§17.6) — which is the same argument
+that made `stop` a `SIGTERM` rather than a protocol message. Throwing a store away is a thing you do with filesystem access, on
 purpose. Only the registry's directory goes; the server's pidfile and log live beside it and are
 where the reason a previous run died is written.
 

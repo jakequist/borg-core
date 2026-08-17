@@ -54,6 +54,8 @@ import {
   dialBorgServer,
   dialBorgWebSocket,
   parseBorgUrl,
+  redactBorgUrl,
+  TOKEN_ENV,
   URL_ENV,
   type BorgAddress,
   type BorgUrl,
@@ -103,6 +105,7 @@ export {
   BorgUnreachableError,
   BorgUrlError,
   parseBorgUrl,
+  redactBorgUrl,
   wellKnownSocket,
   type BorgAddress,
   type BorgUrl,
@@ -453,6 +456,24 @@ export interface BorgContextOptions {
    */
   registry?: string;
   /**
+   * **The api key to present** (§17.6). A url may carry its own, in the userinfo:
+   *
+   * ```ts
+   * createBorgContext({ url: "borg://:borgk_A1b2@localhost/personal-crm" });
+   * createBorgContext({ socket, credential: process.env.BORG_TOKEN });
+   * ```
+   *
+   * Precedence is explicit, then the url, then `$BORG_TOKEN` — the same order `--url` and
+   * `$BORG_URL` relate in, so a process with a token exported can still be pointed elsewhere for
+   * one context. **Absent is legitimate and is the local case**: a server with no keys file
+   * authenticates nobody, and one that does refuses the handshake saying so.
+   *
+   * It is **re-presented on every reconnect**, because a reconnect re-runs the handshake — see
+   * [`Session`]. A context that authenticated once and then silently stopped would be the shape of
+   * bug that only appears after an outage.
+   */
+  credential?: string;
+  /**
    * The def-layer this client's code was generated from — its ClientVersion (§5.4).
    *
    * **Absent means the branch head as it stands**, which is what an un-generated client honestly is:
@@ -526,7 +547,7 @@ export async function createBorgContext(options: BorgContextOptions): Promise<Bo
   return new Context(session);
 }
 
-/** Where a set of options says to connect, and which registry to name. */
+/** Where a set of options says to connect, which registry to name, and what to present. */
 function whereToConnect(options: BorgContextOptions): Endpoint {
   const env = options.env ?? process.env;
   if (options.url !== undefined && options.socket !== undefined) {
@@ -534,18 +555,26 @@ function whereToConnect(options: BorgContextOptions): Endpoint {
       "createBorgContext takes a url or a socket, not both — a url already names the socket",
     );
   }
+  // **Explicit, then the url, then the environment.** The same order `--url` and `$BORG_URL` relate
+  // in: the thing somebody wrote at this call site beats the thing that was lying around.
+  const ambientToken = env[TOKEN_ENV];
+  const fallback =
+    ambientToken === undefined || ambientToken === "" ? undefined : ambientToken;
   if (options.url !== undefined) {
     if (options.registry !== undefined) {
       throw new BorgClientError(
-        `createBorgContext was given both a url and a registry — \`${options.url}\` names its own`,
+        // Redacted, because this message quotes the url back and the url may hold a key (§17.6).
+        `createBorgContext was given both a url and a registry — ` +
+          `\`${redactBorgUrl(options.url)}\` names its own`,
       );
     }
-    return connectionOf(parseBorgUrl(options.url), env);
+    return connectionOf(parseBorgUrl(options.url), env, options.credential, fallback);
   }
   if (options.socket !== undefined) {
     return {
       address: { kind: "unix", path: options.socket },
       registry: options.registry,
+      credential: options.credential ?? fallback,
     };
   }
   const ambient = env[URL_ENV];
@@ -555,17 +584,30 @@ function whereToConnect(options: BorgContextOptions): Endpoint {
         `or { socket }, or set $${URL_ENV}`,
     );
   }
-  return connectionOf(parseBorgUrl(ambient), env);
+  return connectionOf(parseBorgUrl(ambient), env, options.credential, fallback);
 }
 
-/** Where a context connects and which registry it names. */
+/** Where a context connects, which registry it names, and what it presents. */
 interface Endpoint {
   readonly address: BorgAddress;
   readonly registry: string | undefined;
+  /** The api key, or `undefined` for an open server. **Never printed** — see [`Session.address`]. */
+  readonly credential: string | undefined;
 }
 
-function connectionOf(url: BorgUrl, env: NodeJS.ProcessEnv): Endpoint {
-  return { address: borgAddress(url, env), registry: url.registry ?? undefined };
+function connectionOf(
+  url: BorgUrl,
+  env: NodeJS.ProcessEnv,
+  explicit: string | undefined,
+  ambient: string | undefined,
+): Endpoint {
+  return {
+    address: borgAddress(url, env),
+    registry: url.registry ?? undefined,
+    // Explicit beats the url beats the environment — the last of those is what a deployment sets
+    // once, and the first two are what somebody wrote deliberately.
+    credential: explicit ?? url.credential ?? ambient,
+  };
 }
 
 /**
@@ -668,6 +710,10 @@ class Session {
     // reconnect has to re-handshake rather than merely re-open: a new socket that skipped this
     // would be a connection to a server with no idea which store it is for.
     if (this.#endpoint.registry !== undefined) reply.registry = this.#endpoint.registry;
+    // **Presented on every dial, which is what makes a reconnect re-authenticate** (§17.6). A
+    // credential settled once and then not re-sent would work until the first server bounce and
+    // fail afterwards, which is the shape of bug that only appears during an outage.
+    if (this.#endpoint.credential !== undefined) reply.credential = this.#endpoint.credential;
     wire.send(reply);
 
     // **And the server answers, before a request goes out.** This is what closes the deviation the

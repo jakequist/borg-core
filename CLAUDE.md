@@ -17,9 +17,9 @@ cargo fmt
 ```
 
 There are **two binaries**: `borg` (the client, `crates/borg-cli`) and `borg-server` (the server,
-`crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310 and 330 start a real server, so both have to be
-built before `run-all.sh`; `check.sh` builds both. 330 also needs a free TCP port, because it starts
-a server listening on a WebSocket as well as on its socket.
+`crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310, 320, 330 and 340 start a real server,
+so both have to be built before `run-all.sh`; `check.sh` builds both. 330 also needs a free TCP port,
+because it starts a server listening on a WebSocket as well as on its socket.
 `crates/borg-server`). Scenarios 250, 260, 270, 280, 300, 310 and 320 start a real server, so both have
 to be built before `run-all.sh`; `check.sh` builds both.
 
@@ -76,8 +76,11 @@ crates/borg-engine          log, branches, defs, derivation, resolver, registry
 crates/borg-host            what it takes to *host* a store, shared by both binaries: `ops.rs` is
                             what the commands do, `push.rs` is `repo push`, `sidecar.rs` the files
                             beside a store, `serving.rs` the advisory lock, `host.rs` a data
-                            directory of registries (§17.6), and `stream.rs` export/import — a
-                            registry as a canonical event stream (§19)
+                            directory of registries (§17.6), `stream.rs` export/import — a
+                            registry as a canonical event stream (§19) — and `keys.rs` the static
+                            API keys a handshake's credential is checked against, which is the one
+                            piece of state beside a store whose *corruption* is a refusal rather
+                            than a default (§17.6)
 crates/borg-cli             the `borg` binary — argv and printing over `borg-host`, plus
                             `generate.rs`, which emits the typed client (§15). Embedded Borg: it
                             operates directly on a store nobody is serving, and has no `serve`.
@@ -86,12 +89,12 @@ crates/borg-cli             the `borg` binary — argv and printing over `borg-h
 crates/borg-server          the `borg-server` binary — `serve.rs` is `borg-host`'s ops over a
                             socket *and* over a WebSocket (`Transport`/`Peer` is the seam, and
                             `GET /health` is the one HTTP endpoint), and `lifecycle.rs` is
-                            start/stop/status/logs; `status` and `create` are clients of the server
-                            they administer, over `borg_protocol::client::ask`
-                            socket and `lifecycle.rs` is start/stop/status/logs; `status`,
-                            `create`, `export` and `import` are clients of the server they
-                            administer, over `borg_protocol::client::ask`, and fall back to
-                            operating on the data directory directly when nothing is serving it
+                            start/stop/status/logs plus `keygen`/`keys`; `status`, `create`,
+                            `export` and `import` are clients of the server they administer, over
+                            `borg_protocol::client::ask` — presenting the `*`-scoped credential the
+                            server minted at boot, because the unix socket is deliberately **not**
+                            exempt from authentication (§17.6) — and fall back to operating on the
+                            data directory directly when nothing is serving it
 packages/borg-sdk           the TypeScript SDK. Two entry points, deliberately opposite: `borg-sdk`
                             is the author-side DSL and the worker protocol, `borg-sdk/client` is
                             the consumer-side client over `borg-server`. `values.ts` is the one
@@ -337,6 +340,30 @@ Do not "fix" these without discussion — they are tracked in `ROADMAP.md`:
   whose premise is that a proxy has already terminated. So the parser accepts it everywhere and
   `borg_protocol::client::ask` refuses it at the dial, saying to point at the `ws://` the proxy
   forwards to.
+- **Revoking an API key does not close connections that are already open.** Revocation is read at the
+  handshake, so the *next* connection with that key is refused and the live one carries on until it
+  hangs up. Closing them needs a registry of live sessions and a way to signal every session thread —
+  the same machinery relaxing the per-registry gate would want, so it should be one change rather
+  than two — for a window that closes on its own, because connections are short-lived and a
+  reconnecting client re-presents its credential. Asserted in both directions in
+  `crates/borg-server/src/serve.rs` and `scenarios/340`, so that nobody discovers it during an
+  incident.
+- **`borg-server keygen` and `keys revoke` write a file and never speak to the socket**, so they need
+  filesystem access to the data directory and work against a stopped server. That is what makes
+  minting the *first* credential possible at all — doing it over a connection that already requires
+  one is a circle — and it is why enforcement and rotation need no restart. The boundary it draws is
+  the filesystem's: whoever can write the data directory can issue keys, and could already read every
+  store under it.
+- **A key's scope is a list of registry names or `*`, and there is nothing finer.** No read-only key,
+  no per-branch scope, no expiry, no audit log, no rate limit — see `ROADMAP.md`, *Static API keys*.
+  The unit a read/write scope would attach to is not settled (a branch is not a tenant, §17.6), and a
+  key with an expiry is the platform's signed token wearing a worse disguise.
+- **`borg generate` against a *served* store reads that store's lock record, which names a socket and
+  a registry but not the data directory** — so it cannot find the admin token, and generating against
+  an enforcing local server needs `$BORG_TOKEN` or a `--url` carrying a key. Against an open server —
+  every local one until somebody runs `keygen` — nothing changed. Widening the lock record to name
+  the token would work and would put the admin credential's path beside every store, which is a
+  decision rather than a tidy-up.
 - **The Python SDK has no client half and therefore no url parser.** It is the pipeline half and the
   neutrality gate on the worker contract (§17.4); nothing in it connects to a `borg-server`. The
   parser is one file per language that has a client, which today is Rust and TypeScript.

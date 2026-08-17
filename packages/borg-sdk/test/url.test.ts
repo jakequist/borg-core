@@ -13,6 +13,7 @@ import {
   borgAddress,
   borgSocket,
   parseBorgUrl,
+  redactBorgUrl,
   wellKnownSocket,
 } from "../src/connection.js";
 
@@ -96,6 +97,7 @@ suite("connection urls", () => {
     expect(parseBorgUrl("borg+ws://borg.example:7717/crm")).toEqual({
       transport: "ws",
       path: null,
+      credential: null,
       ws: { secure: false, host: "borg.example", port: 7717 },
       registry: "crm",
     });
@@ -125,6 +127,78 @@ suite("connection urls", () => {
     ] as const) {
       expect(() => parseBorgUrl(text), text).toThrow(needle);
     }
+  });
+
+  /**
+   * **The credential table**, case for case with `crates/borg-protocol/src/url.rs` (§17.6, §17.7).
+   * One string means the same thing in both languages or it means two — and this one carries a
+   * secret, so the two disagreeing would be somebody's key going to the wrong server.
+   */
+  test("a url may carry an api key in the userinfo", () => {
+    const table: [string, string, string | null, string | null][] = [
+      // The documented form, on every transport — the credential is a property of the connection
+      // and not of the address, so it goes in the same place whatever follows.
+      ["borg://:borgk_A1b2@localhost/crm", WELL_KNOWN, "crm", "borgk_A1b2"],
+      ["borg+unix://:borgk_A1b2@/tmp/borg.sock/crm", "/tmp/borg.sock", "crm", "borgk_A1b2"],
+      // The colon is optional, because there is no username for it to be separating from.
+      ["borg://borgk_A1b2@localhost/crm", WELL_KNOWN, "crm", "borgk_A1b2"],
+      // No credential at all, which is what an open server's client writes.
+      ["borg://localhost/crm", WELL_KNOWN, "crm", null],
+      // A key and no registry: both halves are independently optional.
+      ["borg://:borgk_A1b2@localhost", WELL_KNOWN, null, "borgk_A1b2"],
+    ];
+    for (const [text, socket, registry, credential] of table) {
+      const url = parseBorgUrl(text);
+      expect([...parsed(text), url.credential], text).toEqual([socket, registry, credential]);
+    }
+
+    // The websocket cases, where the address is a url rather than a path.
+    expect(parseBorgUrl("borg+ws://:borgk_A1b2@borg.example:7717/crm")).toMatchObject({
+      ws: { secure: false, host: "borg.example", port: 7717 },
+      registry: "crm",
+      credential: "borgk_A1b2",
+    });
+    expect(parseBorgUrl("borg+wss://:borgk_A1b2@borg.example/crm")).toMatchObject({
+      ws: { secure: true, host: "borg.example", port: 443 },
+      credential: "borgk_A1b2",
+    });
+
+    // There is no username, so a userinfo that looks like one is refused rather than truncated —
+    // which would fail much later, as `credential not valid`, and send somebody to the wrong file.
+    for (const [text, needle] of [
+      ["borg://user:borgk_A1b2@localhost/crm", /has no username/],
+      ["borg://@localhost/crm", /empty credential/],
+      ["borg://:@localhost/crm", /empty credential/],
+    ] as const) {
+      expect(() => parseBorgUrl(text), text).toThrow(needle);
+    }
+  });
+
+  /**
+   * **A url's refusal quotes the url, so the url it quotes must not hold the key** (§17.6).
+   *
+   * The whole class of bug this exists for: a connection string lives in an environment variable,
+   * something goes wrong, and the error goes to a log file somebody else can read.
+   */
+  test("a credential never reaches an error message", () => {
+    const leaky = "borg://:borgk_supersecret@localhost/a/b";
+    expect(() => parseBorgUrl(leaky)).toThrow(/more than one path segment/);
+    try {
+      parseBorgUrl(leaky);
+    } catch (err) {
+      const said = (err as Error).message;
+      expect(said).not.toContain("borgk_supersecret");
+      expect(said).toContain("borg://:***@localhost/a/b");
+    }
+
+    // The address carries no credential at all, which is what makes every message that names one
+    // safe by construction rather than by review.
+    const url = parseBorgUrl("borg+ws://:borgk_supersecret@borg.example/crm");
+    expect(JSON.stringify(borgAddress(url, ENV))).not.toContain("borgk_supersecret");
+
+    // Redaction leaves a url with no credential exactly as it was, so it can be applied to any.
+    expect(redactBorgUrl("borg://localhost/crm")).toBe("borg://localhost/crm");
+    expect(redactBorgUrl("not a url")).toBe("not a url");
   });
 
   test("an absent registry is absent rather than guessed", () => {

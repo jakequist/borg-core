@@ -2524,7 +2524,8 @@ The handshake carries the client's **ClientVersion** — the def-layer its gener
 from (§5.4) — so that old generated clients keep reading through `down` migrations, and so the engine
 can eventually name which live clients a def push would break (§5.5). Absent means the branch's
 current def-version, which is what an un-generated client honestly is. It also carries the
-**registry** the connection is for and a **credential** (§17.6).
+**registry** the connection is for and a **credential**, which an enforcing server checks at the
+handshake (§17.6).
 
 #### The handshake is answered
 
@@ -2538,9 +2539,12 @@ it was deferred to the first request that needed a registry, which meant an SDK'
 happily against a store that does not exist.
 
 An accepted handshake is answered with the negotiated **codec**, the protocol **version** and the
-**server's** own version, and the **registry the connection settled on**. That last is confirmation
-for a client that named one and news for a client that did not: a server hosting exactly one
-registry resolves it and says which.
+**server's** own version, the **registry the connection settled on**, and whether the server
+**authenticates** — `open` or `required` (§17.6). The registry is confirmation for a client that
+named one and news for a client that did not: a server hosting exactly one resolves it and says
+which. The authentication mode is a fact about the *server*, answered on the connection that was
+being made anyway, which is what lets `borg-server status` tell an open server from an authed one
+without reading a directory that may not be on the same machine.
 
 A refusal names the reason and is followed by a **lingering close** — the server stops writing,
 drains whatever the client already sent, and only then lets go — which is what makes the answer
@@ -2619,10 +2623,83 @@ connection each; and the messages that need no registry at all are `registries`,
 and `import` — the first is what lets a client that guessed wrong discover what to name, and the
 other two make a registry that does not exist yet.
 
-`ClientHello` also carries a **`credential`**, and nothing checks it. Its existence is the point: a
-local server has no one to authenticate, since the socket's file permissions are the boundary, but
-adding the field once authentication exists would mean moving the wire at exactly the moment there
-is a deployment that cannot take a wire change.
+`ClientHello` also carries a **`credential`**, which is what §17.6's *Static API keys* checks. It was
+reserved for two milestones with nothing checking it, and the field did not have to move when
+something did — which was the entire argument for reserving it.
+
+#### Static API keys
+
+**The smallest authentication that puts a server on the internet**, and deliberately no more. The
+server *verifies* credentials; it never owns identity. That is the control-plane / data-plane split
+the platform is built around, and it is what makes today's static keys and tomorrow's
+platform-issued signed tokens the same shape: the same field, verified by a signature check instead
+of a hash lookup.
+
+**No keys file means an open server.** A data directory with no keys file authenticates nobody,
+because on a laptop there is nobody to authenticate — a unix socket's file permissions are the
+boundary and always were. `borg-server keygen <label>` writes the file, prints the key **once**, and
+from that moment every handshake must present a credential. The file's existence is the whole of the
+configuration: no flag, no environment variable, no `auth = on` in a file nobody would find.
+`borg-server status` reports which mode the server is in, so an operator can tell at a glance.
+
+**An unreadable keys file is not an open server.** Absent and corrupt are different answers here,
+and this is the only state beside a store where they are. Everything else follows the sidecar rule
+— *a missing or corrupt file reads as the default* — which is justified by a sidecar holding nothing
+that cannot be recreated. A keys file holds exactly that, in the direction that matters: if an
+unparsable file read as *no keys*, a truncated write would silently turn authentication off. So a
+server refuses to start on one, and one corrupted while it runs refuses every handshake.
+
+**A key is stored as a hash and never as itself.** Plaintext exists in the line `keygen` prints and
+nowhere else — not in the file, not in `status`, not in a log, not in an error message. A connection
+url carries a credential in the userinfo, `borg://:<key>@host/<registry>`, and every message that
+quotes a url back redacts it first, in both languages. Lookup compares digests rather than secrets,
+which is what makes a non-constant-time comparison sound: an attacker supplies a key and cannot walk
+hash prefixes without inverting SHA-256.
+
+**A key's scope is `*` or a list of registry names.** One server is one org, so most keys are `*`
+and scoping is for the deploy key that should reach staging and not production. What a scope buys
+beyond refusing a connection is that **a credential cannot see what it cannot reach**: `registries`
+is filtered to the scope, and so is the list of options in a routing refusal. The n=1 convenience
+applies to the scope rather than to the server — a key that can see exactly one registry may name
+none and get it.
+
+**Enforcement is at the handshake, before routing, uniformly on both transports.** The order is the
+no-disclosure property: routing's refusal names what the server hosts, so a caller that has not
+authenticated must never reach it, or a public address would be a tenant enumerator. An
+unauthenticated caller learns *credential required* or *that credential is not valid* and nothing
+else — the same sentence for a key that was never issued and one that was revoked, because which of
+those it is, is a fact about the key list. A scope refusal names only the registry the caller itself
+asked for. A refusal is followed by the same lingering close every other refusal gets.
+
+This includes `registries`, which is otherwise the one message needing no store. A hello naming no
+registry is still *accepted* while settling on nothing — that asymmetry is unchanged — but "made no
+claim that could be wrong" was never an argument for needing no credential.
+
+**The local administrative path is a credential, not an exemption.** `borg-server status`, `create`,
+`export` and `import` are clients of the server they administer, so enforcement would lock them out.
+The tempting fix is to exempt the unix socket, and it is refused: an exemption would make the two
+transports semantically different, so every claim here would grow "…over the network", and the local
+case — the one everybody develops against — would be the one nothing tests. Instead a server mints a
+`*`-scoped token into its data directory at boot, mode `0600`, and removes it on the way out beside
+the socket and the advisory locks. Its own commands present it on the same field, and it is checked
+by the same code. The boundary it draws is the filesystem's: whoever can read the data directory
+could already read the stores under it. `$BORG_TOKEN` overrides it, which is what reaching a server
+on another machine needs.
+
+**`keygen` and `revoke` write a file and never speak to the socket**, which is what makes minting
+the *first* credential possible at all — doing it over a connection that already requires one is a
+circle. A running server picks both up on its next handshake, so enforcement and rotation need no
+restart.
+
+**Revocation takes effect for new handshakes and does not tear down open connections.** The trade is
+recorded rather than discovered: killing live sessions needs per-connection tracking the server does
+not keep and a revocation path reaching into every session thread, for a window that closes on its
+own because connections are short-lived. Revoking the last key leaves a **locked** server, not an
+open one — the file survives at zero keys, because deleting it is the loosest operation there is and
+revocation is the strictest, and it must be impossible to reach the first by doing the second.
+
+TLS is not part of this and is a proxy's job (§17.6). A key on a plaintext `ws://` reaching the
+public internet is an operator error the same way a plaintext `DATABASE_URL` is.
 
 #### Two transports, one protocol
 
@@ -2658,7 +2735,8 @@ version and how many registries it hosts. A WebSocket *is* an upgraded HTTP requ
 that speaks one is already parsing the other, and refusing to answer a health probe on the port it
 is already listening on would make a supervisor open a second one. It reports the registry **count**
 and not their names, because it is unauthenticated and a registry name is tenancy; `registries` on
-§17.5 is where the names live, behind a handshake that will one day carry a credential. Everything
+§17.5 is where the names live, behind a handshake that carries a credential (*Static API keys*
+above). Everything
 else on that port is `404` — a second endpoint would be an API beside the API, and the API is §17.5.
 
 **Registries open lazily and lock eagerly.** Opening one brings its projections to head, which for a
@@ -2702,6 +2780,7 @@ borg+unix:///run/user/1000/borg.sock/crm    an explicit socket, registry crm
 borg+unix:///tmp/borg.sock                  an explicit socket, no registry named
 borg+ws://borg.example:7717/crm             a websocket, registry crm
 borg+wss://borg.example/crm                 the same, through a TLS-terminating proxy
+borg+wss://:borgk_A1b2@borg.example/crm     the same, presenting an api key (§17.6)
 ```
 
 Everything a client needs to reach a store is *where the server is* and *which registry on it*, and
@@ -2728,6 +2807,19 @@ store to speak it, for a deployment shape whose whole premise is that a proxy ha
 — so `borg` refuses `borg+wss://` at the dial, by name, saying to point it at the `ws://` the proxy
 forwards to. The asymmetry is per language and is stated rather than hidden; refusing the scheme
 outright would make the deployed address unsayable.
+
+**A credential rides in the userinfo**, where `DATABASE_URL` puts a password and therefore where
+every deployment system already knows not to log it. There is no username — a borg server
+authenticates a key and not a person (§17.6) — so the leading colon is optional and a userinfo
+carrying a second colon is refused rather than silently split into a name nothing would read.
+`$BORG_TOKEN` is the ambient form for a deployment that does not write the key into the url;
+precedence is what a client was told explicitly, then the url, then the environment.
+
+Every refusal in this grammar quotes the url back, which is exactly how a secret reaches a log file,
+so the quoting **redacts**: `borg://:borgk_A1b2@host/crm` prints as `borg://:***@host/crm`. Enough
+to see that a credential was supplied, and none of it. The address a client dials carries no
+credential at all, which is what makes every message naming one safe by construction rather than by
+review.
 
 **An absent registry is absent.** The parser does not default it, and neither does any client. §17.6
 already says what an absent registry means — the sole registry at n=1, an error naming the options

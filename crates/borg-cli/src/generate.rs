@@ -68,6 +68,14 @@ pub struct Generate {
     /// From the same URL: which registry on that socket (SPEC.md §17.6, §17.7). `None` is `None` in
     /// the handshake, and the server's n=1 convenience decides.
     pub registry: Option<String>,
+    /// The api key to present, from the url's userinfo or from `$BORG_TOKEN` (§17.6).
+    ///
+    /// **The lock-record path carries none**, and that is the honest boundary rather than an
+    /// oversight: a served store's lock record names a socket and a registry, not the data
+    /// directory the server's admin token lives in, so generating against an *enforcing* local
+    /// server means `$BORG_TOKEN` or a `--url` that carries the key. Against an open one — every
+    /// local server until somebody runs `keygen` — nothing changed.
+    pub credential: Option<String>,
 }
 
 pub async fn run(args: &Ops, options: &Generate) -> Result<()> {
@@ -166,7 +174,11 @@ async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, Strin
                 .registry
                 .clone()
                 .or_else(|| served.and_then(|served| served.registry));
-            let schema = over_server(&address, registry.as_deref(), args.branch.as_deref())?;
+            let connect = borg_protocol::client::Connect::to(
+                registry.as_deref(),
+                options.credential.as_deref(),
+            );
+            let schema = over_server(&address, &connect, args.branch.as_deref())?;
             Ok((schema, format!("through {address}")))
         }
         None => {
@@ -191,13 +203,13 @@ async fn read_schema(args: &Ops, options: &Generate) -> Result<(SchemaDef, Strin
 /// the server reads as "the sole registry" — the same default a hand-written client takes (§17.6).
 fn over_server(
     address: &borg_protocol::url::Address,
-    registry: Option<&str>,
+    connect: &borg_protocol::client::Connect<'_>,
     branch: Option<&str>,
 ) -> Result<SchemaDef> {
     let request = Request::DefView {
         branch: branch.map(str::to_string),
     };
-    match borg_protocol::client::ask(address, registry, &request)? {
+    match borg_protocol::client::ask(address, connect, &request)? {
         Response::Defs(schema) => Ok(schema),
         Response::Error { message } => Err(BorgError::Storage(message)),
         other => Err(BorgError::Storage(format!(

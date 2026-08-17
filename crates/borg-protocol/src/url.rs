@@ -13,7 +13,21 @@
 //! borg+unix:///tmp/borg.sock                  an explicit socket, no registry named
 //! borg+ws://borg.example:7717/crm             a websocket, registry crm
 //! borg+wss://borg.example/crm                 the same, through a TLS-terminating proxy
+//! borg+wss://:borgk_A1b2@borg.example/crm     the same, presenting an api key (§17.6)
 //! ```
+//!
+//! ## The credential rides in the userinfo, and is redacted out of every message
+//!
+//! `borg://:<key>@host/<registry>`, which is where `DATABASE_URL` puts a password and therefore
+//! where every deployment system already knows not to log it. There is **no username** — a borg
+//! server authenticates a key and not a person (§17.6) — so the leading colon is optional and a
+//! userinfo holding a second colon is refused rather than silently split into a name nothing would
+//! ever read.
+//!
+//! **Every refusal in this module quotes the url back**, which is exactly how a secret ends up in a
+//! log, so [`redacted`] rewrites the userinfo before it is quoted. That is not a courtesy: it is the
+//! same rule that keeps a key out of the keys file, out of `status` and out of the server's log —
+//! plaintext exists in the line `borg-server keygen` prints and nowhere else.
 //!
 //! **An absent registry stays absent.** It is not defaulted here to `main`, to the first directory
 //! under a data dir, or to anything else: the server's rule is that a handshake naming no registry
@@ -133,13 +147,33 @@ impl std::fmt::Display for Address {
     }
 }
 
-/// A parsed connection URL: where the server is, and which registry on it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A parsed connection URL: where the server is, which registry on it, and what it presents.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionUrl {
     pub transport: Transport,
     /// The registry named in the URL. **`None` means none was named**, which is what the handshake
     /// then carries — see the module header.
     pub registry: Option<String>,
+    /// The API key from the url's userinfo, for [`crate::client::ClientHello::credential`] (§17.6).
+    ///
+    /// `None` means none was carried, which is what a client on an open server writes and what
+    /// `$BORG_TOKEN` then fills in. It is deliberately **not** in this type's `Debug`, because a
+    /// `{url:?}` in a log or a panic is the commonest way a secret escapes.
+    pub credential: Option<String>,
+}
+
+/// **Redacted**, so that `{url:?}` cannot leak a key. See [`redacted`].
+impl std::fmt::Debug for ConnectionUrl {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("ConnectionUrl")
+            .field("transport", &self.transport)
+            .field("registry", &self.registry)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ConnectionUrl {
@@ -163,7 +197,11 @@ impl ConnectionUrl {
                 ),
             ));
         }
-        match scheme {
+        // **The credential comes off first, whatever the transport.** It is a property of the
+        // connection rather than of the address, so every scheme takes it in the same place and no
+        // parser below has to know it was ever there.
+        let (credential, rest) = userinfo(text, rest)?;
+        let mut url = match scheme {
             "borg" => local(text, rest),
             "borg+unix" => unix(text, rest),
             "borg+ws" => websocket(text, rest, false),
@@ -175,7 +213,9 @@ impl ConnectionUrl {
                      borg+wss://"
                 ),
             )),
-        }
+        }?;
+        url.credential = credential;
+        Ok(url)
     }
 
     /// The address to dial. `well_known` is `borg_host::host::default_socket`'s answer, which only a
@@ -192,6 +232,37 @@ impl ConnectionUrl {
             },
         }
     }
+}
+
+/// **The credential, and the rest of the url without it.** SPEC.md §17.6, §17.7.
+///
+/// The userinfo is everything before the first `@`, and the `@` is looked for before the first `/`
+/// so that a unix socket path containing one — which is legal, if unusual — is not read as an
+/// authority. There is no username here: a borg server authenticates a key, so `:<key>@` and
+/// `<key>@` both mean the same thing and a userinfo carrying a second colon is a mistake said out
+/// loud rather than truncated into something that would fail as "credential not valid" much later.
+fn userinfo<'a>(text: &str, rest: &'a str) -> Result<(Option<String>, &'a str)> {
+    let authority = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority].find('@') else {
+        return Ok((None, rest));
+    };
+    let (userinfo, address) = (&rest[..at], &rest[at + 1..]);
+    let key = userinfo.strip_prefix(':').unwrap_or(userinfo);
+    if key.contains(':') {
+        return Err(malformed(
+            text,
+            "a borg url has no username — the credential is the whole userinfo, as \
+             borg://:<key>@host/<registry>",
+        ));
+    }
+    if key.is_empty() {
+        return Err(malformed(
+            text,
+            "it has an empty credential — leave the `@` out to present none, or write \
+             borg://:<key>@host/<registry>",
+        ));
+    }
+    Ok((Some(key.to_string()), address))
 }
 
 /// `borg://<host>[/<registry>]`.
@@ -211,6 +282,7 @@ fn local(text: &str, rest: &str) -> Result<ConnectionUrl> {
     Ok(ConnectionUrl {
         transport: Transport::Local,
         registry: registry_segment(text, tail)?,
+        credential: None,
     })
 }
 
@@ -232,6 +304,7 @@ fn unix(text: &str, rest: &str) -> Result<ConnectionUrl> {
         return Ok(ConnectionUrl {
             transport: Transport::Unix(PathBuf::from(socket)),
             registry: None,
+            credential: None,
         });
     }
 
@@ -241,11 +314,13 @@ fn unix(text: &str, rest: &str) -> Result<ConnectionUrl> {
         return Ok(ConnectionUrl {
             transport: Transport::Unix(PathBuf::from(head)),
             registry: Some(last.to_string()),
+            credential: None,
         });
     }
     Ok(ConnectionUrl {
         transport: Transport::Unix(PathBuf::from(rest)),
         registry: None,
+        credential: None,
     })
 }
 
@@ -289,6 +364,7 @@ fn websocket(text: &str, rest: &str, secure: bool) -> Result<ConnectionUrl> {
             port,
         },
         registry: registry_segment(text, tail)?,
+        credential: None,
     })
 }
 
@@ -328,7 +404,28 @@ fn name_is_valid(name: &str) -> bool {
 }
 
 fn malformed(text: &str, why: &str) -> BorgError {
-    BorgError::Storage(format!("`{text}` is not a borg url: {why}"))
+    BorgError::Storage(format!("`{}` is not a borg url: {why}", redacted(text)))
+}
+
+/// **A url with its credential taken out**, for anything a human or a log will see. §17.6.
+///
+/// Every refusal here quotes the url back, because a url usually lives in an environment variable
+/// somebody has to go and find — and that is precisely the shape that puts a secret in a log file.
+/// So the quoting goes through this. `borg://:borgk_A1b2@host/crm` prints as `borg://:***@host/crm`:
+/// enough to see that a credential was supplied, and none of it.
+///
+/// Public because it is not only this module's problem: anything that reports a connection url —
+/// the CLI, an SDK, a scenario — has the same secret in the same place.
+#[must_use]
+pub fn redacted(text: &str) -> String {
+    let Some((scheme, rest)) = text.split_once("://") else {
+        return text.to_string();
+    };
+    let authority = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority].find('@') {
+        Some(at) => format!("{scheme}://:***@{}", &rest[at + 1..]),
+        None => text.to_string(),
+    }
 }
 
 /// **What a client says when nothing is listening.** SPEC.md §17.7.
@@ -488,6 +585,117 @@ mod tests {
             Some("ws://borg.example:80/"),
             "the request path is `/` — the registry travels in the handshake and nowhere else"
         );
+    }
+
+    /// **The credential table.** SPEC.md §17.6, §17.7. `packages/borg-sdk/test/url.test.ts` holds
+    /// the same cases, because one string means the same thing in both languages or it means two.
+    #[test]
+    fn a_url_may_carry_an_api_key_in_the_userinfo() {
+        let table = [
+            // The documented form, on every transport — the credential is a property of the
+            // connection and not of the address, so it goes in the same place whatever follows.
+            (
+                "borg://:borgk_A1b2@localhost/crm",
+                WELL_KNOWN,
+                Some("crm"),
+                Some("borgk_A1b2"),
+            ),
+            (
+                "borg+ws://:borgk_A1b2@borg.example:7717/crm",
+                "ws://borg.example:7717",
+                Some("crm"),
+                Some("borgk_A1b2"),
+            ),
+            (
+                "borg+wss://:borgk_A1b2@borg.example/crm",
+                "wss://borg.example:443",
+                Some("crm"),
+                Some("borgk_A1b2"),
+            ),
+            (
+                "borg+unix://:borgk_A1b2@/tmp/borg.sock/crm",
+                "/tmp/borg.sock",
+                Some("crm"),
+                Some("borgk_A1b2"),
+            ),
+            // The colon is optional, because there is no username for it to be separating from.
+            (
+                "borg://borgk_A1b2@localhost/crm",
+                WELL_KNOWN,
+                Some("crm"),
+                Some("borgk_A1b2"),
+            ),
+            // No credential at all, which is what an open server's client writes.
+            ("borg://localhost/crm", WELL_KNOWN, Some("crm"), None),
+            // A key and no registry: both halves are independently optional.
+            (
+                "borg://:borgk_A1b2@localhost",
+                WELL_KNOWN,
+                None,
+                Some("borgk_A1b2"),
+            ),
+        ];
+        for (text, socket, registry, credential) in table {
+            let url = ConnectionUrl::parse(text).unwrap_or_else(|err| panic!("{text}: {err}"));
+            assert_eq!(
+                (
+                    url.address(Path::new(WELL_KNOWN)).to_string(),
+                    url.registry.clone(),
+                    url.credential.clone()
+                ),
+                (
+                    socket.to_string(),
+                    registry.map(str::to_string),
+                    credential.map(str::to_string)
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    /// **A url's refusal quotes the url, so the url it quotes must not hold the key.** §17.6.
+    ///
+    /// The whole class of bug this exists for: a connection string lives in an environment variable,
+    /// something goes wrong, and the error goes to a log file that somebody else can read.
+    #[test]
+    fn a_credential_never_reaches_an_error_message_or_a_debug_line() {
+        let leaky = "borg://:borgk_supersecret@localhost/a/b";
+        let refusal = ConnectionUrl::parse(leaky).unwrap_err().to_string();
+        assert!(
+            !refusal.contains("borgk_supersecret"),
+            "the refusal leaked the key: {refusal}"
+        );
+        assert!(refusal.contains("borg://:***@localhost/a/b"), "{refusal}");
+        assert!(refusal.contains("more than one path segment"), "{refusal}");
+
+        // …and the same for `{:?}`, which is how a key escapes through a panic rather than a log.
+        let url = ConnectionUrl::parse("borg://:borgk_supersecret@localhost/crm").unwrap();
+        let shown = format!("{url:?}");
+        assert!(!shown.contains("borgk_supersecret"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert_eq!(url.credential.as_deref(), Some("borgk_supersecret"));
+
+        // An address carries no credential at all, which is what makes every message that names one
+        // — `unreachable`, the CLI's, the SDK's — safe by construction rather than by review.
+        assert!(!url.address(Path::new(WELL_KNOWN)).to_string().contains('@'));
+
+        // Redaction leaves a url with no credential exactly as it was, so it can be applied to any.
+        assert_eq!(redacted("borg://localhost/crm"), "borg://localhost/crm");
+        assert_eq!(redacted("not a url"), "not a url");
+    }
+
+    /// There is no username, so a userinfo that looks like one is refused rather than truncated —
+    /// which would fail much later, as `credential not valid`, and send somebody to the wrong file.
+    #[test]
+    fn a_userinfo_that_is_not_a_bare_key_is_refused_by_name() {
+        for (text, needle) in [
+            ("borg://user:borgk_A1b2@localhost/crm", "has no username"),
+            ("borg://@localhost/crm", "empty credential"),
+            ("borg://:@localhost/crm", "empty credential"),
+        ] {
+            let refusal = ConnectionUrl::parse(text).unwrap_err().to_string();
+            assert!(refusal.contains(needle), "parsing `{text}` said: {refusal}");
+        }
     }
 
     /// Nothing here defaults a registry. The server's n=1 convenience and n≥2 refusal are one rule

@@ -40,6 +40,7 @@
 //! registry, requests are still answered one at a time, which is the serialisation
 //! process-per-command gave the CLI for free (`ROADMAP.md`).
 
+use crate::keys::Scope;
 use crate::ops::{self, Held, Ops};
 use crate::serving;
 use borg_core::{BorgError, Result};
@@ -238,10 +239,21 @@ impl Host {
     /// The registries this server hosts, and which of them are open.
     #[must_use]
     pub fn hosted(&self) -> Vec<Hosted> {
+        self.hosted_within(&Scope::all())
+    }
+
+    /// The same, **filtered to what a credential may see** (§17.6, [`crate::keys`]).
+    ///
+    /// A registry name is tenancy, so a scoped key's `registries` answers its own registries and not
+    /// the server's. Open servers pass [`Scope::all`] and get everything, which is why nothing that
+    /// predates authentication changed.
+    #[must_use]
+    pub fn hosted_within(&self, scope: &Scope) -> Vec<Hosted> {
         self.registries
             .lock()
             .unwrap()
             .values()
+            .filter(|slot| scope.allows(&slot.name))
             .map(|slot| Hosted {
                 name: slot.name.clone(),
                 open: slot.is_open(),
@@ -271,16 +283,39 @@ impl Host {
     /// would be a coin toss over somebody's data. So at n≥2 it is an error, and the error names the
     /// options rather than merely refusing.
     pub fn route(&self, named: Option<&str>) -> Result<Arc<Slot>> {
+        self.route_within(named, &Scope::all())
+    }
+
+    /// The same routing, **inside what a credential may reach** (§17.6, [`crate::keys`]).
+    ///
+    /// Scope is applied as a *filter on what exists*, not as a check after the fact, and the
+    /// difference is the whole of the no-disclosure property: a registry outside the scope is
+    /// indistinguishable from one this server does not host, and every sentence this produces names
+    /// only registries the caller may already know about. It also makes the n=1 convenience do the
+    /// right thing — a key scoped to one registry on a two-registry server names nothing and gets
+    /// its own, because from inside that scope there *is* exactly one.
+    pub fn route_within(&self, named: Option<&str>, scope: &Scope) -> Result<Arc<Slot>> {
         let registries = self.registries.lock().unwrap();
+        let visible = || {
+            registries
+                .keys()
+                .filter(|name| scope.allows(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         if let Some(name) = named {
-            return registries.get(name).cloned().ok_or_else(|| {
-                BorgError::Storage(format!(
-                    "no registry named `{name}` — this server hosts {}",
-                    listed(&registries.keys().cloned().collect::<Vec<_>>())
-                ))
-            });
+            return registries
+                .get(name)
+                .filter(|slot| scope.allows(&slot.name))
+                .cloned()
+                .ok_or_else(|| {
+                    BorgError::Storage(format!(
+                        "no registry named `{name}` — this server hosts {}",
+                        listed(&visible())
+                    ))
+                });
         }
-        let mut all = registries.values();
+        let mut all = registries.values().filter(|slot| scope.allows(&slot.name));
         match (all.next(), all.next()) {
             (Some(only), None) => Ok(Arc::clone(only)),
             (None, _) => Err(BorgError::Storage(format!(
@@ -291,7 +326,7 @@ impl Host {
             (Some(_), Some(_)) => Err(BorgError::Storage(format!(
                 "this server hosts {} — name one in the handshake, because there is no obvious \
                  default with more than one",
-                listed(&registries.keys().cloned().collect::<Vec<_>>())
+                listed(&visible())
             ))),
         }
     }
@@ -481,6 +516,45 @@ mod tests {
         // Naming one is never ambiguous, whatever else is hosted.
         assert_eq!(host.route(Some("crm")).unwrap().name, "crm");
         assert_eq!(host.route(Some("analytics")).unwrap().name, "analytics");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **A scope is a filter on what exists, not a check after the fact** (§17.6). From inside a
+    /// one-registry scope on a two-registry server, a registry outside it reads exactly as one
+    /// nobody hosts — and the n=1 convenience applies to the scope rather than to the server.
+    #[tokio::test]
+    async fn a_scoped_credential_routes_inside_its_scope_and_cannot_see_past_it() {
+        let dir = temp_dir("scoped");
+        let host = host_with(&dir, &["crm", "analytics"]).await;
+        let only_crm = Scope::Only(vec!["crm".into()]);
+
+        assert_eq!(
+            host.route_within(Some("crm"), &only_crm).unwrap().name,
+            "crm"
+        );
+        assert_eq!(
+            host.route_within(None, &only_crm).unwrap().name,
+            "crm",
+            "one visible registry is a sole registry"
+        );
+
+        let refusal = host
+            .route_within(Some("analytics"), &only_crm)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            refusal, "storage: no registry named `analytics` — this server hosts 1 registry (crm)",
+            "a registry outside the scope reads as one nobody hosts, and the sentence names only \
+             what the credential may already see"
+        );
+
+        assert_eq!(
+            host.hosted_within(&only_crm)
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crm"]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

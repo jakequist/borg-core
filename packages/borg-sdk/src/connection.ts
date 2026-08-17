@@ -29,6 +29,14 @@ export const SOCKET_ENV = "BORG_WORKER_SOCKET";
 /** The environment variable a *client* is configured with. See [`parseBorgUrl`]. */
 export const URL_ENV = "BORG_URL";
 
+/**
+ * The environment variable an api key travels in when the url does not carry one (§17.6).
+ *
+ * The same name as `borg_host::keys::TOKEN_ENV` and as the CLI's, because a token with three
+ * spellings gets configured in the wrong one.
+ */
+export const TOKEN_ENV = "BORG_TOKEN";
+
 /** The socket's name, wherever it is put — `borg_host::host::SOCKET_FILE`. */
 const SOCKET_FILE = "borg.sock";
 
@@ -83,11 +91,19 @@ export async function openUnixSocket(path: string, what: string): Promise<Socket
  * borg+unix:///tmp/borg.sock                  an explicit socket, no registry named
  * borg+ws://borg.example:7717/crm             a websocket, registry crm
  * borg+wss://borg.example/crm                 the same, through a TLS-terminating proxy
+ * borg+wss://:borgk_A1b2@borg.example/crm     the same, presenting an api key (§17.6)
  * ```
  *
  * Everything a client needs is *where the server is* and *which registry on it* (§17.6), and those
  * two travel together or they get separated — which is how a staging client ends up pointed at
  * production's socket with production's registry name still in the other variable.
+ *
+ * **The credential rides in the userinfo**, `borg://:<key>@host/<registry>`, where `DATABASE_URL`
+ * puts a password and where every deployment system already knows not to log it. There is no
+ * username — a borg server authenticates a key and not a person — so the leading colon is optional
+ * and a userinfo holding a second colon is refused rather than silently split. Every refusal here
+ * quotes the url back, so [`redactBorgUrl`] takes the key out first: a connection string in an
+ * environment variable, an error, and a log file is exactly how a secret escapes.
  *
  * **An absent registry stays absent.** It is not defaulted here: the server's rule is that a
  * handshake naming no registry gets the sole registry at n=1 and is refused with the options at
@@ -123,6 +139,13 @@ export interface BorgUrl {
   readonly ws: { readonly secure: boolean; readonly host: string; readonly port: number } | null;
   /** The registry named in the url, or `null` — which is `null` in the handshake too. */
   readonly registry: string | null;
+  /**
+   * The api key from the userinfo, for `ClientHello.credential` (§17.6), or `null`.
+   *
+   * `null` is what a client of an open server carries — a server with no keys file authenticates
+   * nobody — and what `$BORG_TOKEN` then fills in.
+   */
+  readonly credential: string | null;
 }
 
 /** A url that is not one, named with enough detail to fix it. */
@@ -151,7 +174,59 @@ function nameIsValid(name: string): boolean {
 }
 
 function malformed(text: string, why: string): BorgUrlError {
-  return new BorgUrlError(`\`${text}\` is not a borg url: ${why}`);
+  return new BorgUrlError(`\`${redactBorgUrl(text)}\` is not a borg url: ${why}`);
+}
+
+/**
+ * **A url with its credential taken out**, for anything a human or a log will see (§17.6).
+ *
+ * `borg://:borgk_A1b2@host/crm` becomes `borg://:***@host/crm`: enough to see that a key was
+ * supplied, and none of it. The same function exists as `borg_protocol::url::redacted` in Rust,
+ * because both clients quote urls back in errors and one of them redacting is no protection.
+ *
+ * Exported because it is not only this file's problem — anything that reports a connection url has
+ * the same secret in the same place.
+ */
+export function redactBorgUrl(text: string): string {
+  const mark = text.indexOf("://");
+  if (mark < 0) return text;
+  const rest = text.slice(mark + 3);
+  const slash = rest.indexOf("/");
+  const authority = slash < 0 ? rest : rest.slice(0, slash);
+  const at = authority.indexOf("@");
+  return at < 0 ? text : `${text.slice(0, mark)}://:***@${rest.slice(at + 1)}`;
+}
+
+/**
+ * **The credential, and the rest of the url without it.** §17.6, §17.7.
+ *
+ * The `@` is looked for before the first `/` so that a unix socket path containing one — legal, if
+ * unusual — is not read as an authority. `:<key>@` and `<key>@` mean the same thing, because there
+ * is no username for the colon to be separating from; a userinfo with a second colon is refused
+ * rather than truncated, which would fail much later as `credential not valid`.
+ */
+function userinfo(text: string, rest: string): { credential: string | null; rest: string } {
+  const slash = rest.indexOf("/");
+  const authority = slash < 0 ? rest : rest.slice(0, slash);
+  const at = authority.indexOf("@");
+  if (at < 0) return { credential: null, rest };
+  const written = authority.slice(0, at);
+  const key = written.startsWith(":") ? written.slice(1) : written;
+  if (key.includes(":")) {
+    throw malformed(
+      text,
+      "a borg url has no username — the credential is the whole userinfo, as " +
+        "borg://:<key>@host/<registry>",
+    );
+  }
+  if (key === "") {
+    throw malformed(
+      text,
+      "it has an empty credential — leave the `@` out to present none, or write " +
+        "borg://:<key>@host/<registry>",
+    );
+  }
+  return { credential: key, rest: rest.slice(at + 1) };
 }
 
 /** Parse a connection url. Every refusal quotes it back — see [`BorgUrl`]. */
@@ -165,8 +240,8 @@ export function parseBorgUrl(text: string): BorgUrl {
     );
   }
   const scheme = text.slice(0, mark);
-  const rest = text.slice(mark + 3);
-  const stray = /[?#]/.exec(rest);
+  const whole = text.slice(mark + 3);
+  const stray = /[?#]/.exec(whole);
   if (stray !== null) {
     throw malformed(
       text,
@@ -174,22 +249,29 @@ export function parseBorgUrl(text: string): BorgUrl {
         `registry, and nothing else`,
     );
   }
-  switch (scheme) {
-    case "borg":
-      return local(text, rest);
-    case "borg+unix":
-      return unix(text, rest);
-    case "borg+ws":
-      return websocket(text, rest, false);
-    case "borg+wss":
-      return websocket(text, rest, true);
-    default:
-      throw malformed(
-        text,
-        `\`${scheme}\` is not a borg transport — try borg://, borg+unix://, borg+ws:// or ` +
-          `borg+wss://`,
-      );
-  }
+  // **The credential comes off first, whatever the transport.** It is a property of the connection
+  // rather than of the address, so every scheme takes it in the same place and no parser below has
+  // to know it was ever there.
+  const { credential, rest } = userinfo(text, whole);
+  const parsed = ((): BorgUrl => {
+    switch (scheme) {
+      case "borg":
+        return local(text, rest);
+      case "borg+unix":
+        return unix(text, rest);
+      case "borg+ws":
+        return websocket(text, rest, false);
+      case "borg+wss":
+        return websocket(text, rest, true);
+      default:
+        throw malformed(
+          text,
+          `\`${scheme}\` is not a borg transport — try borg://, borg+unix://, borg+ws:// or ` +
+            `borg+wss://`,
+        );
+    }
+  })();
+  return { ...parsed, credential };
 }
 
 /** `borg://<host>[/<registry>]`. */
@@ -211,6 +293,7 @@ function local(text: string, rest: string): BorgUrl {
     path: null,
     ws: null,
     registry: registrySegment(text, tail),
+    credential: null,
   };
 }
 
@@ -242,6 +325,7 @@ function websocket(text: string, rest: string, secure: boolean): BorgUrl {
     path: null,
     ws: { secure, host, port },
     registry: registrySegment(text, tail),
+    credential: null,
   };
 }
 
@@ -257,15 +341,15 @@ function unix(text: string, rest: string): BorgUrl {
   if (rest.endsWith("/")) {
     const socket = rest.slice(0, -1);
     if (socket === "") throw malformed(text, "it names no socket path");
-    return { transport: "unix", path: socket, ws: null, registry: null };
+    return { transport: "unix", path: socket, ws: null, registry: null, credential: null };
   }
   const split = rest.lastIndexOf("/");
   const head = rest.slice(0, split);
   const last = rest.slice(split + 1);
   if (head !== "" && nameIsValid(last)) {
-    return { transport: "unix", path: head, ws: null, registry: last };
+    return { transport: "unix", path: head, ws: null, registry: last, credential: null };
   }
-  return { transport: "unix", path: rest, ws: null, registry: null };
+  return { transport: "unix", path: rest, ws: null, registry: null, credential: null };
 }
 
 /** The one path segment a `borg://` url may carry after the host. */

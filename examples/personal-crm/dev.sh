@@ -117,9 +117,9 @@ link_sdk "$HERE/api"
 #
 # **Stop, delete the registry's directory, start again.** The alternative would be a `registry_delete`
 # on the protocol, and that is deliberately not built: it is a destructive operation on a wire whose
-# `credential` nothing checks yet (§17.6), which is exactly the shape `borg-server stop` avoided by
-# being a SIGTERM rather than a message. Throwing a store away is a thing you do with filesystem
-# access, on purpose.
+# `credential` is a static api key rather than an identity (§17.6) — exactly the shape `borg-server
+# stop` avoided by being a SIGTERM rather than a message. Throwing a store away is a thing you do
+# with filesystem access, on purpose.
 #
 # Only this registry's directory goes. The server's pidfile and log live beside it in the data dir
 # and are worth keeping — the log is where the reason a previous run died is written.

@@ -30,10 +30,24 @@
 //! borg-server create <name>            make a registry, through the server if one is running
 //! borg-server export [<name>] <file>   write a registry out as an event stream (§19)
 //! borg-server import <name> <file>     restore one, creating the registry
+//! borg-server keygen <label>           issue an api key; the first one flips the server to authed
+//! borg-server keys [list|revoke <l>]   what is issued, and how to un-issue it
 //! ```
+//!
+//! ## The key commands are filesystem commands, not protocol ones
+//!
+//! `keygen`, `keys list` and `keys revoke` write and read a file in the data directory and never
+//! speak to the socket, which is deliberate and is what makes the bootstrap work at all: minting the
+//! *first* credential over a connection that already requires one is a circle. It also means they
+//! work against a server that is stopped, and that a running server picks up a revocation on its
+//! next handshake without being restarted or told (`borg_host::keys`).
+//!
+//! The boundary they rely on is the filesystem's: whoever can write the data directory can issue
+//! keys, and could already read every store under it.
 
 use borg_core::{FreshnessRequirement, Result};
 use borg_host::host;
+use borg_host::keys;
 use borg_host::ops::Ops;
 use borg_protocol::client::RegistryInfo;
 use std::path::PathBuf;
@@ -48,6 +62,8 @@ struct Args {
     foreground: bool,
     /// `--listen ws://host:port`, repeatable. Beside the unix socket, never instead of it.
     listen: Vec<String>,
+    /// `--registries a,b` for `keygen`. Absent is every registry (§17.6).
+    registries: Option<String>,
     follow: bool,
     lines: usize,
     rest: Vec<String>,
@@ -66,6 +82,9 @@ borg-server — hosts a directory of borg registries
   borg-server create <name>             create a registry in the data directory
   borg-server export [<name>] <file>    write a registry out as a canonical event stream
   borg-server import <name> <file>      restore a stream, creating the registry it names
+  borg-server keygen <label>            issue an api key and print it once
+  borg-server keys [list]               the keys this data directory holds, by label
+  borg-server keys revoke <label>       stop honouring one
 
 A server hosts a **data directory of registries**: every store under --data-dir, addressable by
 name. The registry is the unit of tenancy — one advisory lock per store, one held registry per
@@ -79,7 +98,24 @@ WebSocket is what a browser can open and what rides an ordinary load balancer; t
 answers `GET /health` with the server version and how many registries are hosted, which is the one
 HTTP endpoint there is. TLS is **not** terminated here: put a proxy in front and forward plaintext
 ws:// to this port. The server trusts no forwarded header — nothing in the protocol is a function
-of the client's address, and authentication, when it exists, is a field in the handshake.
+of the client's address, and authentication is a field in the handshake rather than a header.
+
+**Authentication is off until the first `keygen`, and on from then on.** A data directory with no
+keys file is an open server: anyone who can reach the socket reaches everything, which is what
+makes `borg-server start` on a laptop a thing with no ceremony. `borg-server keygen ci` writes the
+file, prints the key **once** and never again, and every handshake from that moment must present a
+credential — over the unix socket exactly as over a websocket, because an exemption for the local
+transport would make the two mean different things. A key is presented in the connection url's
+userinfo, `borg://:<key>@localhost/<registry>`, or in $BORG_TOKEN.
+
+`--registries a,b` scopes a key to those registries; the default is `*`. A scoped key cannot reach
+the others and cannot see them either — `registries` and every refusal it can provoke are filtered
+to its own scope, so a credential learns no name it did not already have.
+
+`status`, `create`, `export` and `import` are clients of the server they administer, so a running
+server mints a `*`-scoped token into <data-dir>/borg-server.admin (mode 0600) and removes it when
+it stops. They present it automatically; $BORG_TOKEN overrides it, which is what reaching a server
+on another machine needs.
 
 `start` backgrounds by default and writes a pidfile and a log beside the registries. Use
 --foreground under a supervisor — systemd, docker, or a scenario — where staying in the foreground
@@ -112,6 +148,7 @@ Options:
   --foreground          do not background; log to stdout
   --listen <ws url>     also listen for websockets here (repeatable); port 0 binds an
                         ephemeral one and the log names it
+  --registries <a,b>    `keygen`: which registries the key may reach (default: all of them)
   -n, --lines <count>   `logs`: how many lines to show (default 50)
   -f, --follow          `logs`: keep printing as more arrives"
     );
@@ -125,6 +162,7 @@ fn parse_args() -> Args {
         socket: None,
         foreground: false,
         listen: Vec::new(),
+        registries: None,
         follow: false,
         lines: 50,
         rest: Vec::new(),
@@ -139,6 +177,7 @@ fn parse_args() -> Args {
                 Some(address) => args.listen.push(address),
                 None => usage(),
             },
+            "--registries" => args.registries = raw.next(),
             "-f" | "--follow" => args.follow = true,
             "-n" | "--lines" => {
                 args.lines = raw
@@ -194,7 +233,10 @@ async fn run(args: Args) -> Result<()> {
         }
         "status" => {
             let status = lifecycle::status(&data_dir, &socket);
-            let running = status.registries.is_some();
+            // **Running** means a server answered, not that it answered *this*: one that refused
+            // our credential is emphatically up, and exiting non-zero would tell a script to start
+            // a second one on a socket that is already busy.
+            let running = status.registries.is_some() || status.refused.is_some();
             report_status(&status);
             if running {
                 return Ok(());
@@ -257,7 +299,105 @@ async fn run(args: Args) -> Result<()> {
             report_moved(&moved, &socket);
             Ok(())
         }
+        // **The key commands write a file and never speak to the socket** — see the header for why
+        // that is what makes issuing the first credential possible at all.
+        "keygen" => {
+            let Some(label) = args.rest.first() else {
+                usage()
+            };
+            let scope = match args.registries.as_deref() {
+                None => keys::Scope::all(),
+                Some(list) => keys::Scope::Only(
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ),
+            };
+            let first = keys::load(&data_dir)?.is_none();
+            let key = keys::issue(&data_dir, label, scope)?;
+            report_key(&data_dir, label, &key, first);
+            Ok(())
+        }
+        "keys" => match args
+            .rest
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [] | ["list"] => {
+                report_keys(&data_dir);
+                Ok(())
+            }
+            ["revoke", label] => {
+                keys::revoke(&data_dir, label)?;
+                println!("revoked `{label}`");
+                println!(
+                    "connections opened with it are not torn down; every new handshake is refused \
+                     from now on"
+                );
+                Ok(())
+            }
+            _ => usage(),
+        },
         _ => usage(),
+    }
+}
+
+/// **The one time a key exists in plaintext.** SPEC.md §17.6.
+///
+/// Printed to stdout so it can be piped into a secret store, with everything else on stderr — a
+/// `borg-server keygen ci | doppler secrets set BORG_TOKEN` should carry the key and not the
+/// commentary. Nothing here ever prints it again, because nothing anywhere has it again: the file
+/// holds a digest.
+fn report_key(data_dir: &std::path::Path, label: &str, key: &str, first: bool) {
+    println!("{key}");
+    eprintln!("issued `{label}` — this is the only time the key is shown; store it now");
+    eprintln!(
+        "present it as borg://:<key>@localhost/<registry>, or in ${}",
+        keys::TOKEN_ENV
+    );
+    if first {
+        eprintln!(
+            "this server now requires a credential on every handshake, over every transport — \
+             {} is what says so",
+            keys::keys_path(data_dir).display()
+        );
+    }
+}
+
+/// What `keys list` prints. **Labels, scopes and ages — never a key and never a digest**: a digest
+/// is not a secret but it is not information either, and a list somebody can paste into an issue is
+/// worth more than one they have to redact first.
+fn report_keys(data_dir: &std::path::Path) {
+    match keys::load(data_dir) {
+        Err(err) => eprintln!("error: {err}"),
+        Ok(None) => {
+            println!(
+                "no keys — this server is open, and the first `borg-server keygen <label>` is what \
+                 changes that"
+            );
+        }
+        Ok(Some(file)) if file.keys.is_empty() => {
+            println!(
+                "no keys, and a keys file — every handshake is refused until one is issued; \
+                 delete {} to reopen the server",
+                keys::keys_path(data_dir).display()
+            );
+        }
+        Ok(Some(file)) => {
+            println!("{:<20} {:<24} issued", "label", "registries");
+            for key in &file.keys {
+                println!(
+                    "{:<20} {:<24} {}",
+                    key.label,
+                    key.registries.written(),
+                    keys::ago(key.created)
+                );
+            }
+        }
     }
 }
 
@@ -281,7 +421,7 @@ fn report_moved(moved: &lifecycle::Moved, socket: &std::path::Path) {
 /// not had its log replayed, and a server that presented everything as warm would be claiming a boot
 /// cost it deliberately does not pay.
 fn report_status(status: &lifecycle::Status) {
-    let Some(registries) = &status.registries else {
+    if status.registries.is_none() && status.refused.is_none() {
         println!(
             "borg-server is not running: nothing is answering on {}",
             status.socket.display()
@@ -291,12 +431,21 @@ fn report_status(status: &lifecycle::Status) {
             status.data_dir.display()
         );
         return;
-    };
+    }
     let pid = status
         .pid
         .map_or_else(String::new, |pid| format!(" (pid {pid})"));
     println!("borg-server running on {}{pid}", status.socket.display());
     println!("data dir {}", status.data_dir.display());
+    println!("{}", authentication(status));
+    // A server that would not talk to *us*. It is running, and the sentence it gave is the whole of
+    // what there is to act on.
+    let Some(registries) = &status.registries else {
+        if let Some(refused) = &status.refused {
+            println!("but it would not answer: {refused}");
+        }
+        return;
+    };
     if registries.is_empty() {
         println!(
             "no registries yet — create one with `borg-server create <name> --data-dir {}`",
@@ -307,6 +456,31 @@ fn report_status(status: &lifecycle::Status) {
     println!("registries:");
     for registry in registries {
         println!("  {}", named(registry));
+    }
+}
+
+/// **Open or authed, at a glance.** SPEC.md §17.6.
+///
+/// The mode comes from the handshake, because it is a fact about the server; the key count comes
+/// from the file, because it is a fact about this directory and is deliberately not on the wire —
+/// an unauthenticated caller asking how many keys exist is one question too many.
+fn authentication(status: &lifecycle::Status) -> String {
+    let counted = match status.keys {
+        Some(1) => " (1 key issued)".to_string(),
+        Some(n) => format!(" ({n} keys issued)"),
+        None => String::new(),
+    };
+    match status.auth.as_deref() {
+        Some("open") => format!(
+            "auth   open — anyone who can reach {} reaches every registry; `borg-server keygen \
+             <label>` changes that",
+            status.socket.display()
+        ),
+        Some("required") => format!("auth   api key required on every handshake{counted}"),
+        Some(other) => format!("auth   {other}{counted}"),
+        // Refused at the handshake, so there was no acknowledgement to read a mode out of — which
+        // is itself the answer: a server that refuses a credential is one that requires one.
+        None => format!("auth   api key required on every handshake{counted}"),
     }
 }
 

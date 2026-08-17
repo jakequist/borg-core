@@ -97,7 +97,21 @@ use std::os::unix::net::UnixStream;
 /// **A refusal to connect is [`crate::url::unreachable`]'s sentence**, not an `io::Error`: nothing
 /// listening on a socket is the commonest failure a client has and "Connection refused" is the
 /// least useful way to report it.
-pub fn ask(address: &Address, registry: Option<&str>, request: &Request) -> Result<Response> {
+pub fn ask(address: &Address, connect: &Connect<'_>, request: &Request) -> Result<Response> {
+    greet(address, connect, request).map(|(_, answer)| answer)
+}
+
+/// **What the handshake settled, as well as the answer.** SPEC.md §17.5, §17.6.
+///
+/// The same one round trip; the caller that wants [`Accepted`] gets it rather than asking a second
+/// question about the connection it has already made. `borg-server status` is the caller: it needs
+/// the server's *authentication mode*, which is a fact about the server and travels in the
+/// acknowledgement it was going to receive anyway.
+pub fn greet(
+    address: &Address,
+    connect: &Connect<'_>,
+    request: &Request,
+) -> Result<(Accepted, Response)> {
     let broke = |what: &str, err: &dyn std::fmt::Display| {
         BorgError::Storage(format!("{address}: {what}: {err}"))
     };
@@ -113,30 +127,61 @@ pub fn ask(address: &Address, registry: Option<&str>, request: &Request) -> Resu
         // would be making a claim about somebody else's code (§5.4).
         client_version: None,
         codec: "json".to_string(),
-        registry: registry.map(str::to_string),
-        // Nothing to present, and nothing checks it yet (§17.6).
-        credential: None,
+        registry: connect.registry.map(str::to_string),
+        credential: connect.credential.map(str::to_string),
     };
     conn.send(crate::Codec::Json, &hello)
         .map_err(|err| broke("cannot greet", &err))?;
-    match conn
+    let accepted = match conn
         .recv::<HelloAck>(crate::Codec::Json)
         .map_err(|err| broke("no acknowledgement", &err))?
     {
-        HelloAck::Accepted(_) => {}
+        HelloAck::Accepted(accepted) => accepted,
         // The server's own sentence, unwrapped: a handshake that named a registry nobody hosts is
         // already carrying the list of the ones that exist, and prefixing it with an address would
-        // bury the part that says what to do.
+        // bury the part that says what to do. The same is true of a refused credential, whose
+        // sentence says what to present and deliberately says nothing else (§17.6).
         HelloAck::Refused { reason } => return Err(BorgError::Storage(reason)),
-    }
+    };
 
     conn.send(crate::Codec::Json, request)
         .map_err(|err| broke("cannot ask", &err))?;
     let answer = conn
         .recv(crate::Codec::Json)
-        .map_err(|err| broke("no answer", &err));
+        .map_err(|err| broke("no answer", &err))?;
     conn.close();
-    answer
+    Ok((accepted, answer))
+}
+
+/// **Who is connecting, and what for**: the registry the connection settles on, and the credential
+/// it presents. SPEC.md §17.6.
+///
+/// A struct rather than two `Option<&str>` parameters, and that is the whole reason it exists: two
+/// adjacent optional strings is the shape a caller silently swaps, and swapping these two would
+/// send a registry name where a secret goes — which fails as *credential not valid* and sends
+/// somebody to the wrong file.
+#[derive(Clone, Copy, Default)]
+pub struct Connect<'a> {
+    /// `None` is `None` on the wire: the server's n=1 convenience and n≥2 refusal are one rule and
+    /// live there (§17.6).
+    pub registry: Option<&'a str>,
+    /// The API key, from a url's userinfo or from `$BORG_TOKEN`. `None` is what a client of an open
+    /// server presents, and what an enforcing server refuses at the handshake.
+    ///
+    /// **Never printed.** Nothing in this crate formats it, `Connect` has no `Debug`, and
+    /// [`crate::url::redacted`] is what any caller quoting a url goes through.
+    pub credential: Option<&'a str>,
+}
+
+impl<'a> Connect<'a> {
+    /// The commonest form: a registry, and whatever credential the environment supplies.
+    #[must_use]
+    pub fn to(registry: Option<&'a str>, credential: Option<&'a str>) -> Self {
+        Self {
+            registry,
+            credential,
+        }
+    }
 }
 
 /// One connection, over whichever transport the address named. See [`Conn::dial`].
@@ -281,6 +326,23 @@ pub struct Accepted {
     /// status`, asking [`Request::Registries`] — has to be able to make. The ambiguity is reported
     /// at the first request that needs a store, and names the options.
     pub registry: Option<String>,
+    /// **Whether this server authenticates**: `"open"` or `"required"`. SPEC.md §17.6.
+    ///
+    /// A fact about the *server*, answered on the connection that was being made anyway, because an
+    /// operator has to be able to tell an open server from an authed one at a glance and the honest
+    /// place to ask is the server rather than the directory it was started against — the same
+    /// argument that put `registries` on the wire rather than in a `readdir`.
+    ///
+    /// It says nothing about *which* credential got in and never names a key or a label: an
+    /// acknowledgement is read by whoever just connected, and `open` versus `required` is the whole
+    /// of what they need. **Absent reads as `"open"`**, which is what a server built before this
+    /// field was one.
+    #[serde(default = "open_mode")]
+    pub auth: String,
+}
+
+fn open_mode() -> String {
+    "open".to_string()
 }
 
 /// The client's reply to the server's [`ServerHello`](crate::ServerHello). Always JSON, whatever is
@@ -315,15 +377,23 @@ pub struct ClientHello {
     /// toss over somebody's data, so the server refuses and names the options instead.
     #[serde(default)]
     pub registry: Option<String>,
-    /// **Reserved for authentication. Nothing checks it.** SPEC.md §17.6.
+    /// **The credential this connection presents.** SPEC.md §17.6, `borg_host::keys`.
     ///
-    /// Its existence is the point rather than its behaviour. A local server has no one to
-    /// authenticate — the socket's file permissions are the boundary — and the hosted platform this
-    /// is the local instance of has nothing else it could be. Adding the field once auth exists would
-    /// mean a wire change at exactly the moment there is a deployment that cannot take one, so the
-    /// shape is settled now and left empty; a client that sends nothing today sends nothing valid
-    /// tomorrow, and one that sends a credential to a server that ignores it is not misled, because
-    /// it was refused nothing.
+    /// Reserved for two milestones and checked since static API keys arrived — **and the field did
+    /// not move**, which was the entire argument for reserving it. A wire that had to grow a field
+    /// on the day authentication shipped would have had to grow it at exactly the moment there was
+    /// a deployment that could not take a wire change.
+    ///
+    /// Today it holds an API key, which the server hashes and looks up (`borg_host::keys`).
+    /// Tomorrow it holds a platform-issued signed token, which the server *verifies* rather than
+    /// looks up — control plane and data plane split, so the engine never learns what an org is
+    /// (`ROADMAP.md`, *The production arc*). That is a change of what the server does with this
+    /// string and not a change to the string's place on the wire.
+    ///
+    /// **Absent is legitimate**: a server with no keys file authenticates nobody, which is what
+    /// keeps `borg-server start` on a laptop a thing with no ceremony. An enforcing server refuses
+    /// an absent credential at the handshake, with a sentence that says what to present and names
+    /// no registry.
     #[serde(default)]
     pub credential: Option<String>,
 }
@@ -1081,7 +1151,8 @@ mod tests {
     /// **The handshake routes, and it has room for a credential before there is one to check.**
     /// SPEC.md §17.6. Both fields are asserted here rather than only where they are used, because
     /// the whole argument for `credential` existing now is that the wire shape must not have to move
-    /// when auth arrives — and a field nothing serialises is a field that will be forgotten.
+    /// when auth arrived — and it did not. A field nothing serialises is a field that gets
+    /// forgotten, which is why both halves are asserted here as well as where they are used.
     #[test]
     fn the_handshake_can_name_a_registry_and_carry_a_credential() {
         let raw = r#"{"registry":"crm","credential":"tok","codec":"msgpack"}"#;
@@ -1161,6 +1232,7 @@ mod tests {
                 server: "0.1.0".into(),
                 codec: "msgpack".into(),
                 registry: Some("crm".into()),
+                auth: "required".into(),
             }),
             // A connection that settled no registry — an administrative client, which is a thing
             // the protocol has to keep being able to be.
@@ -1169,6 +1241,7 @@ mod tests {
                 server: "0.1.0".into(),
                 codec: "json".into(),
                 registry: None,
+                auth: "open".into(),
             }),
             HelloAck::Refused {
                 reason: "no registry named `nope` — this server hosts analytics, crm".into(),
@@ -1201,6 +1274,7 @@ mod tests {
             server: "0.1.0".into(),
             codec: "json".into(),
             registry: Some("crm".into()),
+            auth: "required".into(),
         }))
         .unwrap();
         assert_eq!(json.as_object().unwrap().len(), 1, "one key: {json}");
@@ -1208,6 +1282,7 @@ mod tests {
         assert_eq!(json["accepted"]["server"], "0.1.0");
         assert_eq!(json["accepted"]["codec"], "json");
         assert_eq!(json["accepted"]["registry"], "crm");
+        assert_eq!(json["accepted"]["auth"], "required");
 
         let refused = serde_json::to_value(HelloAck::Refused {
             reason: "nope".into(),

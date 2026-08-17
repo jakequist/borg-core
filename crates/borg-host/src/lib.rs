@@ -23,6 +23,9 @@
 //!   PID counter.
 //! * [`serving`] — the advisory lock. One process serves a store (§17.5), and this is how every
 //!   other process finds out and is told where to go instead.
+//! * [`keys`] — **static API keys** (§17.6): the file a server checks a handshake's credential
+//!   against, the scope that decides which registries a key reaches, and the local admin token that
+//!   lets the server's own CLI clients in without the unix socket being exempt from the rule.
 //! * [`host`] — a **data directory of registries**, which is what a server hosts. The registry is
 //!   the unit of tenancy; this is the map from a name to a store, the lazy opening, and the
 //!   per-registry gate.
@@ -34,6 +37,7 @@
 //!   clone/seed — because the log is the data and every index is already a fold over it.
 
 pub mod host;
+pub mod keys;
 pub mod ops;
 pub mod push;
 pub mod render;

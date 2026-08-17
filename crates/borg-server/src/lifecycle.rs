@@ -38,9 +38,10 @@
 
 use borg_core::{BorgError, Result};
 use borg_host::host::{self, Host, LOG_FILE, PID_FILE};
+use borg_host::keys;
 use borg_host::ops::Ops;
 use borg_host::{serving, stream};
-use borg_protocol::client::{Request, Response};
+use borg_protocol::client::{Connect, Request, Response};
 use borg_protocol::url::Address;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,22 @@ use std::time::{Duration, Instant};
 /// it in the healthy case: both loops return the moment what they are waiting for happens.
 const PATIENCE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
+
+/// **The credential this server's own CLI clients present.** SPEC.md §17.6, `borg_host::keys`.
+///
+/// `$BORG_TOKEN` first, then the token the running server minted into its data directory. That
+/// order is the useful one: the environment variable is how a lifecycle command reaches a server it
+/// is not on the same filesystem as, and the minted token is how the local case needs no
+/// configuration at all.
+///
+/// `None` where there is neither, which is exactly right against an **open** server — it has no
+/// keys file and authorises everybody, so there is nothing to present and nothing is presented.
+fn admin(data_dir: &Path) -> Option<String> {
+    std::env::var(keys::TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+        .or_else(|| keys::read_admin(data_dir))
+}
 
 pub fn pid_path(data_dir: &Path) -> PathBuf {
     data_dir.join(PID_FILE)
@@ -246,6 +263,27 @@ pub struct Status {
     pub pid: Option<u32>,
     /// `None` when nothing is answering.
     pub registries: Option<Vec<borg_protocol::client::RegistryInfo>>,
+    /// **Which mode the server is in**: `open` or `required` (§17.6).
+    ///
+    /// From the handshake's acknowledgement rather than from the keys file on disk, and for the
+    /// same reason `registries` comes over the socket: it is a fact about the *server*, and a
+    /// directory read would answer about a directory — which is not the same answer once the server
+    /// is on another machine, or once somebody has edited the file since it started.
+    ///
+    /// `None` when nothing answered, and `None` when the server refused the handshake — see
+    /// [`Status::refused`], which is the case that must not be reported as *not running*.
+    pub auth: Option<String>,
+    /// **What a server said when it would not talk to us.** `None` when it did.
+    ///
+    /// A server that refuses this command's credential is emphatically *running*, and reporting it
+    /// as stopped would send an operator to start a second one on a socket that is already busy. So
+    /// the refusal is carried rather than collapsed into the absence of an answer.
+    pub refused: Option<String>,
+    /// How many keys are in the file this process can see, when it can see one. Local, and labelled
+    /// as such by [`Status::auth`] being the thing that says the *mode* — a count is what an
+    /// operator wants next ("did the revoke land?") and it is not on the wire, because a key count
+    /// is one more thing an unauthenticated caller would be able to ask for.
+    pub keys: Option<usize>,
 }
 
 /// Ask the server what it is. **Through the socket**, because which registries a server hosts and
@@ -254,19 +292,39 @@ pub struct Status {
 /// being asked about is on another machine. `borg_protocol::client::ask` is the thirty lines that
 /// takes, shared with the CLI's two socket commands so there is one handshake and not three.
 pub fn status(data_dir: &Path, socket: &Path) -> Status {
-    let registries = match borg_protocol::client::ask(
+    let token = admin(data_dir);
+    let answered = borg_protocol::client::greet(
         &Address::Unix(socket.into()),
-        None,
+        &Connect::to(None, token.as_deref()),
         &Request::Registries {},
-    ) {
-        Ok(Response::Registries(hosted)) => Some(hosted),
-        _ => None,
+    );
+    // Three outcomes, and the middle one is the one worth having a field for: an answer, a server
+    // that would not answer *this caller*, and nothing listening at all.
+    let (auth, registries, refused) = match answered {
+        Ok((accepted, Response::Registries(hosted))) => (Some(accepted.auth), Some(hosted), None),
+        Ok((accepted, Response::Error { message })) => (Some(accepted.auth), None, Some(message)),
+        Ok((accepted, other)) => (
+            Some(accepted.auth),
+            None,
+            Some(format!("unexpected answer to registries: {other:?}")),
+        ),
+        // **`Unreachable` is the only "no server"**, and it is `borg_protocol::url::unreachable`'s
+        // own classification (§17.7). Anything else — a refused credential, a protocol version —
+        // came *from* a server, which is the distinction that keeps `status` from lying.
+        Err(BorgError::Unreachable(_)) => (None, None, None),
+        Err(err) => (None, None, Some(err.to_string())),
     };
     Status {
         data_dir: data_dir.to_path_buf(),
         socket: socket.to_path_buf(),
         pid: running_pid(data_dir),
         registries,
+        auth,
+        refused,
+        keys: keys::load(data_dir)
+            .ok()
+            .flatten()
+            .map(|file| file.keys.len()),
     }
 }
 
@@ -279,9 +337,10 @@ pub fn status(data_dir: &Path, socket: &Path) -> Status {
 /// way to give it anything.
 pub async fn create(data_dir: &Path, socket: &Path, name: &str, base: &Ops) -> Result<bool> {
     if serving::is_listening(socket) {
+        let token = admin(data_dir);
         return match borg_protocol::client::ask(
             &Address::Unix(socket.into()),
-            None,
+            &Connect::to(None, token.as_deref()),
             &Request::RegistryCreate {
                 name: name.to_string(),
             },
@@ -333,7 +392,12 @@ pub async fn export(
             registry: name.map(str::to_string),
             path: path.display().to_string(),
         };
-        return match borg_protocol::client::ask(&Address::Unix(socket.into()), name, &request)? {
+        let token = admin(data_dir);
+        return match borg_protocol::client::ask(
+            &Address::Unix(socket.into()),
+            &Connect::to(name, token.as_deref()),
+            &request,
+        )? {
             Response::Exported {
                 path,
                 layers,
@@ -396,7 +460,12 @@ pub async fn import(
             name: name.to_string(),
             path: path.display().to_string(),
         };
-        return match borg_protocol::client::ask(&Address::Unix(socket.into()), None, &request)? {
+        let token = admin(data_dir);
+        return match borg_protocol::client::ask(
+            &Address::Unix(socket.into()),
+            &Connect::to(None, token.as_deref()),
+            &request,
+        )? {
             Response::Imported {
                 name,
                 layers,

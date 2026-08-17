@@ -368,6 +368,12 @@ struct Dial {
     /// The registry to name in the handshake. `None` is `None` on the wire — the server's n=1
     /// convenience and n≥2 refusal are one rule and live there (§17.6).
     registry: Option<String>,
+    /// **The api key to present** (§17.6): the url's userinfo, or `$BORG_TOKEN`.
+    ///
+    /// `None` is what a client of an open server presents, which is every local server until
+    /// somebody runs `borg-server keygen`. Never printed — every message naming a connection names
+    /// the [`borg_protocol::url::Address`], which cannot hold one.
+    credential: Option<String>,
 }
 
 fn dial(args: &Args) -> Result<Option<Dial>> {
@@ -378,7 +384,19 @@ fn dial(args: &Args) -> Result<Option<Dial>> {
     Ok(Some(Dial {
         address: url.address(&borg_host::host::well_known_socket()),
         registry: url.registry,
+        // The url wins over the environment, exactly as `--url` wins over `$BORG_URL`: the explicit
+        // thing beats the ambient one, so a shell with a token exported can still be pointed at
+        // another server for one command.
+        credential: url.credential.or_else(token),
     }))
+}
+
+/// `$BORG_TOKEN`, when there is one. The ambient half of §17.6's credential, shared with
+/// `borg-server`'s lifecycle commands and with the TypeScript SDK under one name.
+fn token() -> Option<String> {
+    std::env::var(borg_host::keys::TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
 }
 
 /// A layer id as written by `borg layer head` — `L7` — or bare.
@@ -480,6 +498,12 @@ async fn run(args: Args) -> Result<()> {
                     watch: args.watch,
                     address: dialled.as_ref().map(|dial| dial.address.clone()),
                     registry: dialled.as_ref().and_then(|dial| dial.registry.clone()),
+                    // From the url when there was one, and from `$BORG_TOKEN` otherwise — including
+                    // on the lock-record path, where there is no url to have carried one.
+                    credential: dialled
+                        .as_ref()
+                        .and_then(|dial| dial.credential.clone())
+                        .or_else(token),
                 },
             )
             .await
@@ -1205,7 +1229,11 @@ fn over_socket_push(args: &Args, dial: &Dial, dir: &str) -> Result<Vec<String>> 
         branch: args.ops.branch.clone(),
         path: Some(path),
     };
-    match borg_protocol::client::ask(&dial.address, dial.registry.as_deref(), &request)? {
+    match borg_protocol::client::ask(
+        &dial.address,
+        &borg_protocol::client::Connect::to(dial.registry.as_deref(), dial.credential.as_deref()),
+        &request,
+    )? {
         borg_protocol::client::Response::Pushed { report, .. } => Ok(report),
         borg_protocol::client::Response::Error { message } => Err(BorgError::Storage(message)),
         other => Err(BorgError::Storage(format!(
