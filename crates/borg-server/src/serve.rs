@@ -17,8 +17,11 @@
 //! *which store* is settled once per connection ([`session`]) rather than repeated per message.
 //! Absent names the sole registry when there is exactly one, which is what keeps a laptop's
 //! experience unchanged, and is an error naming the options at two, because there is no obvious
-//! default over somebody else's data. The one exception is `repo_push`, which may name another
-//! registry: a deploy client should not need three connections to push to three registries.
+//! default over somebody else's data. The exceptions are `repo_push` and `export`, which may name
+//! another registry: a deploy client should not need three connections to push to three registries,
+//! and neither should a backup client covering three. `import` is a third kind of exception — it
+//! *creates* the registry it names (§19), so like `registry_create` it is answered by the host
+//! before any routing happens.
 //!
 //! **Transactions bind to the store, not to the connection.** The transaction table is a sidecar
 //! beside the store (§12.2), so a handle outlives the socket that opened it: a browser that reloads
@@ -95,7 +98,7 @@ use borg_core::{BorgError, MergeRejection, Result};
 use borg_host::host::{Host, Slot};
 use borg_host::ops::{self, Ops};
 use borg_host::render::struct_def;
-use borg_host::{push, serving};
+use borg_host::{push, serving, stream};
 use borg_protocol::client::{
     BranchInfo, ClientHello, Envelope, Lineage, LineageInput, RegistryInfo, Request, Response,
     SchemaDef,
@@ -459,8 +462,10 @@ fn dispatch(
     request: Request,
     handle: &tokio::runtime::Handle,
 ) -> Response {
-    // The two questions that are about the *server* rather than about a store, and therefore the
-    // two a connection that settled no registry can still ask.
+    // The questions that are about the *server* rather than about a store, and therefore the ones a
+    // connection that settled no registry can still ask. `import` is here rather than below because
+    // it *creates* the registry it names (§19) — there is no slot to route to yet, which is the same
+    // reason `registry_create` is here.
     match &request {
         Request::Registries {} => {
             return Response::Registries(
@@ -481,13 +486,26 @@ fn dispatch(
                 Err(err) => failed(err),
             };
         }
+        Request::Import { name, path } => {
+            return match handle.block_on(served.host.restore(name, base, Path::new(path))) {
+                Ok((_, report)) => Response::Imported {
+                    name: name.clone(),
+                    layers: report.layers,
+                    events: report.events,
+                    branches: report.branches,
+                    head: report.head.to_string(),
+                    written_by: report.written_by,
+                },
+                Err(err) => failed(err),
+            };
+        }
         _ => {}
     }
 
-    // `repo_push` may name another registry — see `Request::RepoPush`. Everything else is for the
-    // one the handshake settled.
+    // The two messages that may name another registry — `repo_push` for a deploy client and
+    // `export` for a backup one. Everything else is for the one the handshake settled.
     let named = match &request {
-        Request::RepoPush { registry, .. } => registry.clone(),
+        Request::RepoPush { registry, .. } | Request::Export { registry, .. } => registry.clone(),
         _ => None,
     };
     let slot = match named {
@@ -684,11 +702,40 @@ pub async fn answer(base: &Ops, request: Request) -> Response {
                 .unwrap_or_else(failed)
         }
 
+        // **A live export.** SPEC.md §19. The registry's gate is held around this whole call
+        // (`dispatch`), which is what makes it a coherent snapshot without any snapshot machinery:
+        // nothing else on this registry runs while it walks. The cost is that a large export holds
+        // its registry for its duration, which is the same gate `ROADMAP.md` already tracks.
+        Request::Export { path, .. } => {
+            let handle = match std::fs::File::create(&path) {
+                Ok(file) => file,
+                Err(err) => {
+                    return Response::Error {
+                        message: format!("{path}: {err}"),
+                    };
+                }
+            };
+            let mut out = std::io::BufWriter::new(handle);
+            stream::export(base, &mut out)
+                .await
+                .map(|report| Response::Exported {
+                    path,
+                    layers: report.layers,
+                    events: report.events,
+                    interned: report.interned,
+                    head: report.head.to_string(),
+                    settled: report.settled.to_string(),
+                })
+                .unwrap_or_else(failed)
+        }
+
         // Answered in `dispatch`, before any registry was needed. Unreachable rather than
         // impossible, so it says so instead of panicking.
-        Request::Registries {} | Request::RegistryCreate { .. } => Response::Error {
-            message: "this request is answered by the host, not by a registry".into(),
-        },
+        Request::Registries {} | Request::RegistryCreate { .. } | Request::Import { .. } => {
+            Response::Error {
+                message: "this request is answered by the host, not by a registry".into(),
+            }
+        }
     }
 }
 

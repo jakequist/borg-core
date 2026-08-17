@@ -30,7 +30,7 @@ use borg_core::{
 };
 use borg_engine::Registry;
 use borg_host::ops::{self, Ops};
-use borg_host::{push, serving};
+use borg_host::{push, serving, stream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -136,6 +136,9 @@ borg — an event-sourced data backend
   borg frontier                        how far each producer has caught up
   borg frontier reaches <layer>        wait until every producer has incorporated it
 
+  borg export [<file>]                 write this registry out as a canonical event stream
+  borg import <file>                   restore one into --store, which must hold nothing yet
+
   borg generate --lang ts -o <dir>     emit a typed client, pinned to this branch's def-version
   borg generate ... --watch            and rewrite it whenever that def-version moves
 
@@ -237,6 +240,18 @@ Derived layers are a cache that happens to live in the log, and dropping them lo
 source is separate. `borg derive --rebuild` is that fallback: it forgets what has been derived here
 and recomputes it from source. Run on a fork, it recomputes the world as of the fork point without
 touching the branch it forked from — which is how you check a watermark rather than trust it.
+
+**What borg guarantees across versions is the data, not the bytes.** On-disk formats may change
+before 1.0; every release writes a registry out as a canonical event stream and reads streams
+written by earlier releases back in, so an upgrade is export, upgrade, import. `borg export` with
+no file writes to stdout and `borg import -` reads stdin, so a backup is a pipe and a clone is
+`borg export | borg --store copy.db import -`. The stream carries the log — layers, branches,
+events with their read-sets, membership, def events, interned bytes — plus the PID counter, the
+producer table, pause flags and poisonings. It does not carry open transactions, which are
+ephemeral, and it does not carry any index, because every index in borg is a fold over the log.
+Import creates the registry: importing into one that already holds anything is refused, because
+restore is create-then-import and merging two id spaces would rewrite the lineage the stream exists
+to preserve. Two exports of one registry are byte-identical, which is how you check a restore.
 
 Options:
   --store <path>            store file (default ./borg.db)
@@ -445,6 +460,8 @@ async fn run(args: Args) -> Result<()> {
         ("def", ["version"]) => def_version(&args).await,
         ("layer", ["list"]) => layer_list(&args).await,
         ("layer", ["head"]) => layer_head(&args).await,
+        ("export", rest) => export(&args, rest.first().copied()).await,
+        ("import", [file]) => import(&args, file).await,
         ("repo", ["push", dir]) => repo_push(&args, dialled.as_ref(), dir).await,
         ("producer", ["list"]) => producer_list(&args).await,
         ("derive", ["pause"]) => derive_pause(&args, true).await,
@@ -996,6 +1013,73 @@ async fn layer_list(args: &Args) -> Result<()> {
 
 async fn layer_head(args: &Args) -> Result<()> {
     outln!("{}", ops::branch_head(&args.ops).await?.1);
+    Ok(())
+}
+
+/// Write this store out as a canonical event stream. SPEC.md §19.
+///
+/// **No file, or `-`, means stdout**, which is what makes a backup a pipe and a clone one line:
+/// `borg export | borg --store copy.db import -`. The summary then goes to stderr, so it does not
+/// end up inside the backup — a report that corrupts the artifact it describes is the one thing this
+/// command must not do.
+async fn export(args: &Args, file: Option<&str>) -> Result<()> {
+    let to_stdout = matches!(file, None | Some("-"));
+    let report = if to_stdout {
+        let mut out = std::io::BufWriter::new(std::io::stdout());
+        stream::export(&args.ops, &mut out).await?
+    } else {
+        let path = file.unwrap_or_else(|| usage());
+        let handle = std::fs::File::create(path)
+            .map_err(|err| BorgError::Storage(format!("{path}: {err}")))?;
+        let mut out = std::io::BufWriter::new(handle);
+        stream::export(&args.ops, &mut out).await?
+    };
+
+    // Where the log stood, said plainly, because that is the whole answer to *what did I just
+    // capture*: the export is the log at head, not a settled read — settling would silently drop
+    // every source layer above the watermark (see `stream::export`). The settled position is
+    // reported beside it so a backlog is visible rather than surprising.
+    let lag = if report.settled.0 < report.head.0 {
+        format!(
+            "; the default branch is settled to {} — the backlog is captured with it",
+            report.settled
+        )
+    } else {
+        String::new()
+    };
+    let summary = format!(
+        "exported {} layers, {} events, {} interned values — the log ends at {}{lag}",
+        report.layers, report.events, report.interned, report.head
+    );
+    if to_stdout {
+        eprintln!("{summary}");
+    } else {
+        outln!("{summary}");
+    }
+    Ok(())
+}
+
+/// Restore a stream into `--store`, which must not already hold a registry. SPEC.md §19.
+async fn import(args: &Args, file: &str) -> Result<()> {
+    let report = if file == "-" {
+        let mut input = std::io::BufReader::new(std::io::stdin());
+        stream::import(&args.ops.store, &mut input).await?
+    } else {
+        let handle = std::fs::File::open(file)
+            .map_err(|err| BorgError::Storage(format!("{file}: {err}")))?;
+        let mut input = std::io::BufReader::new(handle);
+        stream::import(&args.ops.store, &mut input).await?
+    };
+    outln!(
+        "restored {} into {}: {} layers, {} events, {} branches, head {} (written by {})",
+        file,
+        args.ops.store.display(),
+        report.layers,
+        report.events,
+        report.branches,
+        report.head,
+        report.written_by
+    );
     Ok(())
 }
 

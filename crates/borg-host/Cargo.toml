@@ -22,3 +22,13 @@ borg-protocol.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 serde.workspace = true
 serde_json.workspace = true
+# `StreamExt`, for walking a layer's membership in `stream::export`. `read_layer` answers a stream
+# because a provider is allowed to page (§17.1), and an export is the one caller that reads every
+# layer in the registry — so it consumes the stream rather than collecting it.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# `ProducerCtx`, so the export round trip's fixture can hold real derived data without needing a
+# shell on the machine running the tests. `scenarios/320-export-and-import` is the same claim through
+# the real binaries and a real subprocess pipeline.
+borg-exec.workspace = true

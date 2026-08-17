@@ -390,6 +390,35 @@ impl OpenLayer for SqliteOpenLayer {
         Ok(id)
     }
 
+    async fn adopt_event(&mut self, event: Event) -> Result<()> {
+        if event.authored != self.id {
+            return Err(BorgError::Storage(format!(
+                "event {} says it was authored in {}, but is being replayed into {}",
+                event.id, event.authored, self.id
+            )));
+        }
+        // `fetch_max`, so the sequence ends up past every adopted id however they arrive — an
+        // ordinary write after an import must not reissue one.
+        self.next_event.fetch_max(event.id.0 + 1, Ordering::Relaxed);
+        self.pending.push(Pending {
+            seq: self.seq,
+            event: event.id.0 as i64,
+            authored: Some((
+                encode(&event.cell.buffer)?,
+                encode(&event.cell.key)?,
+                event.version.0.0 as i64,
+                encode(&event.value)?,
+                i64::from(event.origin == Origin::Derived),
+                event.derivation.as_ref().map(encode).transpose()?,
+            )),
+        });
+        self.seq += 1;
+        if self.pending.len() >= BATCH {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
     async fn include_event(&mut self, event: EventId) -> Result<()> {
         self.pending.push(Pending {
             seq: self.seq,

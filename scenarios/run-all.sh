@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run every scenario in order. Exits non-zero on the first failure.
 #
-# Two binaries: `borg`, which every scenario drives, and `borg-server`, which the five that need a
-# server start (250, 260, 270, 280, 300).
+# Two binaries: `borg`, which every scenario drives, and `borg-server`, which the seven that need a
+# server start (250, 260, 270, 280, 300, 310, 320).
 set -euo pipefail
 
 cd "$(dirname "$0")"

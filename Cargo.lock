@@ -106,11 +106,13 @@ version = "0.1.0"
 dependencies = [
  "borg-core",
  "borg-engine",
+ "borg-exec",
  "borg-exec-native",
  "borg-exec-process",
  "borg-protocol",
  "borg-storage",
  "borg-storage-sqlite",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",

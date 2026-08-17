@@ -192,6 +192,24 @@ impl OpenLayer for MemoryOpenLayer {
         Ok(id)
     }
 
+    async fn adopt_event(&mut self, event: Event) -> Result<()> {
+        if event.authored != self.id {
+            return Err(BorgError::Storage(format!(
+                "event {} says it was authored in {}, but is being replayed into {}",
+                event.id, event.authored, self.id
+            )));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        // Past the adopted id, never backwards: the ids in a stream are dense-ish but not ordered
+        // with respect to anything this store has already taken, and a mint that walked back would
+        // reissue one of them on the next ordinary write.
+        inner.next_event = inner.next_event.max(event.id.0);
+        let staged = staged(&mut inner, self.id)?;
+        staged.members.push(event.id);
+        staged.authored.push(event);
+        Ok(())
+    }
+
     async fn include_event(&mut self, event: EventId) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if inner.stored(event).is_none() {

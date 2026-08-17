@@ -2150,6 +2150,7 @@ scan_buffer(path, buffer) -> Iterator<Event>      // entity discovery (§9.6), a
 
 // Writing into an open layer.
 author_event(cell, EventDraft) -> EventId         // streaming; never buffered whole
+adopt_event(Event)                                // an event that already has an identity (§19.5)
 include_event(EventId)                            // membership — what makes merge not copy
 put_def(DefEvent)                                 // a layer holds values xor defs (§6.2)
 seal / abort
@@ -2166,6 +2167,15 @@ rebuild_read_index()                              // the index is a projection, 
 intern(kind, bytes) -> Pid                        // content-addressed; no path, no layer
 read_interned(pid) -> bytes?
 ```
+
+**A writer names neither an id nor a layer** — `author_event` takes a *draft*, and `authored` is the
+layer it is called on — which is what makes it impossible to author an event claiming to have been
+written somewhere it was not. `adopt_event` is the one exception and is import's alone (§19.5): an
+event id is *referenced*, by every membership row and every read-set in a stream, so a replay that
+re-minted one would rewrite the lineage it was restoring. It takes a whole `Event` and a provider
+**must refuse one whose `authored` is not the layer it is being replayed into**, which keeps the
+property above intact rather than merely mostly intact — an event can only be replayed into the
+place it says it came from.
 
 **A read takes a `ReadPath`, not a branch.** The engine resolves ancestry (§7.2) and hands storage a
 list of `(branch, bound)` segments to walk outward; storage never learns what a branch *is*, which is
@@ -2447,10 +2457,12 @@ It reuses §17.4's framing whole — same codecs, same per-codec framing, same *
 rule — because the two protocols differ in who is asking and not in how a message is carried. The
 operations are the ones the CLI already has: `tx_begin`, `tx_get`, `tx_set`, `tx_create`,
 `tx_commit`, `tx_abort`, `get`, `list`, `explain`, `branch_list`, `branch_head`, `def_show`,
-`repo_push`. That is a constraint rather than a coincidence: the CLI is the testbed for what a client
-is like to use, so a protocol needing an operation the CLI lacks would be evidence about the CLI. The
-two that are not lifted subcommands are `registries` and `registry_create`, and they are not about a
-store at all — they are about the server hosting it (§17.6).
+`repo_push`, `export`. That is a constraint rather than a coincidence: the CLI is the testbed for
+what a client is like to use, so a protocol needing an operation the CLI lacks would be evidence
+about the CLI. The three that are not lifted subcommands are `registries`, `registry_create` and
+`import`, and none of them is about a store at all — they are about the server hosting it (§17.6),
+and `import` in particular *creates* the registry it names, so there is no store for it to have been
+lifted onto.
 
 Two operations arrived with the first real application rather than with the CLI, and both are on the
 CLI too, because the rule above holds in that direction as well: an operation a client needs is one
@@ -2553,10 +2565,11 @@ case the same code as the single one.
 connection. Absent means the server's sole registry *when it has exactly one* — which is what keeps a
 one-registry server the thing a local developer already expects, with no name anywhere — and is an
 error naming the options when it hosts more than one, because at n≥2 any default would be a guess
-over somebody else's data. The one message that may name another registry is `repo_push`, so that a
-deploy client pushing to several does not need a connection each; and the one message that needs no
-registry at all is `registries`, which is what lets a client that guessed wrong discover what to
-name.
+over somebody else's data. The messages that may name another registry are `repo_push` and `export`,
+so that a deploy client pushing to several and a backup client covering several do not need a
+connection each; and the messages that need no registry at all are `registries`, `registry_create`
+and `import` — the first is what lets a client that guessed wrong discover what to name, and the
+other two make a registry that does not exist yet.
 
 `ClientHello` also carries a **`credential`**, and nothing checks it. Its existence is the point: a
 local server has no one to authenticate, since the socket's file permissions are the boundary, but
@@ -2679,6 +2692,8 @@ itself, and by construction rather than by machinery — a transaction is an id 
 - Producer poisoning as durable operational state, expiring on the ClientVersion that recorded it
 - Distribution seams (§17.2) behind traits, naive in-process implementations
 - Serializable command/response form for every engine operation
+- Export and import: a registry as a canonical event stream, and the version promise it carries
+  (§19)
 
 **Out:**
 
@@ -2710,3 +2725,182 @@ itself, and by construction rather than by machinery — a transaction is an id 
 2. `should_invest_in_startup` — multi-hop pipeline, verify that a write to a depended-on field
    recomputes and a write to an undepended field does not, and that watermarks and lineage report
    correctly throughout.
+
+---
+
+## 19. Export and Import
+
+**What Borg guarantees across versions is the data, not the bytes.** Before 1.0 an on-disk format
+may change: a storage backend may re-shape its tables, a projection may be re-keyed, a sidecar may
+be re-spelled. What may not change is a customer's ability to get their data out of one release and
+into the next. So every release **exports a registry as a canonical event stream and imports streams
+written by prior releases**, and an upgrade is `export → upgrade → import`.
+
+That is one mechanism doing four jobs, and it is worth naming them because they were never four
+problems: **backup**, **restore**, **format migration**, and **clone/seed**.
+
+Borg is unusually well placed to keep this promise, for a reason the rest of this document has been
+building toward: **the log is the data.** Every index — the read index (§17.1), the dependency index
+(§16.3), the cell-touch index (§12.4), the watermarks (§10.3) — is a projection, and each is proven
+rebuildable from the log by a test rather than by a claim. So an export is *"walk the log and write
+it down"*, and an import is a **replay** — the same operation `Registry::open` performs from the
+other end.
+
+### 19.1 What the stream carries
+
+Everything needed to reconstruct a registry exactly, and **nothing that is a projection**.
+
+| In the stream | Why |
+|---|---|
+| Branches — id, name, origin layer | The structure of the log, not a fold over it (§17.1) |
+| Layers — id, branch, kind, author, `reflects`, parent, guards; **committed only** | Likewise. An open or sealed layer never became visible (§6.2) and is not part of what the registry is |
+| Events — id, cell, value, def-version, origin, derivation with its **read-set**, `authored` | §4.3. A read-set is a recorded fact about one invocation, not something a replay could recompute without re-running the producer |
+| Layer membership, in order | §6.2. An event may be named by layers on two branches; that is what a merge is (§13) |
+| Def events, per def layer, in order | §6.1 |
+| Interned content — the bytes behind every content PID in use | §3.1 |
+| The PID counter (`allocations`) | §3.1, and see below |
+| The producer implementation table | §9.2 |
+| Pause flags and poisonings | §9.6, §14 |
+
+Not in the stream: the read index, the dependency index, the cell-touch index, watermarks, and every
+other projection. Importing them would be importing an answer the log already contains, and would
+create the possibility of a restore whose indexes disagree with its log.
+
+### 19.2 Which sidecars are state, and which are residue
+
+The files beside a store are not log data (§14.2), so each was decided separately. The rule:
+**a sidecar is exported when losing it would change an answer the restored registry gives, and
+skipped when it only describes a process that is over.**
+
+- **The PID counter — exported.** It is the one sidecar a store cannot recover from: lose it and the
+  count restarts, so a fresh object can be issued the identity of an existing one. This stream is
+  its backup story.
+- **The producer implementation table — exported.** Definitions travel the log and implementations
+  do not (§9.2), so a restore without the table is a registry holding producer definitions it cannot
+  run. The commands in it are paths on the exporting machine and are written back verbatim; a
+  restore onto a different machine repairs them with one `repo push`, which is what put them there.
+- **Pause flags — exported.** A branch somebody paused on purpose that came back deriving would
+  resume work they had deliberately stopped.
+- **Poisonings — exported.** This is the decision that could have gone the other way. A poisoning is
+  the engine's judgement about code (§14) and looks like operational residue; it is not, because a
+  poisoned producer's cells read `broken` rather than `stale` and `explain` reports the error. Drop
+  the table and those exact reads change — `broken` becomes `stale`, which is the promise of a
+  catch-up that is not coming, precisely the lie §14 exists to prevent — and the first derive after
+  a restore re-runs known-broken code to rediscover what was already known. The record is keyed on
+  the ClientVersion it was recorded against, so it still self-expires when fixed code is pushed:
+  exporting it changes nothing about recovery and everything about whether a restore answers the
+  same questions the same way.
+- **Open transactions — skipped.** Ephemeral by decree (§12.3). A transaction is reaped on silence,
+  and restore is create-then-import, so no client can hold a handle to a registry that did not exist
+  a moment ago. The transaction *timeout* is exported, because that is a knob somebody set rather
+  than a transaction somebody opened.
+- **The advisory lock — skipped.** It is not state at all; it is a live claim naming the socket of a
+  process that is not this one (§17.5).
+
+### 19.3 The format
+
+**Versioned, streaming, line-oriented JSON.** One record per line; the first line is a header.
+
+```text
+{"header":{"version":1,"binary":"borg 0.1.0"}}
+{"allocations":{"next":42}}
+{"tx_timeout":{"seconds":86400}}
+{"producer":{"id":"12342029420047889112","name":"invest","source":"Company",
+             "command":"/srv/repo/pipelines/is_investible.sh","transport":"stdio"}}
+{"poison":{"branch":1,"producer":"1234…","version":9,"error":"…","since":12}}
+{"paused":{"branch":4}}
+{"branch":{"id":1,"name":"main","origin":null}}
+{"layer":{"id":1,"branch":1,"kind":"def","author":"source","parent":null,"guards":[]}}
+{"def":{"event":{"DeclareField":{"struct_name":"Company","field":"website","ty":"String",…}}}}
+{"layer":{"id":3,"branch":1,"kind":"value","author":"source","parent":1,"guards":[]}}
+{"content":{"pid":"s-d83eg…","text":"acme.ai"}}
+{"event":{"id":2,"cell":"Company:o-04002.website","value":{"ref":"s-d83eg…"},
+          "version":1,"origin":"source"}}
+{"member":{"event":1}}
+```
+
+- **Line-oriented** because a registry may be huge and must never be materialized whole — the same
+  discipline §6.2 and §17.1 impose on the storage layer. It streams, it diffs against yesterday's
+  backup, and `grep` works on it.
+- **JSON** because every other persisted format here already is: def events, layer metadata and cell
+  values are stored as their serde encodings, so relaying them costs no second conversion table.
+- **Every record is a single-key object**, payload-free ones written `{}` rather than as bare
+  strings — the same rule §17.4 imposes, so that `jq 'keys[0]'` can dispatch.
+- **A producer id is a string; layer, branch and event ids are numbers.** The same split §9.2's
+  implementation table makes, for the same reason: a producer id is a hash using the whole `u64`
+  range and every JSON tool silently rounds one above 2⁵³, while the others are sequential counters
+  that `jq` should be able to sort.
+- **Cells are canonical text** — `Company:o-1234abcd.website` — the one spelling §4 gives them, so a
+  cell in a backup is a cell that can be pasted into a client.
+- **Content is addressed by the PID that is its hash.** Import re-interns the bytes and requires the
+  PID it computes to be the one the line claimed, so content addressing is the integrity check and
+  no checksum is bolted on beside it.
+
+**Order is part of the format.** A `layer` record opens a block and everything until the next one
+belongs to it, so `event`, `member` and `def` records carry no layer of their own — repeating it on
+each of a merge layer's million membership rows would pay real bytes for a fact the position already
+carries. Layers are emitted in ascending id, which is what makes a stream importable in **one pass**:
+a layer only ever names events authored at or below its own id, so nothing refers forwards.
+
+**Identical registries export byte-identically.** That determinism is testable and is the cheapest
+total check available: export, import, export again, compare. It is why the header carries the
+stream version and the producing binary's version and *nothing else* — no timestamp, no registry
+name, no path. Where a copy came from and when are facts about the copy rather than about the data,
+and a filename and an `ls -l` already carry both. Everything with no natural order is sorted.
+
+### 19.4 What an export represents
+
+**The whole log, at the instant the export took the registry.** There is no snapshot machinery,
+because exclusion already exists: embedded `borg` is refused against a served store (§17.5) and is
+one process besides, and a served export runs under that registry's own gate (§17.6), which
+serialises it against every other request. Nothing can commit while it walks. The cost is the honest
+one — a large export holds its registry for its duration.
+
+**It is deliberately not a settled read.** §10.5's settled frontier answers *where can a coherent
+snapshot be read*, which is a question about derived data lagging source data. Bounding an export
+there would silently drop every source layer above the watermark: data loss, dressed as coherence. A
+backlog is part of what a registry is, so an export captures the lag faithfully — watermarks and all
+— and the restore works the same backlog off. The settled position is *reported* by an export so
+that an operator can see what state they captured, and is used for nothing.
+
+### 19.5 Import creates; it does not merge
+
+Importing into a registry that already holds anything is **refused**. Restore is
+*create-then-import*, and the alternative is a decision nobody can make correctly: the stream names
+layer, branch and event ids, so merging two id spaces means either re-minting — which invalidates
+every read-set and every `reflects` in the stream — or colliding with them. Refusing is the only
+answer that cannot silently corrupt.
+
+**Ids are preserved, not re-minted**, for the same reason: they are part of the data. An import
+therefore writes through `StorageProvider` directly rather than through a `Registry` — it is
+replaying a log, not re-executing one. Nothing is validated against definitions (the events were
+validated when they were authored, under the def-view in force then), nothing is derived, and
+nothing is re-sequenced. A provider must be able to adopt an event that already has an identity, and
+must refuse one claiming to have been authored in a layer other than the one it is being replayed
+into, so that §17.1's *"a writer cannot claim to have written somewhere it did not"* survives intact.
+
+A malformed or truncated stream fails with the **line number** and what was expected. A stream whose
+format version this binary does not know fails naming **both** versions, so a reader knows which end
+to fix. A restore that cannot finish removes the store it created, because a half-written store is
+worse than no store: under a data directory it is a registry the next server start would host.
+
+### 19.6 The surface
+
+```text
+borg export [<file>]                  write --store's registry out; no file, or `-`, is stdout
+borg import <file>                    restore into --store, which must hold nothing yet; `-` is stdin
+borg-server export [<name>] <file>    …through a running server, so a live registry needs no downtime
+borg-server import <name> <file>      …creating the registry it names
+```
+
+`borg` addresses a store by path, because that is what embedded Borg is (§17.5). `borg-server`
+addresses a registry by name under a data directory (§17.6), and — like `create` — does it through
+the server when one is running and directly when one is not. When a server does it, `<file>` is a
+path **on the server's machine**, exactly as `repo push --url`'s directory is (§17.6): a response
+carrying the stream would be the buffering this format exists to avoid, and a multi-message reply
+would be a change of shape rather than a field. The remote form is an uploaded artifact, and that is
+a field on the message when it arrives.
+
+A registry restored through a server is created and filled in **one** operation, because the two
+halves apart leave a window in which the server hosts an empty registry that clients can route to
+and write into.

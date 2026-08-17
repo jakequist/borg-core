@@ -27,6 +27,8 @@
 //! borg-server status                   the address, the pid, and what is hosted
 //! borg-server logs [-n N] [-f]         what a backgrounded server has printed
 //! borg-server create <name>            make a registry, through the server if one is running
+//! borg-server export [<name>] <file>   write a registry out as an event stream (§19)
+//! borg-server import <name> <file>     restore one, creating the registry
 //! ```
 
 use borg_core::{FreshnessRequirement, Result};
@@ -58,6 +60,8 @@ borg-server — hosts a directory of borg registries
   borg-server status                    where it is listening and what it hosts
   borg-server logs [-n <count>] [-f]    what a backgrounded server has printed
   borg-server create <name>             create a registry in the data directory
+  borg-server export [<name>] <file>    write a registry out as a canonical event stream
+  borg-server import <name> <file>      restore a stream, creating the registry it names
 
 A server hosts a **data directory of registries**: every store under --data-dir, addressable by
 name. The registry is the unit of tenancy — one advisory lock per store, one held registry per
@@ -78,6 +82,17 @@ to, because one process serves a store: the sidecars beside a store and its laye
 multi-process safe. Pushing a schema is the exception that used to prove the rule and no longer
 does — `repo_push` is on the protocol, so the *server* runs the push against a path on its own disk
 and the registry it is holding open sees the new definitions and the new code without a restart.
+
+**What borg guarantees across versions is the data, not the bytes.** On-disk formats may change
+before 1.0; every release exports a registry as a canonical event stream and imports streams from
+earlier releases, so an upgrade is export, upgrade, import — and the same one mechanism is backup,
+restore, format migration and clone. `export` and `import` work through the server when one is
+running, so a live registry is backed up without stopping it: the export runs under that registry's
+own gate, which makes it a snapshot of the whole log at one instant. `<file>` is a path on the
+*server's* machine, as `borg repo push --url`'s directory is; a relative one is resolved against the
+shell that typed it. `import` creates the registry it names and refuses one that already exists,
+because restore is create-then-import and merging two id spaces would rewrite the lineage the stream
+exists to preserve.
 
 Options:
   --data-dir <path>     the directory of registries to host (default ~/.borg)
@@ -187,7 +202,56 @@ async fn run(args: Args) -> Result<()> {
             );
             Ok(())
         }
+        // **The registry name is optional and the file is not.** A one-registry server is the local
+        // case and naming its sole registry adds nothing, so `borg-server export backup.ndjson`
+        // works exactly where `borg-server status` needs no name either — and the n≥2 refusal is
+        // `Host::route`'s one sentence rather than a second opinion here (§17.6).
+        "export" => {
+            let (name, file) = match args.rest.as_slice() {
+                [file] => (None, file),
+                [name, file] => (Some(name.as_str()), file),
+                _ => usage(),
+            };
+            let moved = lifecycle::export(
+                &data_dir,
+                &socket,
+                name,
+                std::path::Path::new(file),
+                &base(&data_dir),
+            )
+            .await?;
+            report_moved(&moved, &socket);
+            Ok(())
+        }
+        "import" => {
+            let [name, file] = args.rest.as_slice() else {
+                usage()
+            };
+            let moved = lifecycle::import(
+                &data_dir,
+                &socket,
+                name,
+                std::path::Path::new(file),
+                &base(&data_dir),
+            )
+            .await?;
+            report_moved(&moved, &socket);
+            Ok(())
+        }
         _ => usage(),
+    }
+}
+
+/// What an export or a restore did, and **whether a server did it**.
+///
+/// The second half is not decoration: an export taken through a running server is a snapshot of what
+/// that server is holding, and one taken directly is a snapshot of a directory nobody is serving.
+/// They are the same bytes when nothing is writing and different questions when something is, so the
+/// sentence says which one was asked.
+fn report_moved(moved: &lifecycle::Moved, socket: &std::path::Path) {
+    println!("{}", moved.summary);
+    if moved.served {
+        println!("through the server on {}", socket.display());
     }
 }
 

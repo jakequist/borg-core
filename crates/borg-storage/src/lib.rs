@@ -36,6 +36,24 @@ pub trait OpenLayer: Send {
     /// otherwise.
     async fn author_event(&mut self, cell: &CellRef, draft: EventDraft) -> Result<EventId>;
 
+    /// Author an event that **already has an identity**. The import half of §19, and its only caller.
+    ///
+    /// [`author_event`](OpenLayer::author_event) takes a draft precisely because a writer must not be
+    /// able to name an id or a layer. An import is the one writer for which that is backwards: an
+    /// event id is *referenced* — by every membership row in the stream and by every read-set inside
+    /// it — so re-minting one would rewrite the lineage the export exists to preserve, and `authored`
+    /// is what tells a merged event apart from a copied one (§13). The stream carries both because
+    /// they are data.
+    ///
+    /// **`event.authored` must be this layer**, and a provider is required to refuse otherwise. That
+    /// is what keeps `author_event`'s property intact rather than merely mostly intact: an event
+    /// still cannot claim to have been written somewhere it was not — it can only be replayed into
+    /// the layer it says it came from.
+    ///
+    /// A provider must also advance whatever mints ids past this one, or the next ordinary write
+    /// would reissue an id the import has just adopted.
+    async fn adopt_event(&mut self, event: Event) -> Result<()>;
+
     /// Name an existing event as a member of this layer. SPEC.md §13.
     ///
     /// **This is what makes a merge not copy.** The event keeps its identity and its `authored`
