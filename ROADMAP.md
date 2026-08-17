@@ -171,7 +171,11 @@ cloud later, with the platform's own control plane built on Borg itself.
   clone records no version (irreproducible CI) and gitignored-but-precious directories are how the
   CRM's data got deleted. borg-cloud consumes the server image, SDK and CLI by pinned version, with
   local path-overrides for same-day cross-repo work — feeling exactly the packaging a customer
-  feels.
+  feels. *Revised for the working checkout only:* a private meta-repo (`borg-root`) now holds the
+  developer workspace — scripts and cross-repo docs, with the real repos checked out inside it,
+  gitignored there. What the original decision forbade is unchanged: neither repo consumes the
+  other's *source* through the nesting, and CI for each repo sees only that repo. A gitignored
+  child that is a full clone with a remote is recoverable in a way plain data files are not.
 - **Format policy: guarantee the data, not the bytes.** Pre-1.0 on-disk formats may change; every
   release exports a canonical event stream and imports streams of prior releases; upgrades are
   export → upgrade → import. Additive changes stay serde-compatible without ceremony. **Built** —
