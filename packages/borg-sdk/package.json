@@ -2,7 +2,7 @@
   "name": "borg-sdk",
   "version": "0.1.0",
   "description": "Borg in TypeScript: the author-side DSL, and the client generated code is built on.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=20"

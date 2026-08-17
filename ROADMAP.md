@@ -129,6 +129,49 @@ Act 1 is the modern ORM.
 
 ---
 
+## The production arc (P1–P3)
+
+The project is reorienting to a deployed product: borg-hq.com, run from a Proxmox host now and a
+cloud later, with the platform's own control plane built on Borg itself.
+
+**Decisions taken (with the reasoning that survives):**
+
+- **The engine is single-tenant, everywhere.** Tenant isolation lives at the VM boundary — the
+  strongest primitive available — so pipelines survive on every plan and container isolation
+  returns to being defense-in-depth rather than a security prerequisite. Cheap plans are cheaper
+  VMs, not shared engines. A server's registries mean one org's *projects and environments*, not
+  many customers. The trade held with open eyes: VM-per-tenant has a per-tenant floor cost; the
+  eventual fix is lighter VMs, in the platform's provisioning layer, never in the engine.
+- **Control plane / data plane split.** The platform (private `borg-cloud`) owns identity, orgs,
+  memberships, plans, provisioning and routing; `borg-server` owns registries and verifies
+  platform-issued credentials without owning identity — signed tokens, no phone-home, so on-prem
+  verifies offline. Orgs are platform data, and the engine never learns what one is.
+- **The platform runs on Borg** — first production Borg application, registry `platform`, with the
+  bootstrap loop (platform needs its own borg-server up) accepted and documented.
+- **Open core.** This repo (engine, server, CLI, SDKs, examples) is public as `jakequist/borg-core`
+  under **Apache-2.0**; `borg-cloud` is private. Apache now does not preclude FSL/BSL later for
+  future versions — the flip cost is a fork of the last Apache release, negligible pre-traction —
+  but relicensing requires owning all contributions, so **a CLA must exist before the first outside
+  PR is accepted**.
+- **Repos are siblings, never nested; borg-cloud pins artifacts, not source.** A gitignored nested
+  clone records no version (irreproducible CI) and gitignored-but-precious directories are how the
+  CRM's data got deleted. borg-cloud consumes the server image, SDK and CLI by pinned version, with
+  local path-overrides for same-day cross-repo work — feeling exactly the packaging a customer
+  feels.
+- **Format policy: guarantee the data, not the bytes.** Pre-1.0 on-disk formats may change; every
+  release exports a canonical event stream and imports streams of prior releases; upgrades are
+  export → upgrade → import. Additive changes stay serde-compatible without ceremony.
+- **Secrets live in Doppler** (project `borg`); deploys target the Proxmox host (`m3`) first with a
+  thin VM-provider seam named for the eventual cloud move.
+
+**P1 — networked, authed, deployed:** WebSocket transport (browser-ready, rides standard infra) ·
+hello acknowledgement (closes the routing deviation) · static org-scoped API keys · export/import ·
+Dockerfile + CI · one server live on the Proxmox host.
+**P2 — the platform:** control-plane app on Borg — orgs, users, memberships, token issuance,
+provisioning, subdomain routing, platform.borg-hq.com.
+**P3 — tiering:** dedicated-server provisioning via the Proxmox API, on-prem packaging, and
+(optionally, as hardening) containerized workers.
+
 ## Open questions and deferrals
 
 What is knowingly not done, and what it would cost. Nothing here is a bug; each is a decision to
